@@ -22,8 +22,18 @@ AgentSematic/
 ├── spectral_cluster.py           # medoid 姿态上的谱聚类分割
 ├── seg_mat_runner.py             # SEG-MAT / QMAT 调用封装
 ├── skeleton_mat.py               # 从蒙皮骨架近似生成 initial.ma
+├── vlm/                          # VLM 语义细化（三分类 + 局部分裂循环）
+│   ├── api_keys.py / config.py   #   .env 加载 + provider 配置
+│   ├── client.py                 #   OpenAI 兼容 / Anthropic / Google / Azure
+│   ├── prompts.py                #   三分类与种子数提示
+│   ├── render_component.py       #   单分块高亮 12 视角渲染
+│   ├── classifier.py             #   full / partial / none 判定
+│   ├── seed_split.py             #   局部符合分块的子谱聚类
+│   ├── pipeline.py               #   迭代细化主循环
+│   └── cli.py                    #   python -m vlm.cli 入口
 ├── config/
 │   └── vlm_config.yaml           # VLM API 配置（API Key 走环境变量）
+├── .env.example                  # 复制为 .env 后填 API Key；.env 已被 .gitignore
 ├── third_party/
 │   ├── SEG-MAT/                  # submodule：分割算法源码
 │   ├── QMAT/                     # 本地构建的 QMAT CLI（被 .gitignore 忽略）
@@ -85,7 +95,16 @@ git submodule update --init --recursive
 
 ### 4. VLM 配置（可选）
 
-`config/vlm_config.yaml` 用 `${ENV_VAR_NAME}` 引用 API Key，按需要把对应的环境变量设置好即可，例如：
+`config/vlm_config.yaml` 用 `${ENV_VAR_NAME}` 引用 API Key，按需要把对应的环境变量设置好即可。
+**推荐做法**：把 `.env.example` 复制为 `.env`，把真实 key 写进去——`.env` 已经在 `.gitignore`
+中（同时还忽略了 `.env.*`、`.env.local` 等变体），不会被误提交：
+
+```bash
+cp .env.example .env
+# 然后编辑 .env，按需填 OPENAI_API_KEY / ANTHROPIC_API_KEY / ...
+```
+
+也可以直接在 shell 里 `export` / `$env:` 设置，效果等价：
 
 ```powershell
 $env:OPENAI_API_KEY = "sk-..."
@@ -205,6 +224,84 @@ python mesh_distortion_analyzer.py model.glb --no-render
 | `spectral_cluster.py` | 归一化图 Laplacian + KMeans；特征值间隙自动估簇数；融合畸变标量特征 |
 | `seg_mat_runner.py` | 写 `.off`、调用 QMAT 简化 MAT、调用 SEG-MAT、解析彩色 OFF 反推 face 标签 |
 | `skeleton_mat.py` | 蒙皮骨架 → `initial.ma`：关节→球，父子→边，兄弟关节→三角面（QMAT 拓扑校验） |
+| `vlm/` | VLM 语义细化：高亮单块 12 视角图 → 三分类 → 局部符合再谱聚类分裂（递归直至收敛） |
+
+---
+
+## VLM 语义细化（`vlm/` 模块）
+
+在已有 SEG-MAT 或谱聚类结果之上，使用 VLM 把每个分块按用户输入的语义判定为
+**完全符合 / 局部符合 / 完全不符合** 三类，并对"局部符合"的分块继续做谱聚类
+分裂，直到没有"局部符合"为止：
+
+1. **Step 1：高亮 + 三分类**
+   每个分块单独渲染一张 4×3 = 12 视角拼图：当前分块用鲜艳红色高亮，其它分块淡灰
+   做参考。把这张图喂给 VLM，让其返回 JSON：
+   ```json
+   {"label": "full" | "partial" | "none", "confidence": 0.9, "reason": "..."}
+   ```
+2. **Step 2：分裂**
+   - `full` → 直接接受
+   - `none` → 直接拒绝
+   - `partial` → 先问 VLM 在这一块内需要多少子块（`seed_count ≥ 2`），
+     然后只在该分块顶点构造的子 mesh 上跑一次谱聚类，得到 `seed_count` 个子分块。
+     每个子分块回到 Step 1。
+3. **终止条件**：队列空 / 达到 `--max-depth` / 子块面数低于 `--min-block-size`。
+
+### 一行命令
+
+```bash
+# 先准备好 .env 中的 API Key
+python -m vlm.cli \
+    output/<模型>/medoid_pose/render_pose.off \
+    --labels output/<模型>/medoid_pose/face_segment_labels.json \
+    --semantic "面部" \
+    --provider openai \
+    --verbose
+```
+
+也可以传 `--labels output/<模型>/spectral_clustering/face_cluster_labels.json` 从
+谱聚类结果开始。`--dry-run` 只渲染初始分块拼图、不调用 VLM，可用于排查。
+
+### 输出
+
+`output/<模型>/vlm/<语义>/`：
+
+```
+panels/                每个 block 的高亮 12 视角图（block_C0.png ...）
+responses/             每次 VLM 调用的原始 JSON 响应（便于复盘 / 调参）
+initial_segmentation.png   初始分块拼图
+semantic_mask.png      最终：绿色=完全符合语义，淡色=不符合
+semantic_mask.json     最终被判为"符合"的 face_id 列表
+block_tree.json        完整 block 树（含父子、状态、VLM 决策）
+responses_log.json     调用流水时序
+```
+
+### 常用参数
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `--semantic STR` | — | **必填**，用户语义（如 "面部"、"右手"） |
+| `--labels PATH` | — | **必填**，face_labels JSON（SEG-MAT 或谱聚类输出均可） |
+| `--provider NAME` | YAML 中 `active_provider` | 选定 VLM 提供方 |
+| `--model NAME` | provider 的 `default_model` | 覆盖模型 |
+| `--config PATH` | `config/vlm_config.yaml` | 配置 YAML 路径 |
+| `--env-file PATH` | 自动加载 `.env` / `.env.local` | 额外 .env 路径 |
+| `--max-depth N` | `3` | 局部符合分裂递归深度上限 |
+| `--max-seeds N` | `6` | 单次分裂最多种子数 |
+| `--min-block-size N` | `20` | 忽略 face 数少于该值的分块 |
+| `--image-size N` | `512` | 单视角分辨率（12 视角共用） |
+| `--scalar-weight W` | `0.35` | 子谱聚类畸变特征权重 |
+| `--dry-run` | — | 只渲染初始分块，不调用 VLM |
+| `--verbose` | — | 打印进度（每个 block 的分类 / 分裂） |
+
+### API Key 安全
+
+- `.env` / `.env.local` / `.env.*` 都在 `.gitignore` 里，**永远不会被提交**；
+  只有 `.env.example` 允许进 Git。
+- `config/vlm_config.yaml` 全部用 `${ENV_VAR_NAME}` 引用 key，YAML 里**没有任何明文 key**。
+- 程序启动时会按顺序加载 `./.env` → `./.env.local`，已有的环境变量不会被覆盖
+  （所以 CI 里 `OPENAI_API_KEY=xxx python -m vlm.cli ...` 也能正常用）。
 
 ---
 

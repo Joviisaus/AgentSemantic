@@ -13,3 +13,5 @@ dependencies:
       - DracoPy>=2.0.0
       - pyvista>=0.43
       - pillow>=10.0
+      - scipy>=1.10
+      - requests>=2.31

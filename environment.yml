@@ -1,0 +1,15 @@
+name: agentsematic
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.10
+  - numpy>=1.24
+  - pyyaml>=6.0
+  - pip
+  - pip:
+      - trimesh>=4.0
+      - pygltflib>=1.16
+      - ufbx>=0.0.5
+      - DracoPy>=2.0.0
+      - pyvista>=0.43
+      - pillow>=10.0

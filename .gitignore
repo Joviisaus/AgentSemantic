@@ -1,0 +1,95 @@
+# ============================================================
+# Python
+# ============================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+
+# 打包 / 安装产物
+build/
+dist/
+*.egg
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# 测试 / 类型检查 / Lint 缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ============================================================
+# Virtual environments
+# ============================================================
+.venv/
+venv/
+env/
+ENV/
+
+# ============================================================
+# 项目运行产物 / 本地配置
+# ============================================================
+output/
+out.json
+*.log
+
+# polyscope / imgui 运行时本地配置
+imgui.ini
+.polyscope.ini
+
+# 本地环境变量（API Key 等）
+.env
+.env.*
+!.env.example
+
+# ============================================================
+# IDE / Editor
+# ============================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ============================================================
+# 操作系统生成的文件
+# ============================================================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ============================================================
+# Third-party 下载的可执行 / 源码压缩包与解压产物
+#   说明：SEG-MAT 作为 submodule 由 git 跟踪，这里只忽略外部下载件
+# ============================================================
+# QMAT
+third_party/QMAT/
+third_party/QMAT-exe/
+third_party/QMAT-full-src/
+third_party/qmat_x64_runnable.zip
+third_party/qmat_x64_sourcecode.rar
+
+# SEG-MAT 预编译版本
+third_party/SEG-MAT/SEG-MAT-Release.zip
+third_party/SEG-MAT/exe program/SEG-MAT-Release/
+
+# 通用：忽略 third_party 下的所有压缩包
+third_party/**/*.zip
+third_party/**/*.rar
+third_party/**/*.7z
+third_party/**/*.tar
+third_party/**/*.tar.gz
+third_party/**/*.tgz

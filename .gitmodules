@@ -1,0 +1,3 @@
+[submodule "third_party/SEG-MAT"]
+	path = third_party/SEG-MAT
+	url = https://github.com/clinplayer/SEG-MAT.git

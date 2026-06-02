@@ -362,6 +362,9 @@ _OPENAI_COMPATIBLE = {
     "deepseek",
     "ollama",
     "custom",
+    "doubao",          # 火山方舟（Volcengine ARK），兼容 OpenAI Chat Completions
+    "volcengine",      # alias
+    "ark",             # alias
 }
 
 
@@ -379,19 +382,56 @@ def build_vlm_client(config: VLMProviderConfig) -> VLMClient:
     return OpenAICompatibleClient(config)
 
 
+def _unwrap_json_payload(payload: Any) -> Dict[str, Any]:
+    """统一把 VLM JSON 输出归到 dict：
+    - dict 直接返回
+    - list 全是 dict 时合并：list 字段做去重串联，标量字段取第一个非空
+      （Gemini 偶尔会把同一答复按"每张视图"切成多元素 list，例如
+       `[{covered_parts:[...]}, {covered_parts:[...]}]`）
+    - 其他情况抛 ValueError
+    """
+    if isinstance(payload, dict):
+        return payload
+    if isinstance(payload, list) and payload and all(isinstance(x, dict) for x in payload):
+        merged: Dict[str, Any] = {}
+        for item in payload:
+            for k, v in item.items():
+                if k not in merged:
+                    merged[k] = v
+                    continue
+                cur = merged[k]
+                if isinstance(cur, list) and isinstance(v, list):
+                    seen = {repr(x) for x in cur}
+                    for x in v:
+                        if repr(x) not in seen:
+                            cur.append(x)
+                            seen.add(repr(x))
+                elif isinstance(cur, str) and isinstance(v, str):
+                    if cur and v and v not in cur:
+                        merged[k] = cur + " | " + v
+                    elif not cur:
+                        merged[k] = v
+                # 其他类型保留首次出现的值
+        return merged
+    raise ValueError(
+        f"期望 JSON object，但实际是 {type(payload).__name__}: {str(payload)[:200]}"
+    )
+
+
 def parse_json_response(text: str) -> Dict[str, Any]:
     """
     宽松解析 VLM 返回的 JSON：
     - 优先直接 json.loads
     - 若失败，尝试用正则提取 {...} 块
+    - Gemini 偶尔会把返回包成单元素 list，统一解包成 dict
     """
     text = (text or "").strip()
     if not text:
         raise ValueError("空响应")
 
     try:
-        return json.loads(text)
-    except json.JSONDecodeError:
+        return _unwrap_json_payload(json.loads(text))
+    except (json.JSONDecodeError, ValueError):
         pass
 
     if text.startswith("```"):
@@ -401,8 +441,17 @@ def parse_json_response(text: str) -> Dict[str, Any]:
             cleaned = cleaned[4:]
         cleaned = cleaned.strip()
         try:
-            return json.loads(cleaned)
-        except json.JSONDecodeError:
+            return _unwrap_json_payload(json.loads(cleaned))
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # 优先尝试 [...] 整段（Gemini 风格）
+    lstart = text.find("[")
+    lend = text.rfind("]")
+    if lstart >= 0 and lend > lstart:
+        try:
+            return _unwrap_json_payload(json.loads(text[lstart : lend + 1]))
+        except (json.JSONDecodeError, ValueError):
             pass
 
     start = text.find("{")
@@ -410,7 +459,7 @@ def parse_json_response(text: str) -> Dict[str, Any]:
     if start >= 0 and end > start:
         snippet = text[start : end + 1]
         try:
-            return json.loads(snippet)
-        except json.JSONDecodeError as exc:
+            return _unwrap_json_payload(json.loads(snippet))
+        except (json.JSONDecodeError, ValueError) as exc:
             raise ValueError(f"无法解析 JSON: {text[:200]}") from exc
     raise ValueError(f"响应不含 JSON: {text[:200]}")

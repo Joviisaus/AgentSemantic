@@ -16,7 +16,7 @@ from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from mesh_distortion_analyzer import (
+from geometry.mesh_distortion_analyzer import (
     MeshData,
     MeshTopology,
     build_mesh_topology,

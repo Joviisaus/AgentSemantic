@@ -33,14 +33,14 @@ providers:
     max_tokens: 4096
 
   google:
-    enabled: false
+    enabled: true
     api_key: ${GOOGLE_API_KEY}
     base_url: https://generativelanguage.googleapis.com/v1beta
     models:
+      - gemini-2.5-flash
+      - gemini-2.5-pro
       - gemini-2.0-flash
-      - gemini-1.5-pro
-      - gemini-1.5-flash
-    default_model: gemini-2.0-flash
+    default_model: gemini-2.5-flash
 
   azure_openai:
     enabled: false
@@ -86,6 +86,20 @@ providers:
     models:
       - deepseek-vl2
     default_model: deepseek-vl2
+
+  doubao:
+    # 字节跳动火山方舟 ARK，兼容 OpenAI Chat Completions
+    # 文档: https://www.volcengine.com/docs/82379
+    enabled: true
+    api_key: ${ARK_API_KEY}
+    base_url: https://ark.cn-beijing.volces.com/api/v3
+    models:
+      - doubao-seed-2-0-pro-260215   # Seed-2.0-Pro，多模态
+      - doubao-1-5-vision-pro-32k
+      - doubao-1-5-vision-lite-32k
+    default_model: doubao-seed-2-0-pro-260215
+    vision:
+      image_detail: auto
 
   ollama:
     enabled: false

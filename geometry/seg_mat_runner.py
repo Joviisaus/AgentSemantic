@@ -223,7 +223,7 @@ def _valid_ma(path: Path) -> bool:
             header = f.readline().strip().split()
         if not (len(header) >= 3 and header[0].isdigit()):
             return False
-        from skeleton_mat import validate_ma_topology
+        from geometry.skeleton_mat import validate_ma_topology
 
         return validate_ma_topology(path)
     except OSError:
@@ -306,8 +306,8 @@ def _export_initial_ma_from_skeleton(
     anim_time: float,
     output_path: Path,
 ) -> Path:
-    from mesh_distortion_analyzer import evaluate_skeleton_joint_positions
-    from skeleton_mat import export_skeleton_initial_ma
+    from geometry.mesh_distortion_analyzer import evaluate_skeleton_joint_positions
+    from geometry.skeleton_mat import export_skeleton_initial_ma
 
     joint_positions = evaluate_skeleton_joint_positions(rig, anim_name, anim_time)
     return export_skeleton_initial_ma(rig, joint_positions, pose_vertices, output_path)

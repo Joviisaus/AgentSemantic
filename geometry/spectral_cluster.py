@@ -16,6 +16,7 @@ import numpy as np
 try:
     from scipy.sparse import csr_matrix, diags, eye
     from scipy.sparse.linalg import eigsh
+    from scipy.sparse.linalg import ArpackNoConvergence
 except ImportError as exc:
     raise ImportError("谱聚类需要 scipy: pip install scipy") from exc
 
@@ -58,16 +59,21 @@ def _kmeans(
     *,
     random_state: int = 0,
     max_iter: int = 100,
+    init_centers: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """轻量 KMeans（仅依赖 numpy）。"""
+    """轻量 KMeans（仅依赖 numpy）。
+    init_centers: 可选，shape (n_clusters, D)，跳过随机初始化。"""
     n = len(data)
     if n_clusters <= 1 or n <= 1:
         return np.zeros(n, dtype=np.int64)
     n_clusters = min(n_clusters, n)
 
     rng = np.random.default_rng(random_state)
-    init_idx = rng.choice(n, size=n_clusters, replace=False)
-    centers = data[init_idx].copy()
+    if init_centers is not None and init_centers.shape == (n_clusters, data.shape[1]):
+        centers = np.asarray(init_centers, dtype=data.dtype).copy()
+    else:
+        init_idx = rng.choice(n, size=n_clusters, replace=False)
+        centers = data[init_idx].copy()
 
     labels = np.zeros(n, dtype=np.int64)
     for _ in range(max_iter):
@@ -131,35 +137,33 @@ def build_weighted_adjacency(
     features: np.ndarray,
     sigma: float = DEFAULT_FEATURE_SIGMA,
 ) -> csr_matrix:
-    """由三角面片 1-邻接边构造对称稀疏亲和矩阵。"""
+    """由三角面片 1-邻接边构造对称稀疏亲和矩阵（向量化版本）。"""
     n = len(features)
-    rows: List[int] = []
-    cols: List[int] = []
-    dists: List[float] = []
-
-    for tri in faces:
-        a, b, c = int(tri[0]), int(tri[1]), int(tri[2])
-        for i, j in ((a, b), (b, c), (c, a)):
-            if i == j:
-                continue
-            d = float(np.linalg.norm(features[i] - features[j]))
-            rows.extend([i, j])
-            cols.extend([j, i])
-            dists.extend([d, d])
-
-    if not rows:
+    f = np.asarray(faces, dtype=np.int64)
+    if f.size == 0:
         return csr_matrix((n, n), dtype=np.float64)
 
-    rows_arr = np.asarray(rows, dtype=np.int64)
-    cols_arr = np.asarray(cols, dtype=np.int64)
-    dists_arr = np.asarray(dists, dtype=np.float64)
+    # 三个有向边：(0,1),(1,2),(2,0) —— 后面再加反向边对称化
+    a = np.concatenate([f[:, 0], f[:, 1], f[:, 2]])
+    b = np.concatenate([f[:, 1], f[:, 2], f[:, 0]])
+    valid = a != b  # 退化边
+    a, b = a[valid], b[valid]
+
+    diff = features[a] - features[b]
+    dists = np.linalg.norm(diff, axis=1)
+
+    # 加上反向，得到对称连接
+    rows = np.concatenate([a, b])
+    cols = np.concatenate([b, a])
+    dist_full = np.concatenate([dists, dists])
 
     if sigma <= 0:
-        sigma = float(np.median(dists_arr))
+        sigma = float(np.median(dist_full))
         sigma = max(sigma, 1e-6)
 
-    weights = np.exp(-0.5 * (dists_arr / sigma) ** 2)
-    adj = csr_matrix((weights, (rows_arr, cols_arr)), shape=(n, n), dtype=np.float64)
+    weights = np.exp(-0.5 * (dist_full / sigma) ** 2)
+    adj = csr_matrix((weights, (rows, cols)), shape=(n, n), dtype=np.float64)
+    # csr_matrix 在重复 (i,j) 上会累加，这里再做一次 sym 平均确保对称
     adj = 0.5 * (adj + adj.T)
     adj.eliminate_zeros()
     return adj
@@ -190,6 +194,65 @@ def estimate_cluster_count(
     return int(np.clip(k, min_clusters, max_clusters))
 
 
+_DENSE_EIGH_MAX_N = 3000
+
+
+def _solve_smallest_eigs(
+    laplacian, k_eigs: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    取 normalized Laplacian 的 k 个最小特征对。
+
+    优先用 ARPACK eigsh(which="SM")；若不收敛则按以下顺序退化：
+      1. ARPACK 放宽 tol / 增加 maxiter；
+      2. 矩阵规模小 (n <= _DENSE_EIGH_MAX_N) 时直接 dense numpy.linalg.eigh；
+      3. 仍然失败则抛 ArpackNoConvergence，让上层走坐标 KMeans 退化路径。
+
+    注意：刻意不再尝试 shift-invert (sigma=0)，因为它需要 LU 分解，
+    在退化拓扑（孤立顶点 / 重复点）上更容易直接段错误，比单纯不收敛更糟。
+    """
+    n = laplacian.shape[0]
+    k_eigs = min(k_eigs, max(1, n - 1))
+
+    try:
+        return eigsh(
+            laplacian,
+            k=k_eigs,
+            which="SM",
+            tol=1e-4,
+            maxiter=max(1000, n * 5),
+        )
+    except ArpackNoConvergence:
+        pass
+
+    try:
+        return eigsh(
+            laplacian,
+            k=k_eigs,
+            which="SM",
+            tol=1e-2,
+            maxiter=max(5000, n * 20),
+        )
+    except ArpackNoConvergence:
+        pass
+
+    if n <= _DENSE_EIGH_MAX_N:
+        dense = (
+            laplacian.toarray()
+            if hasattr(laplacian, "toarray")
+            else np.asarray(laplacian)
+        )
+        dense = 0.5 * (dense + dense.T)
+        eigvals, eigvecs = np.linalg.eigh(dense)
+        return eigvals[:k_eigs], eigvecs[:, :k_eigs]
+
+    raise ArpackNoConvergence(
+        f"eigsh failed for n={n}, k={k_eigs}; dense fallback skipped (n>{_DENSE_EIGH_MAX_N})",
+        np.array([]),
+        np.zeros((n, 0)),
+    )
+
+
 def spectral_cluster_vertices(
     vertices: np.ndarray,
     faces: np.ndarray,
@@ -200,6 +263,7 @@ def spectral_cluster_vertices(
     min_clusters: int = DEFAULT_MIN_CLUSTERS,
     max_clusters: int = DEFAULT_MAX_CLUSTERS,
     random_state: int = 0,
+    init_vertex_indices: Optional[Sequence[int]] = None,
 ) -> Tuple[np.ndarray, int, Dict[str, Any]]:
     """
     对网格顶点做谱聚类。
@@ -215,13 +279,7 @@ def spectral_cluster_vertices(
     laplacian = normalized_graph_laplacian(adjacency)
 
     k_eigs = min(max(max_clusters + 1, min_clusters + 1), max(2, n - 1))
-    eigenvalues, eigenvectors = eigsh(
-        laplacian,
-        k=k_eigs,
-        which="SM",
-        tol=1e-4,
-        maxiter=max(1000, n * 5),
-    )
+    eigenvalues, eigenvectors = _solve_smallest_eigs(laplacian, k_eigs)
 
     order = np.argsort(eigenvalues)
     eigenvalues = eigenvalues[order]
@@ -239,7 +297,14 @@ def spectral_cluster_vertices(
         emb = eigenvectors[:, 1 : n_clusters + 1]
         if emb.shape[1] == 0:
             emb = eigenvectors[:, :1]
-        labels = _kmeans(emb, n_clusters, random_state=random_state)
+        init_centers = None
+        if init_vertex_indices is not None:
+            idx = np.asarray(list(init_vertex_indices), dtype=np.int64)
+            if idx.size == n_clusters and idx.min() >= 0 and idx.max() < n:
+                init_centers = emb[idx].copy()
+        labels = _kmeans(
+            emb, n_clusters, random_state=random_state, init_centers=init_centers
+        )
 
     debug = {
         "num_vertices": n,
@@ -300,7 +365,7 @@ def render_spectral_cluster_views(
     cols: int = 4,
 ) -> Tuple[Path, Path]:
     """渲染 12 视角拼图与单视角概览图。"""
-    from heatmap_renderer import (
+    from rendering.heatmap_renderer import (
         DEFAULT_OVERVIEW_VIEW,
         render_segmentation_panel,
         render_segmentation_view,

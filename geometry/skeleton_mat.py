@@ -13,7 +13,7 @@ from typing import Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 import numpy as np
 
 if TYPE_CHECKING:
-    from mesh_distortion_analyzer import SkeletonRig
+    from geometry.mesh_distortion_analyzer import SkeletonRig
 
 
 def _skin_joint_parent(joint_nodes: Sequence[int], node_parents: Sequence[int], j: int) -> int:

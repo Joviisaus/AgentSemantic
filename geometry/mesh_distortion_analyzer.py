@@ -1532,7 +1532,7 @@ def main() -> None:
             parser.error("--view 格式应为 ELEV,AZIM，例如 22.6,45")
         view_elev, view_azim = float(parts[0]), float(parts[1])
     else:
-        from heatmap_renderer import DEFAULT_OVERVIEW_VIEW
+        from rendering.heatmap_renderer import DEFAULT_OVERVIEW_VIEW
 
         view_elev, view_azim = DEFAULT_OVERVIEW_VIEW
 
@@ -1606,7 +1606,7 @@ def main() -> None:
     seg_face_labels: Optional[List[int]] = None
     seg_num_segments = 0
     if not args.no_seg_mat and result.render_vertices is not None:
-        from seg_mat_runner import run_seg_mat_on_render_pose
+        from geometry.seg_mat_runner import run_seg_mat_on_render_pose
 
         print(f"[seg-mat] -> {medoid_pose_dir.resolve()}")
         seg_result = run_seg_mat_on_render_pose(
@@ -1642,7 +1642,7 @@ def main() -> None:
 
     spectral_cluster_summary: Optional[Dict[str, Any]] = None
     if not args.no_spectral_cluster and result.render_vertices is not None:
-        from spectral_cluster import run_spectral_clustering_on_render_pose
+        from geometry.spectral_cluster import run_spectral_clustering_on_render_pose
 
         n_clusters = args.spectral_clusters
         print(f"[spectral] -> {spectral_cluster_dir.resolve()}")
@@ -1690,7 +1690,7 @@ def main() -> None:
         and seg_face_labels is not None
         and len(seg_face_labels) == len(mesh.faces)
     ):
-        from heatmap_renderer import render_medoid_segmentation_12view
+        from rendering.heatmap_renderer import render_medoid_segmentation_12view
 
         t_seg_render = time.perf_counter()
         seg_panel = render_medoid_segmentation_12view(
@@ -1721,7 +1721,7 @@ def main() -> None:
         print(f"[export] {json_path.resolve()}")
 
     if not args.no_render and result.render_vertices is not None:
-        from heatmap_renderer import render_medoid_pose_overview
+        from rendering.heatmap_renderer import render_medoid_pose_overview
 
         ang = result.render_frame_angular
         area = result.render_frame_area
@@ -1752,7 +1752,7 @@ def main() -> None:
         print(f"[render] {overview.composite}  (视角 elev={view_elev}, azim={view_azim})")
 
     if not args.no_render and not args.no_animation_heatmaps:
-        from heatmap_renderer import render_all_animations_from_mesh
+        from rendering.heatmap_renderer import render_all_animations_from_mesh
 
         t3 = time.perf_counter()
         metric_list = [m.strip() for m in args.metrics.split(",") if m.strip()]

@@ -43,6 +43,13 @@ class SemanticBlock:
     children_ids: List[str] = field(default_factory=list)
     panel_path: Optional[str] = None
     notes: str = ""
+    # 由 review 触发的强制分裂：跳过 VLM classify，直接走 partial 的分裂路径。
+    # 用于 review 判定 over_claimed 时把过大的 FULL 块降级回去再切。
+    force_split: bool = False
+    # 是否已做过 segmat 几何预分割（auto-K 谱聚类，基于特征值 gap 自动估 K）。
+    # 单连通块的第一次几何切走 segmat；segmat 的子块再切才走 VLM 给 K 的 FPS-spectral。
+    # CC 切出的新 CC 子块默认 False（每个 CC 都需要各自做一次 segmat）。
+    segmat_done: bool = False
 
     @property
     def size(self) -> int:

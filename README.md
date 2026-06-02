@@ -17,20 +17,31 @@
 
 ```
 AgentSematic/
-├── mesh_distortion_analyzer.py   # 主入口：畸变分析 + 端到端流水线 + CLI
-├── heatmap_renderer.py           # 独立的热力图渲染 CLI（仅热力图）
-├── spectral_cluster.py           # medoid 姿态上的谱聚类分割
-├── seg_mat_runner.py             # SEG-MAT / QMAT 调用封装
-├── skeleton_mat.py               # 从蒙皮骨架近似生成 initial.ma
-├── vlm/                          # VLM 语义细化（三分类 + 局部分裂循环）
-│   ├── api_keys.py / config.py   #   .env 加载 + provider 配置
-│   ├── client.py                 #   OpenAI 兼容 / Anthropic / Google / Azure
-│   ├── prompts.py                #   三分类与种子数提示
-│   ├── render_component.py       #   单分块高亮 12 视角渲染
-│   ├── classifier.py             #   full / partial / none 判定
-│   ├── seed_split.py             #   局部符合分块的子谱聚类
-│   ├── pipeline.py               #   迭代细化主循环
-│   └── cli.py                    #   python -m vlm.cli 入口
+├── geometry/                     # 纯几何 / 拓扑 / 聚类（无 HTTP，无 pyvista）
+│   ├── mesh_distortion_analyzer.py  # 主入口：畸变分析 + 端到端流水线 + CLI
+│   ├── spectral_cluster.py          # medoid 姿态上的谱聚类分割
+│   ├── seg_mat_runner.py            # SEG-MAT / QMAT 调用封装
+│   ├── skeleton_mat.py              # 从蒙皮骨架近似生成 initial.ma
+│   ├── blocks.py                    # SemanticBlock 树结构 + 序列化
+│   ├── seed_split.py                # 在分块子 mesh 上 FPS / 谱聚类分裂
+│   └── grouped_split.py             # 过分割 + VLM 一次性分组
+├── rendering/                    # 离屏渲染（pyvista + PIL）
+│   ├── heatmap_renderer.py          # 独立的热力图渲染 CLI（仅热力图）
+│   ├── render_component.py          # 单分块高亮 / 单视角透明背景渲染
+│   └── view_thumbnails.py           # 选视角用的 12 张缩略图拼图
+├── vlm/                          # **只**包含 VLM 请求相关代码
+│   ├── api_keys.py / config.py      # .env 加载 + provider 配置
+│   ├── client.py                    # OpenAI 兼容 / Anthropic / Google / Doubao
+│   ├── prompts.py                   # 三分类 / 分组 / 种子数 / 进度自审 提示模板
+│   ├── classifier.py                # full / partial / none 判定（HTTP 封装）
+│   ├── review.py                    # 全局进度自审（HTTP 封装）
+│   ├── view_selector.py             # 最佳视角选择（HTTP 封装）
+│   └── cli.py                       # 兼容旧入口的薄转发 → pipeline.cli
+├── pipeline/                     # 流水线 / HTML 报告 / CLI
+│   ├── pipeline.py                  # 迭代细化主循环
+│   ├── report.py                    # 单文件 HTML 报告生成
+│   └── cli.py                       # python -m pipeline.cli 入口（推荐）
+├── scripts/                      # 调试小脚本（ping providers / smoke test）
 ├── config/
 │   └── vlm_config.yaml           # VLM API 配置（API Key 走环境变量）
 ├── .env.example                  # 复制为 .env 后填 API Key；.env 已被 .gitignore
@@ -119,7 +130,7 @@ $env:OPENAI_API_KEY = "sk-..."
 最常用的一条命令：
 
 ```bash
-python mesh_distortion_analyzer.py path/to/model.glb
+python -m geometry.mesh_distortion_analyzer path/to/model.glb
 ```
 
 会自动在 `output/<模型名>/` 下生成：
@@ -148,7 +159,7 @@ output/<模型名>/
 
 ## 常用 CLI 参数
 
-### `mesh_distortion_analyzer.py`（端到端主入口）
+### `geometry.mesh_distortion_analyzer`（端到端主入口）
 
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
@@ -173,12 +184,12 @@ output/<模型名>/
 | `--uniform-weight` | — | 动作等权（默认按时长加权） |
 | `--verbose` | — | 打印各阶段耗时 |
 
-完整参数见 `python mesh_distortion_analyzer.py -h`。
+完整参数见 `python -m geometry.mesh_distortion_analyzer -h`。
 
-### `heatmap_renderer.py`（只渲染热力图）
+### `rendering.heatmap_renderer`（只渲染热力图）
 
 ```bash
-python heatmap_renderer.py path/to/model.glb --metrics angular,area --max-frames 60
+python -m rendering.heatmap_renderer path/to/model.glb --metrics angular,area --max-frames 60
 ```
 
 仅做参考形状计算 + 热力图渲染，不跑 SEG-MAT / 谱聚类。参数子集与上面同名一致。
@@ -190,27 +201,27 @@ python heatmap_renderer.py path/to/model.glb --metrics angular,area --max-frames
 **只看畸变热力图，跳过所有分割：**
 
 ```bash
-python mesh_distortion_analyzer.py model.glb --no-seg-mat --no-spectral-cluster
+python -m geometry.mesh_distortion_analyzer model.glb --no-seg-mat --no-spectral-cluster
 ```
 
 **只想要 SEG-MAT 分割结果，并指定 SEG-MAT 路径：**
 
 ```bash
-python mesh_distortion_analyzer.py model.glb --no-spectral-cluster \
+python -m geometry.mesh_distortion_analyzer model.glb --no-spectral-cluster \
     --seg-mat-exe D:/tools/SEG-MAT.exe --qmat-exe D:/tools/QMAT.exe
 ```
 
 **手动指定谱聚类簇数 = 8、降低畸变特征权重：**
 
 ```bash
-python mesh_distortion_analyzer.py model.glb --no-seg-mat \
+python -m geometry.mesh_distortion_analyzer model.glb --no-seg-mat \
     --spectral-clusters 8 --spectral-scalar-weight 0.15
 ```
 
 **只算数据不出图（适合批处理 / CI）：**
 
 ```bash
-python mesh_distortion_analyzer.py model.glb --no-render
+python -m geometry.mesh_distortion_analyzer model.glb --no-render
 ```
 
 ---
@@ -219,12 +230,15 @@ python mesh_distortion_analyzer.py model.glb --no-render
 
 | 模块 | 作用 |
 | --- | --- |
-| `mesh_distortion_analyzer.py` | 加载多种 mesh 格式、采样动画帧、计算畸变指标、选 medoid、串起全流水线 |
-| `heatmap_renderer.py` | 基于 pyvista + Pillow 的离屏渲染：12 视角拼图、统一色阶、SEG-MAT 调色板等 |
-| `spectral_cluster.py` | 归一化图 Laplacian + KMeans；特征值间隙自动估簇数；融合畸变标量特征 |
-| `seg_mat_runner.py` | 写 `.off`、调用 QMAT 简化 MAT、调用 SEG-MAT、解析彩色 OFF 反推 face 标签 |
-| `skeleton_mat.py` | 蒙皮骨架 → `initial.ma`：关节→球，父子→边，兄弟关节→三角面（QMAT 拓扑校验） |
-| `vlm/` | VLM 语义细化：高亮单块 12 视角图 → 三分类 → 局部符合再谱聚类分裂（递归直至收敛） |
+| `geometry/mesh_distortion_analyzer.py` | 加载多种 mesh 格式、采样动画帧、计算畸变指标、选 medoid、串起全流水线 |
+| `rendering/heatmap_renderer.py` | 基于 pyvista + Pillow 的离屏渲染：12 视角拼图、统一色阶、SEG-MAT 调色板等 |
+| `geometry/spectral_cluster.py` | 归一化图 Laplacian + KMeans；特征值间隙自动估簇数；融合畸变标量特征 |
+| `geometry/seg_mat_runner.py` | 写 `.off`、调用 QMAT 简化 MAT、调用 SEG-MAT、解析彩色 OFF 反推 face 标签 |
+| `geometry/skeleton_mat.py` | 蒙皮骨架 → `initial.ma`：关节→球，父子→边，兄弟关节→三角面（QMAT 拓扑校验） |
+| `geometry/{blocks,seed_split,grouped_split}.py` | SemanticBlock 树 + 分块子谱聚类 + 过分割分组 |
+| `rendering/{render_component,view_thumbnails}.py` | 单分块高亮 / 单视角透明背景 / 12 视角缩略图 |
+| `vlm/` | VLM 请求层：客户端、提示模板、三分类 / 进度自审 / 视角选择 |
+| `pipeline/` | 主流程编排 + 单文件 HTML 报告 + CLI（`python -m pipeline.cli`） |
 
 ---
 
@@ -252,12 +266,20 @@ python mesh_distortion_analyzer.py model.glb --no-render
 
 ```bash
 # 先准备好 .env 中的 API Key
-python -m vlm.cli \
+python -m pipeline.cli \
     output/<模型>/medoid_pose/render_pose.off \
     --labels output/<模型>/medoid_pose/face_segment_labels.json \
     --semantic "面部" \
     --provider openai \
     --verbose
+
+# 旧入口 python -m vlm.cli 已转为薄转发，命令行参数完全兼容
+```
+
+也可以直接用提供的测试脚本跑一个 smoke check：
+
+```bash
+python -m scripts.test_vlm_pipeline --smoke    # 不调 VLM，只验证四个包的 import & 渲染链
 ```
 
 也可以传 `--labels output/<模型>/spectral_clustering/face_cluster_labels.json` 从
@@ -301,7 +323,7 @@ responses_log.json     调用流水时序
   只有 `.env.example` 允许进 Git。
 - `config/vlm_config.yaml` 全部用 `${ENV_VAR_NAME}` 引用 key，YAML 里**没有任何明文 key**。
 - 程序启动时会按顺序加载 `./.env` → `./.env.local`，已有的环境变量不会被覆盖
-  （所以 CI 里 `OPENAI_API_KEY=xxx python -m vlm.cli ...` 也能正常用）。
+  （所以 CI 里 `OPENAI_API_KEY=xxx python -m pipeline.cli ...` 也能正常用）。
 
 ---
 

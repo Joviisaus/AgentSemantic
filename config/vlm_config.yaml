@@ -60,6 +60,8 @@ providers:
       - qwen-vl-max
       - qwen-vl-plus
       - qwen2-vl-72b-instruct
+      - qwen3-vl-32b-thinking
+      - qwen3-vl-instruct
     default_model: qwen-vl-max
 
   zhipu:
@@ -90,13 +92,24 @@ providers:
   doubao:
     # 字节跳动火山方舟 ARK，兼容 OpenAI Chat Completions
     # 文档: https://www.volcengine.com/docs/82379
+    # ⚠ Ark 的 model 必须是「带日期后缀」的完整 ID，"短名"（如 doubao-1-5-vision-pro-32k）
+    #   会被返回 InvalidEndpointOrModel.NotFound。如下都需要先在 Ark 控制台
+    #   「开通管理」中开通对应模型，否则同样 404。
     enabled: true
     api_key: ${ARK_API_KEY}
     base_url: https://ark.cn-beijing.volces.com/api/v3
     models:
-      - doubao-seed-2-0-pro-260215   # Seed-2.0-Pro，多模态
-      - doubao-1-5-vision-pro-32k
-      - doubao-1-5-vision-lite-32k
+      - doubao-seed-2-0-pro-260215      # Seed-2.0-Pro，多模态（默认）
+      - doubao-seed-2-0-lite-260428     # Seed-2.0-Lite，多模态，低成本（支持 input_image）
+      - doubao-seed-1-6-vision-250815   # Seed-1.6 多模态
+      - doubao-1-5-vision-pro-250328    # 1.5 视觉 Pro（替换原 -32k 短名）
+      - deepseek-v4-flash-260425        # DeepSeek-V4-Flash，纯文本；同走 Ark 网关，可配 web_search 工具
+      - doubao-1-5-vision-pro-32k-250115
+      # 注意：
+      # 1) Doubao 1.5 没有支持图像输入的 "lite" 版，原 doubao-1-5-vision-lite-32k 不存在。
+      #    纯文本轻量版是 doubao-1-5-lite-32k-250115（无视觉，不可用于本项目）。
+      # 2) deepseek-v4-flash-260425 没有视觉能力；本 pipeline 的 view_selector / classifier 需要图像，
+      #    用它会失败。它只适用于"纯文本推理 + web_search 工具"这种 /responses 接口的场景。
     default_model: doubao-seed-2-0-pro-260215
     vision:
       image_detail: auto

@@ -367,7 +367,6 @@ _OPENAI_COMPATIBLE = {
     "ark",             # alias
 }
 
-
 def build_vlm_client(config: VLMProviderConfig) -> VLMClient:
     """根据 provider 名字挑选合适的客户端实现。"""
     name = config.name

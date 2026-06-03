@@ -9,7 +9,7 @@ VLM 提示模板：
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Final
+from typing import Any, Dict, Final, Sequence
 
 LABEL_FULL: Final = "full"
 LABEL_PARTIAL: Final = "partial"
@@ -463,6 +463,191 @@ def build_group_prompt(
             n_candidates=int(n_candidates),
             max_groups=max(2, int(max_groups)),
             candidate_table=candidate_table,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 全覆盖（Full-coverage）模式
+#
+# 思路：先枚举**短名、粗粒度、全覆盖**部位清单（初稿，后续可细化；不区分左右）。
+# 再把清单作为封闭候选集，逐块 multi-label：每个分块必须从候选中至少选 1 项，
+#   - 1 个 → 该块直接归到该部位
+#   - ≥2 个 → 分裂成 len(matched) 个种子继续切（套用 CC → segmat → FPS 级联）
+# 直到每个叶分块只命中 1 个语义为止（不允许 background / 未归类面）。
+# ---------------------------------------------------------------------------
+
+
+ENUMERATE_SYSTEM_PROMPT = (
+    "你是 3D 模型粗粒度语义分区员。"
+    "看 12 视角整模型拼图（无高亮），输出**短名、全覆盖、互不重叠**的部位清单；"
+    "左右对称肢合并为一项（写「手臂」不写「左臂/右臂」）。"
+    "名称宜简（2~6 字），不拆手指/花纹级细节。只输出 JSON。"
+)
+
+
+ENUMERATE_USER_TEMPLATE = """12 视角整模型拼图（淡色、无高亮）。
+
+任务：粗粒度**全覆盖**分区——各项叠起来包住整个主体，彼此不重叠、不重复。
+这是初稿，后续会细化；名称**短而准**（如「头」「躯干」「手臂」），勿写长描述。
+
+命名与颗粒度
+-----------------------------------
+- 每项 2~6 字，不用括号、不用「含/及/+」合并多项。
+- **禁止**用「左/右」区分对称肢：写「手臂」「前臂」「大腿」「小腿」「前肢」「后肢」等统称。
+- 人形常见 6~8 项：头、颈、躯干、上臂、前臂、大腿、小腿（手/脚可并入前臂/小腿）。
+- 四足：头、颈、躯干、尾、前肢、后肢。
+- 简单道具/机械：2~4 项（椅面、椅背、椅腿 …）。
+- 不拆手指/脚趾/发丝；不要把整条腿与躯干合成一项。
+{hint_block}
+
+约束
+-----------------------------------
+1. 全覆盖：主体几何都要能归入某一项；难归类则并入最近大块。
+2. 互不重叠：不要同时列「躯干」与「上身」这类同义重复。
+3. 数量 2~12 项；**不得**出现 background / 其它 / 未分类 等兜底项。
+4. **强约束**：最终每项至少 1 个 face；模型上不存在或无法切出的部位不要列入（收尾阶段会 delete 或 split 补救）。
+
+只返回 JSON：
+{{
+  "object_kind": "≤12 字，模型类型（如「类人角色」「四足动物」「椅子」）",
+  "semantic_parts": ["短名1", "短名2", "..."],
+  "reason": "≤20 字，可选，说明分区依据"
+}}
+"""
+
+
+MULTI_LABEL_SYSTEM_PROMPT = (
+    "你是 3D 分块多标签判别员。"
+    "12 视角拼图里仅一块为鲜艳红/橙高亮，其余淡灰。"
+    "只能从封闭候选集中勾选红色**实际覆盖**的部位；**至少选 1 项**，禁止 background。"
+    "只输出 JSON。"
+)
+
+
+MULTI_LABEL_USER_TEMPLATE = """从候选集中标出红色高亮块覆盖了哪些部位。
+
+候选（封闭集，只能从中选，须**原样拼写**）：
+{candidate_table}
+
+规则
+-----------------------------------
+1. 只认鲜艳红/橙；灰/白/米色不算红。
+2. **matched_parts 至少 1 项**；看不清时选占比最大或几何最相关的候选，禁止留空。
+3. 通常 1~3 个相邻候选；≥4 项先删减不确定项。
+4. 候选未列出的几何 → 归入**空间最近**的候选，勿自造新词。
+
+只返回 JSON：
+{{
+  "matched_parts": ["候选原文", "..."],
+  "dominant": "matched 中占比最大的一项（必填，且须在 matched_parts 内）"
+}}
+
+说明：共 {n_candidates} 个候选；matched_parts 每项须与候选完全一致。
+"""
+
+
+EMPTY_SEMANTIC_REPAIR_SYSTEM_PROMPT = (
+    "你是 3D 全覆盖语义审计员。"
+    "枚举清单中每一项最终都必须至少占 1 个 mesh face，不允许 0 face 的空语义。"
+    "对 0 face 的项，你只能二选一："
+    "split=从已有块中分裂 carve 出该部位；delete=从清单删除该项。"
+    "只输出 JSON。"
+)
+
+
+EMPTY_SEMANTIC_REPAIR_USER_TEMPLATE = """当前分割结果（12 视角按语义上色图）见附图。
+
+语义清单与各部位 face 数（**0 表示空语义，必须处理**）：
+{counts_table}
+
+0 face 的语义（必须逐项给出 repair）：
+{empty_list}
+
+可供 split 时选取的 donor 块（只能从下表 block_id 里选；须足够大以便分裂）：
+{donor_table}
+
+任务
+-----------------------------------
+对每个 0 face 语义给出 **唯一** repair：
+- **split**：从 donor 块里 carve 出该语义的几何。
+  必须填 `donor_block_id`（上表之一），优先选几何上最可能包含该部位的块。
+- **delete**：模型上不存在或已被其它语义覆盖，从清单移除该项。
+  不要填 `donor_block_id`。
+
+只能返回 JSON：
+{{
+  "repairs": [
+    {{
+      "empty_semantic": "须与上面 0 face 列表完全一致",
+      "action": "split | delete",
+      "donor_block_id": "split 时必填 block_id；delete 时省略或空字符串",
+      "reason": "≤30 字"
+    }}
+  ]
+}}
+
+要求：repairs 必须覆盖全部 0 face 语义，每项恰好 1 条；不得遗漏。
+"""
+
+
+def build_enumerate_prompt(*, hint: str = "") -> ClassifyPrompt:
+    """构建「枚举全覆盖语义部位」提示。`hint` 注入额外约束
+    （例如「四足猫，按动物骨架短名分区」）。"""
+    hint_block = (
+        f"- 用户补充：{hint.strip()}"
+        if hint and hint.strip()
+        else "- 无额外说明：按上图形态自选合适模板，保持短名全覆盖。"
+    )
+    return ClassifyPrompt(
+        system=ENUMERATE_SYSTEM_PROMPT,
+        user=ENUMERATE_USER_TEMPLATE.format(hint_block=hint_block),
+    )
+
+
+def build_multi_label_prompt(
+    candidate_parts: list[str],
+) -> ClassifyPrompt:
+    """构建「多标签 — 命中候选集中的哪些部位」提示。"""
+    parts = [str(x).strip() for x in candidate_parts if str(x).strip()]
+    if not parts:
+        raise ValueError("candidate_parts 不能为空")
+    candidate_table = "\n".join(f"- {i+1}. {p}" for i, p in enumerate(parts))
+    return ClassifyPrompt(
+        system=MULTI_LABEL_SYSTEM_PROMPT,
+        user=MULTI_LABEL_USER_TEMPLATE.format(
+            candidate_table=candidate_table,
+            n_candidates=len(parts),
+        ),
+    )
+
+
+def build_empty_semantic_repair_prompt(
+    *,
+    semantic_parts: Sequence[str],
+    face_counts: Dict[str, int],
+    empty_parts: Sequence[str],
+    donor_blocks: Sequence[Dict[str, Any]],
+) -> ClassifyPrompt:
+    """0 face 语义补救：VLM 决定 split（从 donor 块 carve）或 delete。"""
+    counts_table = "\n".join(
+        f"- {p}: {int(face_counts.get(p, 0))} face"
+        for p in semantic_parts
+    )
+    empty_list = "\n".join(f"- {p}" for p in empty_parts)
+    if donor_blocks:
+        donor_table = "\n".join(
+            f"- {b['block_id']}: {b['semantic']}, {int(b['faces'])} face"
+            for b in donor_blocks
+        )
+    else:
+        donor_table = "（无可用 donor 块 → 只能 delete）"
+    return ClassifyPrompt(
+        system=EMPTY_SEMANTIC_REPAIR_SYSTEM_PROMPT,
+        user=EMPTY_SEMANTIC_REPAIR_USER_TEMPLATE.format(
+            counts_table=counts_table,
+            empty_list=empty_list,
+            donor_table=donor_table,
         ),
     )
 

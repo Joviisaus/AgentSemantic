@@ -27,6 +27,15 @@ from .config import (
     get_provider_config,
     load_vlm_config,
 )
+from .full_coverage import (
+    EmptySemanticRepair,
+    EmptySemanticRepairPlan,
+    MultiLabelClassification,
+    SemanticEnumeration,
+    classify_multi_label,
+    enumerate_semantics,
+    resolve_empty_semantic_repairs,
+)
 from .review import ProgressReview, review_progress
 from .view_selector import BestViewSelection, select_best_view
 
@@ -34,12 +43,19 @@ __all__ = [
     "BestViewSelection",
     "ComponentClassification",
     "DEFAULT_CONFIG_PATH",
+    "EmptySemanticRepair",
+    "EmptySemanticRepairPlan",
+    "MultiLabelClassification",
     "ProgressReview",
+    "SemanticEnumeration",
     "VLMClient",
     "VLMProviderConfig",
     "VLMResponse",
     "build_vlm_client",
     "classify_component",
+    "classify_multi_label",
+    "enumerate_semantics",
+    "resolve_empty_semantic_repairs",
     "get_provider_config",
     "load_dotenv",
     "load_vlm_config",

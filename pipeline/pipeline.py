@@ -629,7 +629,7 @@ class SemanticRefinementPipeline:
     @staticmethod
     def _make_forced_partial_classification():
         """force_split=True 时的占位分类，等价于"伪造一个 partial"让分裂路径接管。"""
-        from .classifier import ComponentClassification
+        from vlm.classifier import ComponentClassification
 
         return ComponentClassification(
             label=LABEL_PARTIAL,

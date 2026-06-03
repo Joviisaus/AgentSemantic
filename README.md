@@ -38,9 +38,11 @@ AgentSematic/
 │   ├── view_selector.py             # 最佳视角选择（HTTP 封装）
 │   └── cli.py                       # 兼容旧入口的薄转发 → pipeline.cli
 ├── pipeline/                     # 流水线 / HTML 报告 / CLI
-│   ├── pipeline.py                  # 迭代细化主循环
+│   ├── pipeline.py                  # 单语义迭代细化主循环（full/partial/none）
+│   ├── full_coverage.py             # 全覆盖语义分割主循环（multi-label + 按命中数分裂）
 │   ├── report.py                    # 单文件 HTML 报告生成
-│   └── cli.py                       # python -m pipeline.cli 入口（推荐）
+│   ├── cli.py                       # python -m pipeline.cli 入口（单语义）
+│   └── full_coverage_cli.py         # python -m pipeline.full_coverage_cli 入口（全覆盖）
 ├── scripts/                      # 调试小脚本（ping providers / smoke test）
 ├── config/
 │   └── vlm_config.yaml           # VLM API 配置（API Key 走环境变量）
@@ -324,6 +326,117 @@ responses_log.json     调用流水时序
 - `config/vlm_config.yaml` 全部用 `${ENV_VAR_NAME}` 引用 key，YAML 里**没有任何明文 key**。
 - 程序启动时会按顺序加载 `./.env` → `./.env.local`，已有的环境变量不会被覆盖
   （所以 CI 里 `OPENAI_API_KEY=xxx python -m pipeline.cli ...` 也能正常用）。
+
+---
+
+## VLM 全覆盖语义分割（`pipeline/full_coverage.py`）
+
+与上面的 **单语义** 模式（full/partial/none）不同，**全覆盖** 模式让 VLM 自己看
+整模型枚举出一份「全包围、互不重叠」的语义清单，再把模型的**每一块面**都分配到
+清单中的某一个部位上，等价于一次性完成「语义分块」。
+
+### 算法流程
+
+1. **整模型 overview 渲染 → VLM 枚举**
+   渲染一张「整模型 12 视角同色拼图」（`semantics_overview.png`），让 VLM 列出一份
+   **全包围、互不重叠** 的语义部位清单。例如人形角色 → `["头部", "颈部", "躯干",
+   "左上臂", "右上臂", "左前臂+左手", ..., "左小腿+左脚", "右小腿+右脚"]`。
+   也可以用 `--semantic-parts` 或 `--semantic-parts-file` 直接给定，跳过 VLM 枚举。
+2. **初始分块**：同单语义模式 —— SEG-MAT/谱聚类 label（或直接整 mesh）→ 按连通分量展开
+   → 每个 CC 作为一个 `C{i}` 根 block。
+3. **逐块 multi-label**：对每个待定块渲染高亮 12 视角，把封闭候选集喂给 VLM 让它
+   选出红色实际覆盖到的语义（multi-label，0~N 项）：
+   ```json
+   {
+     "matched_parts": ["头部", "颈部"],
+     "is_background": false,
+     "dominant": "头部",
+     "confidences": {"头部": 0.85, "颈部": 0.4},
+     "notes": "..."
+   }
+   ```
+4. **按命中数分裂**：
+   - `len(matched) == 0` / `is_background=true` → 该块为 **background**，
+     标 `none` 不再处理；
+   - `len(matched) == 1` → 该块直接归到该语义；
+   - `len(matched) ≥ 2` → 切成 `K = len(matched)` 个子块（同样走
+     CC → segmat → FPS-Voronoi-Lloyd 级联），子块下一轮再 multi-label。
+5. **终止条件**：所有叶块的 `matched` 数 ≤ 1，或达到 `--max-depth`，或子块面数低于
+   `--min-block-size`。`max-depth` 处仍是多命中时，把块归到 VLM 的 `dominant`
+   语义（保守的"best-effort"接受）。
+
+### 一行命令
+
+```bash
+# 让 VLM 自己枚举语义清单
+python -m pipeline.full_coverage_cli \
+    output/<模型>/medoid_pose/render_pose.off \
+    --labels output/<模型>/medoid_pose/face_segment_labels.json \
+    --enumerate-hint "请按拟人骨架来切，左右对称肢分开" \
+    --provider openai \
+    --verbose
+
+# 或显式给定语义清单，跳过 VLM 枚举
+python -m pipeline.full_coverage_cli \
+    output/<模型>/medoid_pose/render_pose.off \
+    --semantic-parts "头部,颈部,躯干,左上臂,右上臂,左前臂,右前臂,左大腿,右大腿,左小腿,右小腿" \
+    --provider openai \
+    --verbose
+```
+
+### 输出
+
+`output/<模型>/vlm_full/`：
+
+```
+enumeration.json              VLM 枚举到的语义清单（含理由 / 置信度）
+semantics_overview.png        整模型 12 视角 overview（枚举所用的输入图）
+panels/                       每个 block 的高亮 12 视角图（block_C0.png ...）
+responses/                    每次 VLM multi-label 调用的原始 JSON
+initial_segmentation.png      初始分块拼图（按 CC 着色）
+full_coverage_mask.png        最终：每张面按所属语义上色（自带配色图例）
+face_semantic_labels.json     每张面最终的 semantic 索引 / 部位计数
+leaf_blocks_overview.png      叶分块总览（每块独立随机色，便于核对切分粒度）
+block_tree.json               完整 block 树（含 multi-label 决策 / 分裂记录）
+live_report.html              实时 HTML 进度页（自带 meta refresh）
+iterations/iter_NN.png        单视角迭代时间线
+best_view.json                VLM 选定的视角 + 理由
+best_view_overview.png        chosen view 的整模型透明背景 PNG
+```
+
+### 常用参数
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `mesh` | — | **必填**，渲染姿态 mesh（推荐 `render_pose.off`） |
+| `--labels PATH` | 整 mesh 连通分量 | 初始分块来源 JSON |
+| `--enumerate-hint STR` | `""` | 给 VLM 枚举阶段的额外提示（如 "按拟人骨架切"） |
+| `--semantic-parts STR` | — | 显式给定语义清单（逗号 / 中文「、」分隔），跳过 VLM 枚举 |
+| `--semantic-parts-file PATH` | — | 从 JSON 读语义清单，跳过 VLM 枚举 |
+| `--enumerate-min-parts N` | `2` | VLM 枚举的最少部位数 |
+| `--enumerate-max-parts N` | `12` | VLM 枚举的最多部位数 |
+| `--enumerate-model NAME` | 默认模型 | 枚举阶段单独指定模型 |
+| `--max-depth N` | `6` | 分裂递归深度上限 |
+| `--min-block-size N` | `20` | 忽略 face 数少于该值的分块 |
+| `--max-seeds-per-split N` | `6` | 单次分裂的种子数上限（默认 `K=len(matched)`） |
+| `--parallel-vlm N` | `1` | 每轮 N 个块的 multi-label 用线程池并发 |
+| `--no-live-report` | — | 关闭 live_report.html |
+| `--no-view-select` | — | 关掉 VLM 选视角，直接用 DEFAULT_OVERVIEW_VIEW |
+| `--dry-run` | — | 只渲染 overview + 初始分块，不调用 VLM |
+| `--verbose` | — | 打印每个 block 的命中 / 分裂记录 |
+
+完整参数见 `python -m pipeline.full_coverage_cli -h`。
+
+### 与单语义模式的对比
+
+|  | 单语义 (`pipeline.cli`) | 全覆盖 (`pipeline.full_coverage_cli`) |
+| --- | --- | --- |
+| 用户输入 | 一条语义文本（如「面部」） | 无（VLM 自己枚举）或一份语义清单 |
+| VLM 判定 | full / partial / none | 命中候选清单中的哪些部位（multi-label） |
+| 分裂触发 | label=partial | matched ≥ 2 |
+| 分裂种子数 | VLM 单独询问 `seed_count` | `K = len(matched_parts)` |
+| 最终掩码 | 一种颜色 = 符合语义 | 每个语义一种颜色 + background |
+| 用途 | 提取**一个**特定语义区域 | 一次性完成**整模型语义分块** |
 
 ---
 

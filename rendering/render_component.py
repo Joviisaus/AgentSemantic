@@ -546,10 +546,123 @@ def render_initial_segmentation_panel(
     )
 
 
+# 全覆盖模式下叶分块染色用的高对比调色板（≤16 个语义部位）
+FULL_COVERAGE_PALETTE: Tuple[Tuple[int, int, int], ...] = (
+    (228, 26, 28),    # 红
+    (55, 126, 184),   # 蓝
+    (77, 175, 74),    # 绿
+    (152, 78, 163),   # 紫
+    (255, 127, 0),    # 橙
+    (255, 215, 30),   # 黄
+    (166, 86, 40),    # 棕
+    (247, 129, 191),  # 粉
+    (0, 200, 200),    # 青
+    (140, 86, 75),    # 巧克力
+    (23, 190, 207),   # 天青
+    (180, 180, 50),   # 橄榄
+    (102, 194, 165),  # 薄荷
+    (252, 141, 98),   # 杏
+    (141, 160, 203),  # 灰蓝
+    (231, 138, 195),  # 玫瑰
+)
+FULL_COVERAGE_BG_RGB: Tuple[int, int, int] = (235, 235, 240)
+FULL_COVERAGE_PENDING_RGB: Tuple[int, int, int] = (255, 215, 130)
+
+
+def render_full_coverage_panel(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    face_semantic_index: Sequence[int],
+    semantic_labels: Sequence[str],
+    output_path: str | Path,
+    *,
+    title: str = "全覆盖语义分割",
+    image_size: int = 512,
+    cols: int = 4,
+    palette: Tuple[Tuple[int, int, int], ...] = FULL_COVERAGE_PALETTE,
+    background_rgb: Tuple[int, int, int] = FULL_COVERAGE_BG_RGB,
+    pending_rgb: Tuple[int, int, int] = FULL_COVERAGE_PENDING_RGB,
+) -> Path:
+    """渲染全覆盖语义分割结果的 12 视角拼图：
+
+    - ``face_semantic_index[i]``:
+        - ``-1`` → background / 不属于任何已枚举部位 → 用 ``background_rgb`` 染色
+        - ``-2`` → pending（迭代未结束就保存）→ 用 ``pending_rgb``
+        - ``0..K-1`` → 对应 ``semantic_labels[k]`` → 用 ``palette[k % len(palette)]``
+    - 标题区域附带「编号 → 颜色」图例，便于核对配色。
+    """
+    n_faces = _faces_count(faces)
+    indices = np.asarray(face_semantic_index, dtype=np.int64)
+    if indices.shape[0] != n_faces:
+        raise ValueError(
+            f"face_semantic_index 长度 {indices.shape[0]} ≠ faces.shape[0] {n_faces}"
+        )
+    n_sem = len(semantic_labels)
+    if n_sem == 0:
+        raise ValueError("semantic_labels 不能为空")
+
+    face_colors = np.tile(np.asarray(background_rgb, dtype=np.uint8), (n_faces, 1))
+    bg_mask = indices == -1
+    pending_mask = indices == -2
+    face_colors[bg_mask] = np.asarray(background_rgb, dtype=np.uint8)
+    face_colors[pending_mask] = np.asarray(pending_rgb, dtype=np.uint8)
+    for k in range(n_sem):
+        m = indices == k
+        if not np.any(m):
+            continue
+        face_colors[m] = np.asarray(palette[k % len(palette)], dtype=np.uint8)
+
+    views = _render_views_with_color_table(
+        vertices, faces, face_colors, image_size=(image_size, image_size)
+    )
+
+    legend_lines: List[str] = []
+    for k, name in enumerate(semantic_labels):
+        rgb = palette[k % len(palette)]
+        legend_lines.append(
+            f"{k + 1}={name} ({rgb[0]:>3},{rgb[1]:>3},{rgb[2]:>3})"
+        )
+    legend = "  ".join(legend_lines)
+    full_title = f"{title}  parts={n_sem}  | {legend}"
+    return _compose_panel(
+        views,
+        output_path=Path(output_path),
+        title=full_title,
+        cols=cols,
+    )
+
+
+def render_overview_only_panel(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    output_path: str | Path,
+    *,
+    title: str = "整模型概览",
+    image_size: int = 512,
+    cols: int = 4,
+    body_rgb: Tuple[int, int, int] = (210, 215, 225),
+) -> Path:
+    """渲染一张「整模型同色 12 视角拼图」，用于 VLM 全覆盖语义枚举的输入图。"""
+    n_faces = _faces_count(faces)
+    face_colors = np.tile(np.asarray(body_rgb, dtype=np.uint8), (n_faces, 1))
+    views = _render_views_with_color_table(
+        vertices, faces, face_colors, image_size=(image_size, image_size)
+    )
+    return _compose_panel(
+        views,
+        output_path=Path(output_path),
+        title=title,
+        cols=cols,
+    )
+
+
 __all__ = [
     "ACCEPTED_RGB",
     "CANDIDATE_PALETTE",
     "DIM_RGB",
+    "FULL_COVERAGE_BG_RGB",
+    "FULL_COVERAGE_PALETTE",
+    "FULL_COVERAGE_PENDING_RGB",
     "HIGHLIGHT_RGB",
     "HIGHLIGHT_RGB_SECONDARY",
     "REJECTED_RGB",
@@ -559,8 +672,10 @@ __all__ = [
     "PROGRESS_ABANDONED_RGB",
     "build_highlight_face_colors",
     "render_candidate_panel",
+    "render_full_coverage_panel",
     "render_highlighted_component_panel",
     "render_initial_segmentation_panel",
+    "render_overview_only_panel",
     "render_progress_panel",
     "render_semantic_mask_panel",
     "render_single_view_overview",

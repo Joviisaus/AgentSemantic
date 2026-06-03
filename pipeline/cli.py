@@ -80,6 +80,26 @@ def _load_face_labels(path: Path, n_faces: int) -> List[int]:
     return labels
 
 
+def _default_model_dir_name(mesh_path: Path, base: str = "output") -> str:
+    """根据 mesh 路径推断"模型名"子目录：
+
+    1. 如果 mesh 已经位于 ``<base>/<model_dir>/...``（典型 legacy 约定：
+       ``output/<model>/medoid_pose/render_pose.off``），用 ``<model_dir>`` —
+       这样能把 VLM 产物和已有的 pose / segmat 产物归到同一棵目录。
+    2. 否则（例如 ``E:\\data\\Thingi10K\\raw_meshes\\55280.stl``）用 mesh 的
+       文件名 stem，避免同数据集多个 mesh 互相覆盖到 ``output/Thingi10K/`` 下。
+    """
+    base_path = Path(base)
+    try:
+        rel = mesh_path.resolve().relative_to(base_path.resolve())
+        if rel.parts and rel.parts[0] not in ("", "."):
+            return rel.parts[0]
+    except (ValueError, OSError):
+        pass
+    stem = mesh_path.stem or "mesh"
+    return stem
+
+
 def _resolve_output_dir(
     mesh_path: Path,
     semantic: str,
@@ -89,7 +109,10 @@ def _resolve_output_dir(
     if explicit:
         return Path(explicit)
     return (
-        Path(base) / mesh_path.parent.parent.name / "vlm" / _safe_dir_name(semantic)
+        Path(base)
+        / _default_model_dir_name(mesh_path, base)
+        / "vlm"
+        / _safe_dir_name(semantic)
     )
 
 
@@ -124,13 +147,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--output-dir",
         type=str,
         default=None,
-        help="输出目录（默认 output/<模型>/vlm/<语义>/）",
+        help=(
+            "输出目录。默认 <output-base>/<模型>/vlm/<语义>/，其中 <模型> 的"
+            "推断规则：mesh 若已经在 <output-base> 下则取首级子目录"
+            "（保留 output/<model>/medoid_pose/render_pose.off 这种 legacy"
+            "约定），否则按 mesh 文件名 stem。"
+        ),
     )
     p.add_argument(
         "--output-base",
         type=str,
         default="output",
-        help="输出根目录（与 --output-dir 二选一，默认 output）",
+        help="输出根目录（默认 output）",
     )
 
     p.add_argument(

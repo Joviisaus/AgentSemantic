@@ -57,12 +57,8 @@ providers:
     api_key: ${DASHSCOPE_API_KEY}
     base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
     models:
-      - qwen-vl-max
-      - qwen-vl-plus
-      - qwen2-vl-72b-instruct
-      - qwen3-vl-32b-thinking
-      - qwen3-vl-instruct
-    default_model: qwen-vl-max
+      - qwen3.7-plus
+    default_model: qwen3.7-plus
 
   zhipu:
     enabled: false
@@ -105,6 +101,7 @@ providers:
       - doubao-1-5-vision-pro-250328    # 1.5 视觉 Pro（替换原 -32k 短名）
       - deepseek-v4-flash-260425        # DeepSeek-V4-Flash，纯文本；同走 Ark 网关，可配 web_search 工具
       - doubao-1-5-vision-pro-32k-250115
+      - doubao-seed-2-0-mini-260428
       # 注意：
       # 1) Doubao 1.5 没有支持图像输入的 "lite" 版，原 doubao-1-5-vision-lite-32k 不存在。
       #    纯文本轻量版是 doubao-1-5-lite-32k-250115（无视觉，不可用于本项目）。

@@ -18,6 +18,7 @@ from .prompts import (
     LABEL_NONE,
     LABEL_PARTIAL,
     VALID_LABELS,
+    ObjectContext,
     build_classify_prompt,
     build_observe_prompt,
     build_reason_prompt,
@@ -96,6 +97,7 @@ def classify_component(
     semantic: str,
     *,
     model: Optional[str] = None,
+    context: Optional[ObjectContext] = None,
 ) -> ComponentClassification:
     """
     两阶段分类：
@@ -110,7 +112,7 @@ def classify_component(
     image_path = Path(image_path)
 
     # ---------- 阶段 1：观察 ----------
-    obs_prompt = build_observe_prompt()
+    obs_prompt = build_observe_prompt(context)
     try:
         obs_response: VLMResponse = client.chat(
             user_prompt=obs_prompt.user,
@@ -166,7 +168,7 @@ def classify_component(
         )
 
     # ---------- 阶段 2：推理 ----------
-    rsn_prompt = build_reason_prompt(semantic, covered)
+    rsn_prompt = build_reason_prompt(semantic, covered, context)
     try:
         rsn_response: VLMResponse = client.chat(
             user_prompt=rsn_prompt.user,

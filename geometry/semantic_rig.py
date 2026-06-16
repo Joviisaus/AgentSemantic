@@ -169,12 +169,11 @@ class SemanticSkeleton:
 
     # -- 变形 ---------------------------------------------------------------
 
-    def pose(self, rotations: Dict[int, np.ndarray]) -> np.ndarray:
-        """按给定每根骨的旋转做 LBS 变形，返回 (V, 3) 形变后顶点。
+    def bone_skin_matrices(self, rotations: Dict[int, np.ndarray]) -> np.ndarray:
+        """每根骨的 LBS 蒙皮矩阵 ``skin_b = M_pose_b @ T(-joint_b)``，返回 (B, 4, 4)。
 
-        参数
-        ----
-        rotations: {bone_index: R} ，R 为 (3,3) 旋转矩阵。缺省的骨视为单位旋转。
+        顶点经骨 b 变形后的位置 = ``skin_b @ [x, y, z, 1]``；静止姿态（旋转全为单位）
+        下 ``skin_b = I``，顶点不动。供蒙皮变形与「逐骨变形」局部评估复用。
         """
         n = self.num_bones
         offsets = self._offsets()
@@ -206,18 +205,29 @@ class SemanticSkeleton:
         for r in self.roots:
             dfs(r)
 
-        # 静止全局变换 = 平移到关节位置；蒙皮矩阵 = M_pose @ T(-joint)
-        vh = np.hstack([self.vertices, np.ones((len(self.vertices), 1))])
-        out = np.zeros((len(self.vertices), 3), dtype=np.float64)
+        skins = np.zeros((n, 4, 4), dtype=np.float64)
         for i in range(n):
             gp = global_pose[i]
             assert gp is not None  # 森林覆盖所有骨
-            skin = gp @ trans4(-self.bones[i].joint_position)
+            skins[i] = gp @ trans4(-self.bones[i].joint_position)
+        return skins
+
+    def pose(self, rotations: Dict[int, np.ndarray]) -> np.ndarray:
+        """按给定每根骨的旋转做 LBS 变形，返回 (V, 3) 形变后顶点。
+
+        参数
+        ----
+        rotations: {bone_index: R} ，R 为 (3,3) 旋转矩阵。缺省的骨视为单位旋转。
+        """
+        skins = self.bone_skin_matrices(rotations)
+        vh = np.hstack([self.vertices, np.ones((len(self.vertices), 1))])
+        out = np.zeros((len(self.vertices), 3), dtype=np.float64)
+        for i in range(self.num_bones):
             w = self.weights[:, i]
             sel = w > 1e-9
             if not np.any(sel):
                 continue
-            transformed = (skin @ vh[sel].T).T[:, :3]
+            transformed = (skins[i] @ vh[sel].T).T[:, :3]
             out[sel] += w[sel, None] * transformed
         return out
 

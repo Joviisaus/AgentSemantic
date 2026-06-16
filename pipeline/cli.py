@@ -190,7 +190,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "VLM 会更早自主决定终止，把它设大一点更安全。"
         ),
     )
-    p.add_argument("--max-seeds", type=int, default=6, help="单次分裂最多种子数")
+    p.add_argument(
+        "--max-seeds",
+        type=int,
+        default=4,
+        help="单次分裂最多种子数（默认 4，避免切太碎）",
+    )
     p.add_argument("--min-block-size", type=int, default=20, help="忽略 face 数低于该值的分块")
     p.add_argument(
         "--accept-partial-at-max-depth",
@@ -212,13 +217,36 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--split-strategy",
-        choices=("geodesic_fps", "spectral"),
-        default="geodesic_fps",
+        choices=("auto", "graph_cut", "spectral", "cvt", "sdf", "skeleton", "geodesic_fps"),
+        default="auto",
         help=(
-            "分裂策略："
-            "geodesic_fps —— 在子 mesh 上做测地最远点采样选 K 个种子 + 测地 Voronoi 划分（默认，更均衡）；"
-            "spectral —— 旧的归一化割谱聚类（兼容 / fallback）。"
+            "分裂策略提示：auto（默认，完全由 VLM 根据语义与 block_faces 决定）；"
+            "skeleton 倾向肢类/树状骨架语义（<50k 面）；"
+            "非 auto 值仅作为倾向提示，VLM 仍可在规模过大时改选 geodesic_fps。"
         ),
+    )
+    p.add_argument(
+        "--split-strategy-model",
+        type=str,
+        default=None,
+        help="分块策略 VLM 模型（默认与 --model 相同）。",
+    )
+    p.add_argument(
+        "--skip-segmat",
+        action="store_true",
+        default=True,
+        help="跳过 segmat 几何预切（默认开启，减少碎片与耗时）。",
+    )
+    p.add_argument(
+        "--no-skip-segmat",
+        action="store_false",
+        dest="skip_segmat",
+        help="恢复 segmat 预切（更碎、更慢，仅对比实验用）。",
+    )
+    p.add_argument(
+        "--vlm-split-strategy",
+        action="store_true",
+        help="（已弃用，保留兼容）分块策略现默认始终由 VLM 在运行时决定。",
     )
     p.add_argument(
         "--vlm-grouped-split",
@@ -390,9 +418,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if event == "classified":
             print(f"  [classify] {payload['block_id']} -> {payload['label']}")
         elif event == "split":
+            strat = payload.get("strategy") or payload.get("mode") or ""
+            strat_tag = f" strategy={strat}" if strat else ""
             print(
                 f"  [split]    {payload['block_id']} seeds={payload['seed_count']} "
-                f"children={len(payload.get('children', []))}"
+                f"children={len(payload.get('children', []))}{strat_tag}"
             )
         elif event == "abandoned":
             print(f"  [skip]     {payload['block_id']} ({payload.get('reason')})")
@@ -425,6 +455,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         grouped_split_n_candidates=args.grouped_split_n_candidates,
         grouped_split_max_groups=args.grouped_split_max_groups,
         split_strategy=args.split_strategy,
+        split_strategy_model=args.split_strategy_model or args.model,
+        skip_segmat=args.skip_segmat,
+        vlm_split_strategy=args.vlm_split_strategy,
         parallel_vlm_workers=args.parallel_vlm,
         live_report=not args.no_live_report,
         live_report_refresh_seconds=args.live_report_refresh,

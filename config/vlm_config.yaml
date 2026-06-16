@@ -58,7 +58,8 @@ providers:
     base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
     models:
       - qwen3.7-plus
-    default_model: qwen3.7-plus
+      - qwen3.6-flash
+    default_model: qwen3.6-flash
 
   zhipu:
     enabled: false

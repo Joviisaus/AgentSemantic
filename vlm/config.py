@@ -118,3 +118,32 @@ def get_provider_config(
             }
         },
     )
+
+
+def resolve_model_name(
+    explicit: Optional[str],
+    provider_cfg: VLMProviderConfig,
+) -> str:
+    """把 CLI/配置里的 model 参数解析为 API 可用的 model id。
+
+    常见误用：``--provider qwen --model qwen`` 会把 provider 名当成 model，
+    此处自动回退到 ``default_model``（如 ``qwen3.7-plus``）。
+    """
+    default = str(provider_cfg.default_model or "").strip()
+    if not explicit:
+        if not default:
+            raise ValueError(
+                f"provider '{provider_cfg.name}' 未配置 default_model，"
+                "请用 --model 指定"
+            )
+        return default
+    name = str(explicit).strip()
+    if name == provider_cfg.name:
+        if default:
+            return default
+    if provider_cfg.models and name in provider_cfg.models:
+        return name
+    if default and name == default:
+        return default
+    # 允许 Ark 等带日期后缀的完整 endpoint id（可能不在 models 列表里）
+    return name

@@ -1,14 +1,14 @@
 """
 同部位不连通块的 VLM 细分命名。
 
-full_coverage 给出的语义清单是**粗粒度、左右合并**的（如「腿」），但几何上
+full_coverage 给出的语义清单是**粗粒度、对称实例合并**的（如「腿」），但几何上
 一个「腿」常常是 4 个互不相连的块（四条狗腿）。本模块：
 
 1. 用 ``geometry.connected_components_per_part`` 把每个部位切成连通块
    （与最终建骨同口径）；
 2. 对**含 ≥2 个块**的部位，渲染一张"各块不同颜色 + 数字标签"的 12 视角拼图，
-   交给 VLM，让它根据各块的左右/前后/上下方位决定**是否**给出更具体的名字
-   （如 左前腿/右前腿/…）；
+   交给 VLM，让它根据各块与主体的**邻接/骨架角色**决定**是否**给出更具体的名字
+   （如 肢-1/肢-2）；禁止方位词；
 3. 把 VLM 的命名落回 ``(semantic_parts, face_semantic_index)``，得到一份细分后的
    标签，供下游骨架/动画直接使用。
 
@@ -60,32 +60,24 @@ def _sanitize(name: str) -> str:
     return s or "part"
 
 
-def _axis_word(v: float, span: float, pos: str, neg: str, mid: str = "") -> str:
-    """按相对位置给方位词；|v| 小于 span 的 20% 视为居中。"""
-    if span <= 1e-9 or abs(v) < 0.2 * span:
-        return mid
-    return pos if v > 0 else neg
-
-
-def _describe_positions(
+def _describe_components(
     centroids: Sequence[np.ndarray],
+    comp_face_counts: Sequence[int],
     bbox_min: np.ndarray,
     bbox_max: np.ndarray,
 ) -> str:
-    """给每个块生成一行人类/VLM 可读的方位描述。"""
+    """给每个块生成一行拓扑/几何参考（不含方位词）。"""
     center = 0.5 * (bbox_min + bbox_max)
-    span = bbox_max - bbox_min
+    span = np.maximum(bbox_max - bbox_min, 1e-9)
+    total_faces = max(1, sum(comp_face_counts))
     lines: List[str] = []
     for i, c in enumerate(centroids):
-        d = np.asarray(c, dtype=np.float64) - center
-        words = [
-            _axis_word(d[0], span[0], "右", "左"),
-            _axis_word(d[2], span[2], "前", "后"),
-            _axis_word(d[1], span[1], "上", "下"),
-        ]
-        loc = "".join(w for w in words if w) or "居中"
+        d = (np.asarray(c, dtype=np.float64) - center) / span
+        face_ratio = 100.0 * comp_face_counts[i] / total_faces
         lines.append(
-            f"- {i + 1}: 重心≈({c[0]:.2f}, {c[1]:.2f}, {c[2]:.2f})  方位={loc}"
+            f"- {i + 1}: 重心≈({c[0]:.2f}, {c[1]:.2f}, {c[2]:.2f})  "
+            f"归一化偏移≈({d[0]:+.2f}, {d[1]:+.2f}, {d[2]:+.2f})  "
+            f"面数占比≈{face_ratio:.0f}%"
         )
     return "\n".join(lines)
 
@@ -179,10 +171,12 @@ def refine_disconnected_parts(
         # 候选标签：本部位各块取 0..K-1，其余 -1
         cand = np.full(len(faces), -1, dtype=np.int64)
         centroids: List[np.ndarray] = []
+        comp_face_counts: List[int] = []
         for local, c in enumerate(comps):
             mask = comp_of_face == c
             cand[mask] = local
             centroids.append(face_centers[mask].mean(axis=0))
+            comp_face_counts.append(int(mask.sum()))
 
         panel_path = (out_path / f"refine_{_sanitize(name)}.png") if out_path else None
         if panel_path is None:
@@ -199,7 +193,7 @@ def refine_disconnected_parts(
             continue
         result.panels.append(str(panel_path))
 
-        table = _describe_positions(centroids, bbox_min, bbox_max)
+        table = _describe_components(centroids, comp_face_counts, bbox_min, bbox_max)
         prompt = build_component_name_prompt(name, len(comps), table)
         try:
             response: VLMResponse = client.chat(

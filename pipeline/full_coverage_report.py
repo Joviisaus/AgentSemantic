@@ -767,6 +767,16 @@ def generate_full_coverage_report(
     init_rel = _rel_or_empty(
         output_dir / "initial_segmentation.png", html_dir
     )
+    convex_opt = tree.get("convex_optimize") or {}
+    convex_before_rel = _rel_or_empty(
+        output_dir / "convex_optimize_before.png", html_dir
+    )
+    convex_after_rel = _rel_or_empty(
+        output_dir / "convex_optimize_after.png", html_dir
+    )
+    convex_report_rel = _rel_or_empty(
+        output_dir / "convex_optimize_report.html", html_dir
+    )
     overview_rel = _rel_or_empty(
         output_dir / "best_view_overview.png", html_dir
     )
@@ -1060,6 +1070,62 @@ def generate_full_coverage_report(
             f'<img class="final-mask" src="{_esc(init_rel)}" '
             f'alt="initial_segmentation" /></a></div>'
         )
+    convex_section_html = ""
+    if convex_opt.get("enabled"):
+        c_cells: List[str] = []
+        if convex_before_rel:
+            c_cells.append(
+                f'<div class="final-cell">'
+                f'<div class="muted">convex_optimize_before.png</div>'
+                f'<a href="{_esc(convex_before_rel)}" target="_blank">'
+                f'<img class="final-mask" src="{_esc(convex_before_rel)}" '
+                f'alt="convex before" /></a></div>'
+            )
+        if convex_after_rel:
+            c_cells.append(
+                f'<div class="final-cell">'
+                f'<div class="muted">convex_optimize_after.png</div>'
+                f'<a href="{_esc(convex_after_rel)}" target="_blank">'
+                f'<img class="final-mask" src="{_esc(convex_after_rel)}" '
+                f'alt="convex after" /></a></div>'
+            )
+        e_before = float(convex_opt.get("energy_before", 0.0))
+        e_after = float(convex_opt.get("energy_after", 0.0))
+        e_delta = float(convex_opt.get("energy_delta", e_after - e_before))
+        swaps = int(convex_opt.get("num_swaps", 0))
+        n_changed = int(convex_opt.get("num_faces_changed", 0))
+        n_conn = int(convex_opt.get("num_connectivity_relabels", 0))
+        changed = float(convex_opt.get("changed_face_ratio", 0.0))
+        report_link = ""
+        if convex_report_rel:
+            report_link = (
+                f' <a href="{_esc(convex_report_rel)}" target="_blank">'
+                f'convex_optimize_report.html</a>'
+            )
+        stage = str(convex_opt.get("stage", "connected_components"))
+        stage_zh = {
+            "connected_components": "连通块",
+            "semantic_parts": "语义部位",
+            "final_leaf_blocks": "最终叶分块",
+        }.get(stage, stage)
+        n_parts = int(convex_opt.get("num_semantic_parts", 0))
+        n_comps = int(convex_opt.get("num_components", 0))
+        parts_note = (
+            f'（{n_parts} 个语义部位 → {n_comps} 个连通块）'
+            if n_parts or n_comps else ""
+        )
+        convex_section_html = (
+            f'<h2 class="section-title">凸包边界优化（{stage_zh}）</h2>'
+            f'<p class="muted">VLM 完成后先拆不连通区域{parts_note}，'
+            f'再在连通块上松弛边界（不合并删块，结果写回语义着色）：'
+            f'贪婪交换 <b>{swaps}</b> 次，实际变更 <b>{n_changed}</b> 面'
+            f'（连通性修正 {n_conn}）；活跃部位凹度能量 '
+            f'<b>{e_before:.4f}</b> → <b>{e_after:.4f}</b> '
+            f'(Δ={e_delta:+.4f})；变更比例 <b>{100 * changed:.2f}%</b>.'
+            f'{report_link}</p>'
+            f'<div class="final-grid">{"".join(c_cells)}</div>'
+        )
+
     final_section_html = ""
     if final_cells:
         final_section_html = (
@@ -1130,6 +1196,8 @@ def generate_full_coverage_report(
 {best_view_section}
 
 {timeline_section}
+
+{convex_section_html}
 
 {final_section_html}
 

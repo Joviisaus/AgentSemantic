@@ -39,6 +39,26 @@ def _faces_count(faces: np.ndarray) -> int:
     return int(faces.shape[0])
 
 
+def mesh_face_connected_components(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+) -> np.ndarray:
+    """Per-face face-adjacency connected-component id (0..K-1)."""
+    import trimesh
+    from trimesh.graph import connected_component_labels
+
+    n_faces = _faces_count(faces)
+    mesh = trimesh.Trimesh(
+        np.asarray(vertices, dtype=np.float64),
+        np.asarray(faces, dtype=np.int64),
+        process=False,
+    )
+    adj = mesh.face_adjacency
+    if adj is None or len(adj) == 0:
+        return np.zeros(n_faces, dtype=np.int64)
+    return connected_component_labels(adj, node_count=n_faces)
+
+
 def build_highlight_face_colors(
     n_faces: int,
     highlight_face_ids: Iterable[int],
@@ -67,34 +87,43 @@ def _render_views_with_color_table(
     image_size: Tuple[int, int],
 ) -> List[np.ndarray]:
     """
-    借用 render_segmentation_view：它通过 face_labels_to_rgb 上色，
-    但是只支持调色板索引。这里改写：用 SEG-MAT 不感知的"虚拟 label"，
-    具体上色我们在 vlm/render_component 内部直接用 pyvista。
+    12 视角渲染。每个 face-adjacency 连通块单独 add_mesh，避免三角汤里
+    多个非连通岛被 pyvista 合并后只显示最大岛。
     """
-    # 用更直接的方式：调 pyvista 一次渲染 12 视角。
     try:
         import pyvista as pv
     except ImportError as exc:  # pragma: no cover
         raise ImportError("需要 pyvista: pip install pyvista") from exc
 
-    # 复用 heatmap_renderer 中的相机辅助
     from .heatmap_renderer import _apply_camera, _to_pyvista_faces
 
-    pv_faces = _to_pyvista_faces(faces)
-    pdata = pv.PolyData(vertices, pv_faces)
-    pdata.cell_data["RGB"] = face_colors
+    vertices = np.asarray(vertices, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+    face_colors = np.asarray(face_colors, dtype=np.uint8)
+    cc = mesh_face_connected_components(vertices, faces)
 
     views: List[np.ndarray] = []
     for elev, azim in VIEW_GRID:
         plotter = pv.Plotter(off_screen=True, window_size=image_size)
         plotter.set_background("white")
-        plotter.add_mesh(
-            pdata,
-            scalars="RGB",
-            rgb=True,
-            show_scalar_bar=False,
-            smooth_shading=True,
-        )
+        for cc_id in np.unique(cc):
+            mask = cc == int(cc_id)
+            f_sub = faces[mask]
+            c_sub = face_colors[mask]
+            used_v = np.unique(f_sub.reshape(-1))
+            remap = -np.ones(len(vertices), dtype=np.int64)
+            remap[used_v] = np.arange(len(used_v), dtype=np.int64)
+            v_sub = vertices[used_v]
+            f_remapped = remap[f_sub]
+            pdata = pv.PolyData(v_sub, _to_pyvista_faces(f_remapped))
+            pdata.cell_data["RGB"] = c_sub
+            plotter.add_mesh(
+                pdata,
+                scalars="RGB",
+                rgb=True,
+                show_scalar_bar=False,
+                smooth_shading=True,
+            )
         _apply_camera(plotter, vertices, elev, azim)
         plotter.enable_anti_aliasing("ssaa")
         views.append(plotter.screenshot(return_img=True))
@@ -671,6 +700,7 @@ __all__ = [
     "PROGRESS_NONE_RGB",
     "PROGRESS_ABANDONED_RGB",
     "build_highlight_face_colors",
+    "mesh_face_connected_components",
     "render_candidate_panel",
     "render_full_coverage_panel",
     "render_highlighted_component_panel",

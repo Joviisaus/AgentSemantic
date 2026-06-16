@@ -201,11 +201,7 @@ def case_geometry_chain() -> None:
 
     v, f = _make_cube_mesh()
 
-    vlabels, k, debug = spectral_cluster_vertices(
-        v, f,
-        n_clusters=2,
-        vertex_scalars=None,
-    )
+    vlabels, k, debug = spectral_cluster_vertices(v, f, n_clusters=2)
     assert vlabels.shape == (len(v),)
     assert k >= 1
     assert isinstance(debug, dict)

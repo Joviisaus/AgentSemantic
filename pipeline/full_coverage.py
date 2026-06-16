@@ -9,7 +9,9 @@
   - ≥2 个 → 分裂成 len(matched) 个种子（CC → segmat → FPS-spectral 级联），继续
 
 直到每个叶分块只命中一个语义为止。不允许 background；枚举不区分左右。
-收尾阶段：0 face 的枚举语义由 VLM 决定 split（从已有块 carve）或 delete。
+收尾阶段：0 face 的枚举语义由 VLM 决定 split（从已有块 carve）或 delete；
+随后按枚举给出的拓扑约束审计：块数多了→relabel 到正确语义；
+块数少了→geometric_split 几何切分（VLM 定块数与每块语义）。
 
 输出：
   output/<模型>/vlm_full/
@@ -21,6 +23,9 @@
       full_coverage_mask.png        全覆盖最终结果的 12 视角图（按部位上色）
       block_tree.json               完整 block 树（含 multi-label 决策）
       live_report.html              实时进度（每轮迭代刷新）
+      convex_optimize_report.html   凸包边界优化报告（语义部位，可选）
+      convex_optimize_before.png / convex_optimize_after.png
+      convex_optimize_log.json
       iterations/iter_NN.png        单视角时间线
 """
 
@@ -43,10 +48,21 @@ from geometry.blocks import (
     build_initial_blocks,
     export_tree_json,
 )
+from geometry.partition.common import SubBlockSplit
+from geometry.partition.strategy import (
+    split_block_by_strategy,
+    split_block_by_strategy_timed,
+    split_needs_strategy_retry,
+)
 from geometry.seed_split import (
+    SplitStrategyResponse,
     _extract_submesh,
+    ask_split_strategy,
+    ask_split_strategy_retry,
+    infer_split_strategy_fallback,
+    infer_split_strategy_heuristic,
+    infer_split_strategy_retry,
     split_block_by_connected_components,
-    split_block_by_geodesic_fps,
 )
 from geometry.spectral_cluster import vertex_labels_to_face_labels
 from rendering.render_component import (
@@ -67,9 +83,17 @@ from vlm.client import VLMClient
 from vlm.full_coverage import (
     MultiLabelClassification,
     SemanticEnumeration,
+    TopologyChildAssignment,
+    TopologyConstraint,
+    TopologyRepair,
+    assign_geometric_split_children,
+    audit_topology,
     classify_multi_label,
+    classify_multi_label_coverage_repair,
     enumerate_semantics,
+    infer_topology_constraints,
     resolve_empty_semantic_repairs,
+    resolve_topology_repairs,
 )
 from vlm.view_selector import BestViewSelection, select_best_view
 
@@ -100,8 +124,24 @@ class FullCoverageConfig:
     enumerate_model: Optional[str] = None
     empty_semantic_repair_model: Optional[str] = None
     empty_semantic_repair_max_rounds: int = 5
+    # 拓扑约束审计与修复（枚举阶段给出约束，收尾由 VLM 修复违规）
+    topology_repair: bool = True
+    topology_repair_model: Optional[str] = None
+    topology_repair_max_rounds: int = 3
     # 单次分裂的最多种子数（VLM 即使返回更多 matched，分裂时也不会超过这个数）
-    max_seeds_per_split: int = 6
+    max_seeds_per_split: int = 4
+    # 分裂策略提示：auto=全权交给 VLM；非 auto 仅作倾向提示
+    split_strategy: str = "spectral"
+    split_strategy_model: Optional[str] = None
+    skip_segmat: bool = True
+    # False（默认）= 按面数启发式选策略（小块 spectral，大块 geodesic_fps），不调 VLM
+    vlm_split_strategy: bool = False
+    # 单次几何分裂超时（秒）；≤0 表示不限时
+    split_timeout_seconds: float = 60.0
+    # 策略失败/超时后最多再试几次（可触发 VLM 换策略）
+    split_strategy_max_retries: int = 2
+    # 重试时是否调 VLM 换策略（False 则只用启发式轮换）
+    split_retry_with_vlm: bool = True
     parallel_vlm_workers: int = 1
     save_responses: bool = True
     live_report: bool = True
@@ -113,6 +153,15 @@ class FullCoverageConfig:
     single_view_image_size: int = 720
     # 主流程结束后是否生成最终 report.html（区别于 live_report.html）
     generate_report: bool = True
+    # VLM 完成后是否对语义部位做凸包边界松弛（不改变 VLM 切分逻辑）
+    convex_boundary_opt: bool = True
+    # 与 convex_boundary_opt 独立：仅沿 handle_loop / 凹缝拉直交界（可与 --no-convex-opt 联用）
+    boundary_handle_loop: bool = False
+    convex_opt_max_swaps: int = 800
+    # 语义部位至少保留的面数（低于 min_block_size，便于边界在部位间移动）
+    convex_opt_min_faces: int = 8
+    # 凸包优化前：同语义不连通区域拆成独立连通块（与 semantic_rig 同口径）
+    convex_opt_min_component_faces: int = 20
 
 
 @dataclass
@@ -157,22 +206,12 @@ def _segmat_split_groups(
     vertices: np.ndarray,
     faces: np.ndarray,
     face_ids: Sequence[int],
+    strat_resp: SplitStrategyResponse,
     *,
     min_clusters: int = 3,
     max_clusters: int = 8,
 ) -> Dict[str, Any]:
-    """单连通块的「auto-K」几何预切（测地 FPS + Voronoi + Lloyd）。
-
-    返回 dict：
-      - groups: List[List[int]] 全局 face_id 分组
-      - k_actual: int
-      - sizes: List[int]
-      - mode: str
-      - error: Optional[str]
-
-    与 ``pipeline.pipeline.SemanticRefinementPipeline._segmat_split`` 实现一致，
-    只把它独立成模块级函数避免跨类耦合。
-    """
+    """单连通块的「auto-K」几何预切（VLM 选定策略）。"""
     face_ids_list = list(face_ids)
     if len(face_ids_list) <= 1:
         return {"groups": [], "error": "block too small"}
@@ -182,43 +221,38 @@ def _segmat_split_groups(
         if n_v <= max(min_clusters, 4) or len(sub_f) <= 1:
             return {"groups": [], "error": "submesh too small"}
 
-        from geometry.seed_split import (
-            _build_submesh_vertex_graph,
-            _geodesic_fps_seeds,
-            _lloyd_relax_geodesic,
-            enforce_per_label_face_connectivity,
-        )
-
-        graph = _build_submesh_vertex_graph(sub_v, sub_f)
         k_target = int(np.clip(max_clusters, min_clusters, max(2, n_v - 1)))
-        fps_seeds = _geodesic_fps_seeds(graph, sub_v, k_target)
-        if len(fps_seeds) < 2:
-            return {"groups": [], "error": "fps 不足 2 个种子"}
-        seeds_final, v_labels = _lloyd_relax_geodesic(
-            graph, sub_v, list(fps_seeds), n_iter=8
+        params = strat_resp.params or {}
+        split = split_block_by_strategy(
+            vertices,
+            faces,
+            face_ids_list,
+            k_target,
+            strat_resp.strategy,
+            lambda_smooth=float(params.get("lambda_smooth", 1.0)),
+            lambda_concave=float(params.get("lambda_concave", 0.85)),
+            scalar_weight=float(params.get("scalar_weight", 0.35)),
+            geodesic_weight=params.get("geodesic_weight"),
+            curvature_weight=params.get("curvature_weight"),
+            concavity_weight=params.get("concavity_weight"),
+            lloyd_iter=int(params.get("lloyd_iter", 0)),
+            num_rays=int(params.get("num_rays", 16)),
+            cone_angle_deg=float(params.get("cone_angle_deg", 60.0)),
+            contraction_iters=int(params.get("contraction_iters", 5)),
+            graph_vertex_budget=params.get("graph_vertex_budget"),
         )
+        if split.num_clusters <= 1:
+            return {"groups": [], "error": "segmat 退化为 1 簇"}
 
-        sub_face_labels = vertex_labels_to_face_labels(v_labels, sub_f)
-        arr = np.asarray(sub_face_labels, dtype=np.int64)
-        arr = enforce_per_label_face_connectivity(sub_f, arr)
-
-        used = sorted({int(x) for x in arr})
-        groups: List[List[int]] = []
-        for k in used:
-            idx = np.flatnonzero(arr == k)
-            if idx.size == 0:
-                continue
-            groups.append([face_ids_list[i] for i in idx.tolist()])
+        groups = split.sub_face_groups
         return {
             "groups": groups,
             "k_actual": len(groups),
             "sizes": [len(g) for g in groups],
-            "mode": "geodesic_fps_voronoi_lloyd",
-            "spectral_debug": {
-                "fps_seeds": list(fps_seeds),
-                "lloyd_seeds": list(seeds_final),
-                "k_requested": k_target,
-            },
+            "mode": strat_resp.strategy,
+            "strategy_reason": strat_resp.reason,
+            "strategy_params": strat_resp.params,
+            "spectral_debug": split.debug,
         }
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning("segmat split 失败: %s", exc)
@@ -267,6 +301,20 @@ class FullCoveragePipeline:
         # block_id -> assigned semantic name (set when matched == 1)
         self._assigned_semantic: Dict[str, str] = {}
         self._empty_semantic_repairs: List[Dict[str, Any]] = []
+        self._topology_constraints: List[TopologyConstraint] = []
+        self._topology_repairs: List[Dict[str, Any]] = []
+        self._topology_face_overrides: Dict[int, int] = {}
+        self._split_coverage_repairs: List[Dict[str, Any]] = []
+        self._coverage_vlm_rounds: Dict[str, int] = {}
+        self._coverage_geometric_resplit_done: set[str] = set()
+        self._convex_opt_extra_html: str = ""
+        self._convex_optimized_face_index: Optional[np.ndarray] = None
+
+    def _resolve_vlm_model(self, explicit: Optional[str]) -> str:
+        """解析 model 参数；避免把 provider 名（如 qwen）误传给 API。"""
+        from vlm.config import resolve_model_name
+
+        return resolve_model_name(explicit, self.client.config)
 
     # ---------- 树工具 ----------
     def _next_child_id(self, parent_id: str) -> str:
@@ -295,6 +343,625 @@ class FullCoveragePipeline:
             if raw in self._part_index:
                 return raw
         return None
+
+    @staticmethod
+    def _matched_parts_from_cls_dict(
+        cls_dict: Optional[Dict[str, Any]],
+    ) -> List[str]:
+        if not cls_dict:
+            return []
+        out: List[str] = []
+        seen: Dict[str, int] = {}
+        for raw in cls_dict.get("matched_parts") or []:
+            s = str(raw).strip()
+            if s and s not in seen:
+                seen[s] = 1
+                out.append(s)
+        return out
+
+    def _block_matched_parts(self, block: SemanticBlock) -> List[str]:
+        return self._matched_parts_from_cls_dict(block.classification)
+
+    def _parent_matched_for_block(
+        self, block: Optional[SemanticBlock]
+    ) -> Optional[List[str]]:
+        """父块上一轮 multi-label 标注（几何分裂前的 matched_parts）。"""
+        if block is None or not block.parent_id:
+            return None
+        parent = self.blocks.get(block.parent_id)
+        if parent is None:
+            return None
+        parts = self._block_matched_parts(parent)
+        return list(parts) if parts else None
+
+    def _semantic_claimed_globally(self, semantic: str) -> bool:
+        """整棵 block 树中是否已有块命中或认领该语义。"""
+        sem = str(semantic).strip()
+        if not sem:
+            return False
+        for block in self.blocks.values():
+            if block.status == BlockStatus.SPLIT:
+                continue
+            if self._assigned_semantic.get(block.block_id) == sem:
+                return True
+            if sem in self._block_matched_parts(block):
+                return True
+        return False
+
+    def _filter_globally_covered_missing(
+        self,
+        missing: Sequence[str],
+        *,
+        parent_id: str,
+    ) -> List[str]:
+        """去掉已在分区其他块中出现的「缺失」语义（避免误触发覆盖修复）。"""
+        out: List[str] = []
+        for sem in missing:
+            s = str(sem).strip()
+            if not s:
+                continue
+            if self._semantic_claimed_globally(s):
+                LOGGER.info(
+                    "覆盖审计 parent=%s：语义 '%s' 已在其他块命中/认领，"
+                    "不视为缺失",
+                    parent_id,
+                    s,
+                )
+                continue
+            out.append(s)
+        return out
+
+    def _parent_coverage_ok(self, parent_id: str) -> bool:
+        """父块子树语义并集（含全局认领）是否已覆盖 parent matched。"""
+        parent = self.blocks.get(parent_id)
+        if parent is None or parent.status != BlockStatus.SPLIT:
+            return True
+        parent_set = set(self._block_matched_parts(parent))
+        if not parent_set:
+            return True
+        children = [
+            b for b in self.blocks.values() if b.parent_id == parent_id
+        ]
+        if len(children) < 2:
+            return False
+        covered: set[str] = set()
+        for ch in children:
+            covered.update(self._subtree_matched_parts(ch))
+        missing = self._filter_globally_covered_missing(
+            sorted(parent_set - covered), parent_id=parent_id
+        )
+        return not missing
+
+    def _subtree_fully_resolved(self, block_id: str) -> bool:
+        """该块及其子孙是否均已决策完毕（无 PENDING、无未收敛的 SPLIT）。"""
+        block = self.blocks.get(block_id)
+        if block is None:
+            return True
+        if block.status == BlockStatus.PENDING:
+            return False
+        if block.status == BlockStatus.SPLIT:
+            children = [
+                b for b in self.blocks.values() if b.parent_id == block_id
+            ]
+            if len(children) < 2:
+                return False
+            return all(
+                self._subtree_fully_resolved(ch.block_id) for ch in children
+            )
+        return True
+
+    def _subtree_matched_parts(self, block: SemanticBlock) -> set[str]:
+        """收集块及其子孙的 matched 并集；SPLIT 中间节点向下递归到叶块。"""
+        if block.status == BlockStatus.SPLIT:
+            covered: set[str] = set()
+            for ch in self.blocks.values():
+                if ch.parent_id == block.block_id:
+                    covered.update(self._subtree_matched_parts(ch))
+            return covered
+        assigned = self._assigned_semantic.get(block.block_id)
+        if assigned:
+            return {assigned}
+        return set(self._block_matched_parts(block))
+
+    def _split_children_ready(self, parent_id: str) -> bool:
+        children = [
+            b for b in self.blocks.values() if b.parent_id == parent_id
+        ]
+        if len(children) < 2:
+            return False
+        return all(self._subtree_fully_resolved(ch.block_id) for ch in children)
+
+    def _apply_child_after_coverage_reclassify(
+        self,
+        child: SemanticBlock,
+        cls: MultiLabelClassification,
+        *,
+        parent_id: str,
+        missing_parts: Sequence[str],
+        was_full: bool,
+    ) -> bool:
+        """写入 VLM 覆盖修复分类；必要时从 FULL 改回 PENDING。返回是否 requeue。"""
+        cls_dict = {
+            "matched_parts": list(cls.matched_parts),
+            "is_background": bool(cls.is_background),
+            "dominant": cls.dominant,
+            "confidences": dict(cls.confidences),
+            "notes": cls.notes,
+            "provider": cls.provider,
+            "model": cls.model,
+            "elapsed_seconds": cls.elapsed_seconds,
+            "error": cls.error,
+            "coverage_vlm_repair": True,
+            "coverage_parent_id": parent_id,
+            "coverage_missing": list(missing_parts),
+        }
+        child.classification = cls_dict
+        n_matched = len(cls.matched_parts)
+        reopened = False
+        if was_full and (
+            n_matched != 1
+            or (
+                n_matched == 1
+                and self._assigned_semantic.get(child.block_id)
+                != cls.matched_parts[0]
+            )
+        ):
+            self._assigned_semantic.pop(child.block_id, None)
+            child.status = BlockStatus.PENDING
+            reopened = True
+        elif child.status == BlockStatus.FULL and n_matched >= 2:
+            self._assigned_semantic.pop(child.block_id, None)
+            child.status = BlockStatus.PENDING
+            reopened = True
+        child.notes = (
+            child.notes
+            + f" | coverage_vlm_reclassify(missing={','.join(missing_parts)})"
+        ).strip(" |")
+        return reopened
+
+    def _batch_coverage_repair_reclassify(
+        self,
+        *,
+        parent_id: str,
+        parent_matched: Sequence[str],
+        sibling_matched: Dict[str, List[str]],
+        missing_parts: Sequence[str],
+        tasks: Sequence[Tuple[str, Path]],
+    ) -> Dict[str, MultiLabelClassification]:
+        results: Dict[str, MultiLabelClassification] = {}
+        if not tasks:
+            return results
+
+        def _do(bid: str, panel: Path):
+            return bid, classify_multi_label_coverage_repair(
+                self.client,
+                panel,
+                self.semantic_parts,
+                parent_id=parent_id,
+                block_id=bid,
+                parent_matched=parent_matched,
+                sibling_matched=sibling_matched,
+                missing_parts=missing_parts,
+                model=self._resolve_vlm_model(
+                    self.config.classification_model
+                ),
+            )
+
+        workers = max(1, int(self.config.parallel_vlm_workers))
+        if workers > 1 and len(tasks) > 1:
+            n = min(workers, len(tasks))
+            with ThreadPoolExecutor(max_workers=n) as ex:
+                futs = {
+                    ex.submit(_do, bid, panel): bid for bid, panel in tasks
+                }
+                for fut in as_completed(futs):
+                    bid = futs[fut]
+                    try:
+                        _, cls = fut.result()
+                        results[bid] = cls
+                    except (RuntimeError, ValueError, OSError) as exc:
+                        LOGGER.warning(
+                            "parallel coverage repair failed for %s: %s",
+                            bid, exc,
+                        )
+        else:
+            for bid, panel in tasks:
+                try:
+                    _, cls = _do(bid, panel)
+                    results[bid] = cls
+                except (RuntimeError, ValueError, OSError) as exc:
+                    LOGGER.warning(
+                        "coverage repair reclassify failed for %s: %s",
+                        bid, exc,
+                    )
+        return results
+
+    def _reset_parent_for_geometric_resplit(
+        self,
+        parent_id: str,
+        parent_matched: Sequence[str],
+        missing_parts: Sequence[str],
+        *,
+        progress_cb: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    ) -> List[str]:
+        """VLM 覆盖修复不收敛时：撤销子块，按父块 matched 数重新几何切分。"""
+        parent = self.blocks.get(parent_id)
+        if parent is None:
+            return []
+        if parent_id in self._coverage_geometric_resplit_done:
+            return []
+
+        self._coverage_geometric_resplit_done.add(parent_id)
+        target_k = max(2, len(parent_matched))
+        LOGGER.warning(
+            "覆盖修复不收敛 parent=%s missing=%s → 撤销子块并按 k=%d 重新几何切分",
+            parent_id,
+            list(missing_parts),
+            target_k,
+        )
+
+        for cid in list(parent.children_ids):
+            self.blocks.pop(cid, None)
+            self._assigned_semantic.pop(cid, None)
+        parent.children_ids = []
+        parent.status = BlockStatus.PENDING
+        parent.segmat_done = False
+        parent.force_split = True
+        parent.seed_count = target_k
+        if not parent.classification:
+            dom = parent_matched[0] if parent_matched else ""
+            parent.classification = {
+                "matched_parts": list(parent_matched),
+                "dominant": dom,
+            }
+        parent.notes = (
+            parent.notes
+            + f" | coverage_geometric_resplit(k={target_k}, missing={','.join(missing_parts)})"
+        ).strip(" |")
+
+        if progress_cb:
+            progress_cb(
+                "coverage_geometric_resplit",
+                {
+                    "parent_id": parent_id,
+                    "seed_count": target_k,
+                    "missing": list(missing_parts),
+                },
+            )
+        return [parent_id]
+
+    def _repair_split_coverage_gaps(
+        self,
+        parent_id: str,
+        children: Sequence[SemanticBlock],
+        panel_by_id: Dict[str, Path],
+        responses_dir: Path,
+        next_queue: Optional[List[str]] = None,
+        *,
+        progress_cb: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    ) -> List[str]:
+        """子块 matched 并集须覆盖父块分裂前 matched；缺失则让 VLM 重新分类各子块。"""
+        parent = self.blocks.get(parent_id)
+        if parent is None or parent.status != BlockStatus.SPLIT:
+            return []
+        if len(children) < 2:
+            return []
+
+        parent_matched = self._block_matched_parts(parent)
+        parent_set = set(parent_matched)
+        if not parent_set:
+            return []
+
+        covered: set[str] = set()
+        for ch in children:
+            covered.update(self._subtree_matched_parts(ch))
+
+        missing = sorted(parent_set - covered)
+        missing = self._filter_globally_covered_missing(
+            missing, parent_id=parent_id
+        )
+        if not missing:
+            return []
+
+        LOGGER.warning(
+            "分裂语义覆盖缺失 parent=%s parent_matched=%s children_cover=%s "
+            "missing=%s → VLM 重新分类",
+            parent_id,
+            sorted(parent_set),
+            sorted(covered),
+            missing,
+        )
+
+        sibling_matched = {
+            ch.block_id: list(self._subtree_matched_parts(ch)) for ch in children
+        }
+        tasks: List[Tuple[str, Path]] = []
+        for ch in children:
+            if ch.status == BlockStatus.SPLIT:
+                continue
+            panel = panel_by_id.get(ch.block_id)
+            if panel is None and ch.panel_path:
+                panel = Path(ch.panel_path)
+            if panel is not None and panel.is_file():
+                tasks.append((ch.block_id, panel))
+        if not tasks:
+            LOGGER.warning(
+                "覆盖修复跳过 parent=%s：无可用子块 panel", parent_id
+            )
+            return []
+
+        vlm_round = int(self._coverage_vlm_rounds.get(parent_id, 0))
+        if vlm_round >= 1:
+            LOGGER.info(
+                "parent=%s 已做过 VLM 覆盖修复，跳过重复 VLM 调用", parent_id
+            )
+            cls_cache: Dict[str, MultiLabelClassification] = {}
+        else:
+            cls_cache = self._batch_coverage_repair_reclassify(
+                parent_id=parent_id,
+                parent_matched=parent_matched,
+                sibling_matched=sibling_matched,
+                missing_parts=missing,
+                tasks=tasks,
+            )
+            self._coverage_vlm_rounds[parent_id] = vlm_round + 1
+
+        requeued: List[str] = []
+        if cls_cache:
+            for child in children:
+                cls = cls_cache.get(child.block_id)
+                if cls is None:
+                    continue
+                was_full = child.status == BlockStatus.FULL
+                before = self._block_matched_parts(child)
+                reopened = self._apply_child_after_coverage_reclassify(
+                    child,
+                    cls,
+                    parent_id=parent_id,
+                    missing_parts=missing,
+                    was_full=was_full,
+                )
+                after = self._block_matched_parts(child)
+                self._dump_response(
+                    responses_dir,
+                    f"{child.block_id}_coverage_repair",
+                    {
+                        "parent_id": parent_id,
+                        "missing": missing,
+                        "before": before,
+                        "after": after,
+                        "classification": child.classification,
+                    },
+                )
+                if (
+                    reopened
+                    and next_queue is not None
+                    and child.block_id not in next_queue
+                ):
+                    next_queue.append(child.block_id)
+                    requeued.append(child.block_id)
+                self._split_coverage_repairs.append(
+                    {
+                        "parent_id": parent_id,
+                        "child_id": child.block_id,
+                        "method": "vlm_reclassify",
+                        "missing": list(missing),
+                        "before": before,
+                        "after": after,
+                        "was_full": was_full,
+                        "parent_matched": sorted(parent_set),
+                        "children_cover_before": sorted(covered),
+                    }
+                )
+                if progress_cb:
+                    progress_cb(
+                        "split_coverage_repair",
+                        {
+                            "parent_id": parent_id,
+                            "child_id": child.block_id,
+                            "missing": missing,
+                            "before": before,
+                            "after": after,
+                            "requeued": bool(
+                                requeued and child.block_id in requeued
+                            ),
+                        },
+                    )
+
+        covered_after: set[str] = set()
+        for ch in children:
+            if ch.block_id in self.blocks:
+                covered_after.update(self._subtree_matched_parts(ch))
+        still_missing = sorted(parent_set - covered_after)
+        still_missing = self._filter_globally_covered_missing(
+            still_missing, parent_id=parent_id
+        )
+        if still_missing:
+            LOGGER.warning(
+                "VLM 覆盖修复后仍缺失 parent=%s still_missing=%s",
+                parent_id,
+                still_missing,
+            )
+            geo = self._reset_parent_for_geometric_resplit(
+                parent_id,
+                parent_matched,
+                still_missing,
+                progress_cb=progress_cb,
+            )
+            if geo and next_queue is not None:
+                for pid in geo:
+                    if pid not in next_queue:
+                        next_queue.append(pid)
+            return geo or requeued
+
+        return requeued
+
+    def _audit_split_coverage_before_decisions(
+        self,
+        queue: List[str],
+        panel_by_id: Dict[str, Path],
+        responses_dir: Path,
+        *,
+        progress_cb: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    ) -> None:
+        """本轮所有子块分类写入后、分裂决策前：校验 SPLIT 父块语义覆盖。"""
+        queue_set = set(queue)
+        parent_ids: set[str] = set()
+        for bid in queue:
+            block = self.blocks.get(bid)
+            if block is None or not block.parent_id:
+                continue
+            parent = self.blocks.get(block.parent_id)
+            if parent is not None and parent.status == BlockStatus.SPLIT:
+                parent_ids.add(block.parent_id)
+
+        for pid in sorted(parent_ids):
+            children = [
+                b
+                for b in self.blocks.values()
+                if b.parent_id == pid
+                and b.block_id in queue_set
+                and b.status == BlockStatus.PENDING
+                and b.classification
+            ]
+            if len(children) < 2:
+                continue
+            # 本轮 queue 须包含该父块全部分裂子块（同一批分类）
+            all_siblings = [
+                b
+                for b in self.blocks.values()
+                if b.parent_id == pid and b.status != BlockStatus.SPLIT
+            ]
+            if len(children) != len(all_siblings):
+                continue
+            requeued = self._repair_split_coverage_gaps(
+                pid,
+                children,
+                panel_by_id,
+                responses_dir,
+                next_queue=queue,
+                progress_cb=progress_cb,
+            )
+            if requeued:
+                dead = [
+                    bid for bid in queue
+                    if bid not in self.blocks and bid not in requeued
+                ]
+                if dead:
+                    queue[:] = [bid for bid in queue if bid not in dead]
+
+    def _audit_and_repair_split_coverage(
+        self,
+        parent_id: str,
+        panel_by_id: Dict[str, Path],
+        responses_dir: Path,
+        next_queue: List[str],
+        *,
+        progress_cb: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    ) -> List[str]:
+        """迭代末尾兜底：父块子块均已决策完毕后再查一次。"""
+        parent = self.blocks.get(parent_id)
+        if parent is None or parent.status != BlockStatus.SPLIT:
+            return []
+        if not self._split_children_ready(parent_id):
+            return []
+
+        children = [
+            b for b in self.blocks.values() if b.parent_id == parent_id
+        ]
+        return self._repair_split_coverage_gaps(
+            parent_id,
+            children,
+            panel_by_id,
+            responses_dir,
+            next_queue,
+            progress_cb=progress_cb,
+        )
+
+    def _audit_all_split_coverage(
+        self,
+        panel_by_id: Dict[str, Path],
+        responses_dir: Path,
+        next_queue: List[str],
+        *,
+        progress_cb: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    ) -> None:
+        """每轮迭代末尾：检查所有已分类完毕的 SPLIT 父块。"""
+        parents = sorted(
+            {
+                b.block_id
+                for b in self.blocks.values()
+                if b.status == BlockStatus.SPLIT
+            }
+        )
+        if not parents:
+            return
+        todo = [pid for pid in parents if not self._parent_coverage_ok(pid)]
+        if progress_cb:
+            progress_cb(
+                "coverage_audit",
+                {
+                    "total_parents": len(parents),
+                    "audit_parents": len(todo),
+                    "skipped_ok": len(parents) - len(todo),
+                },
+            )
+        for i, pid in enumerate(todo):
+            if progress_cb:
+                progress_cb(
+                    "coverage_audit",
+                    {
+                        "parent_id": pid,
+                        "index": i + 1,
+                        "total": len(todo),
+                    },
+                )
+            self._audit_and_repair_split_coverage(
+                pid,
+                panel_by_id,
+                responses_dir,
+                next_queue,
+                progress_cb=progress_cb,
+            )
+
+    def _write_block_classification(
+        self,
+        block: SemanticBlock,
+        cls: MultiLabelClassification,
+        responses_dir: Path,
+        *,
+        progress_cb: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    ) -> None:
+        block.classification = {
+            "matched_parts": list(cls.matched_parts),
+            "is_background": bool(cls.is_background),
+            "dominant": cls.dominant,
+            "confidences": dict(cls.confidences),
+            "notes": cls.notes,
+            "provider": cls.provider,
+            "model": cls.model,
+            "elapsed_seconds": cls.elapsed_seconds,
+            "error": cls.error,
+        }
+        if block.parent_id:
+            parent_matched = self._parent_matched_for_block(block)
+            if parent_matched:
+                block.classification["parent_id"] = block.parent_id
+                block.classification["parent_matched"] = list(parent_matched)
+        self._dump_response(
+            responses_dir,
+            f"{block.block_id}_classify",
+            block.classification,
+        )
+        if progress_cb:
+            progress_cb(
+                "classified",
+                {
+                    "block_id": block.block_id,
+                    "matched": list(cls.matched_parts),
+                    "is_background": bool(cls.is_background),
+                },
+            )
 
     def _fallback_semantic(
         self,
@@ -409,8 +1076,22 @@ class FullCoveragePipeline:
     def _delete_semantic_part(self, name: str, *, reason: str) -> None:
         if name not in self.semantic_parts:
             return
+        deleted_idx = self._part_index.get(name)
         self.semantic_parts = [p for p in self.semantic_parts if p != name]
         self._part_index = {n: i for i, n in enumerate(self.semantic_parts)}
+        self._topology_constraints = [
+            c for c in self._topology_constraints if c.part != name
+        ]
+        if deleted_idx is not None and self._topology_face_overrides:
+            remapped: Dict[int, int] = {}
+            for fid, old_idx in self._topology_face_overrides.items():
+                if old_idx == deleted_idx:
+                    continue
+                if old_idx > deleted_idx:
+                    remapped[fid] = old_idx - 1
+                else:
+                    remapped[fid] = old_idx
+            self._topology_face_overrides = remapped
         self._empty_semantic_repairs.append(
             {"empty_semantic": name, "action": "delete", "reason": reason}
         )
@@ -465,12 +1146,15 @@ class FullCoveragePipeline:
         if not donor_sem or donor_sem == empty_sem:
             return False
 
+        repair_panel = panel_dir / f"block_{donor_block_id}.png"
         sub_groups = self._split_block_by_seeds(
             vertices,
             faces,
             block,
             seed_count=2,
             responses_dir=responses_dir,
+            panel_path=repair_panel if repair_panel.is_file() else None,
+            matched_parts=[empty_sem, donor_sem],
         )
         if not sub_groups or len(sub_groups) < 2:
             LOGGER.warning(
@@ -512,7 +1196,12 @@ class FullCoveragePipeline:
                     self.client,
                     panel_path,
                     binary_candidates,
-                    model=self.config.classification_model,
+                    block_id=child_id,
+                    parent_id=donor_block_id,
+                    parent_matched=[empty_sem, donor_sem],
+                    model=self._resolve_vlm_model(
+                        self.config.classification_model
+                    ),
                 )
             except (RuntimeError, ValueError, OSError) as exc:
                 LOGGER.warning(
@@ -575,7 +1264,7 @@ class FullCoveragePipeline:
     ) -> None:
         """收尾：0 face 语义必须由 VLM 决定 split 或 delete，直到清单无空项。"""
         n_faces = int(faces.shape[0])
-        repair_model = (
+        repair_model = self._resolve_vlm_model(
             self.config.empty_semantic_repair_model
             or self.config.classification_model
         )
@@ -590,6 +1279,15 @@ class FullCoveragePipeline:
             LOGGER.info(
                 "0-face 语义补救 round %d: %s", round_idx, empty
             )
+            if progress_cb:
+                progress_cb(
+                    "empty_repair",
+                    {
+                        "round": round_idx,
+                        "empty_semantic": ",".join(empty),
+                        "action": "audit",
+                    },
+                )
             repair_png = out_dir / f"empty_semantic_repair_r{round_idx:02d}.png"
             face_idx = self._compute_face_semantic_index(n_faces)
             face_idx = self._propagate_unlabeled_face_indices(face_idx, faces)
@@ -712,6 +1410,661 @@ class FullCoveragePipeline:
             for name in remaining:
                 self._delete_semantic_part(name, reason="final fallback delete")
 
+    def _resolve_topology_constraints(
+        self,
+        parts: List[str],
+        enumeration: Optional[SemanticEnumeration],
+        overview_path: Optional[Path],
+    ) -> List[TopologyConstraint]:
+        """从枚举结果或 VLM 推断获取拓扑约束。"""
+        if enumeration and enumeration.topology_constraints:
+            return list(enumeration.topology_constraints)
+        if overview_path is not None and overview_path.is_file():
+            LOGGER.info("调用 VLM 推断拓扑约束 ...")
+            topo = infer_topology_constraints(
+                self.client,
+                overview_path,
+                parts,
+                model=self._resolve_vlm_model(
+                    self.config.enumerate_model
+                    or self.config.classification_model
+                ),
+            )
+            if topo:
+                return topo
+        return [TopologyConstraint(part=p, count=1) for p in parts]
+
+    def _get_topology_component_faces(
+        self,
+        vertices: np.ndarray,
+        faces: np.ndarray,
+        n_faces: int,
+        semantic: str,
+        component_index: int,
+    ) -> List[int]:
+        """返回某语义第 component_index（1-based）个连通块的面 id 列表。"""
+        face_idx = self._compute_face_semantic_index(n_faces)
+        face_idx = self._propagate_unlabeled_face_indices(face_idx, faces)
+        audit = audit_topology(
+            vertices,
+            faces,
+            face_idx.tolist(),
+            self.semantic_parts,
+            self._topology_constraints,
+            min_component_faces=self.config.convex_opt_min_component_faces,
+        )
+        for comp in audit.components:
+            if comp.semantic == semantic and comp.index == component_index:
+                return list(comp.face_ids)
+        return []
+
+    def _reassign_component_faces(
+        self,
+        face_ids: Sequence[int],
+        to_semantic: str,
+        *,
+        reason: str,
+    ) -> bool:
+        """把一组面改归目标语义（face 级 override）。"""
+        if to_semantic not in self._part_index or not face_ids:
+            return False
+        target_idx = self._part_index[to_semantic]
+        for fid in face_ids:
+            self._topology_face_overrides[int(fid)] = target_idx
+        self._topology_repairs.append(
+            {
+                "action": "reassign_component",
+                "to_semantic": to_semantic,
+                "num_faces": len(face_ids),
+                "reason": reason,
+            }
+        )
+        return True
+
+    def _sort_split_groups_by_centroid(
+        self,
+        vertices: np.ndarray,
+        faces: np.ndarray,
+        sub_groups: Sequence[Sequence[int]],
+    ) -> List[List[int]]:
+        """按重心空间顺序排序子块（左→右、前→后），与 VLM 编号约定对齐。"""
+        face_centers = vertices[faces].mean(axis=1)
+
+        def _key(group: Sequence[int]) -> Tuple[float, float, float]:
+            if not group:
+                return (0.0, 0.0, 0.0)
+            idx = np.asarray(list(group), dtype=np.int64)
+            c = face_centers[idx].mean(axis=0)
+            return (-float(c[0]), -float(c[2]), -float(c[1]))
+
+        return sorted(
+            [list(g) for g in sub_groups],
+            key=_key,
+        )
+
+    def _apply_geometric_split_repair(
+        self,
+        donor_block_id: str,
+        seed_count: int,
+        child_assignments: Sequence[TopologyChildAssignment],
+        vertices: np.ndarray,
+        faces: np.ndarray,
+        panel_dir: Path,
+        responses_dir: Path,
+        *,
+        reason: str,
+    ) -> bool:
+        """几何切分 donor 块为 K 块，由 VLM 为每个编号子块指定语义。"""
+        block = self.blocks.get(donor_block_id)
+        if block is None or block.status != BlockStatus.FULL:
+            LOGGER.warning(
+                "geometric_split: donor %s 不可用", donor_block_id
+            )
+            return False
+        donor_sem = self._assigned_semantic.get(donor_block_id) or ""
+
+        k = max(2, min(int(seed_count), self.config.max_seeds_per_split))
+        matched_parts = list(
+            dict.fromkeys(
+                [a.semantic for a in child_assignments]
+                + ([donor_sem] if donor_sem else [])
+            )
+        )
+        repair_panel = panel_dir / f"block_{donor_block_id}.png"
+        LOGGER.info(
+            "拓扑 geometric_split: donor=%s faces=%d k=%d strategy=skeleton",
+            donor_block_id,
+            block.size,
+            k,
+        )
+        sub_groups = self._split_block_by_seeds(
+            vertices,
+            faces,
+            block,
+            seed_count=k,
+            responses_dir=responses_dir,
+            panel_path=repair_panel if repair_panel.is_file() else None,
+            matched_parts=matched_parts,
+            strategy_hint_override="skeleton",
+        )
+        if not sub_groups or len(sub_groups) < 2:
+            LOGGER.warning(
+                "geometric_split: donor %s 几何分裂失败", donor_block_id
+            )
+            return False
+
+        ordered_groups = self._sort_split_groups_by_centroid(
+            vertices, faces, sub_groups
+        )
+        actual_k = len(ordered_groups)
+
+        n_faces = int(faces.shape[0])
+        cand = np.full(n_faces, -1, dtype=np.int64)
+        for i, group_face_ids in enumerate(ordered_groups):
+            for fid in group_face_ids:
+                if 0 <= int(fid) < n_faces:
+                    cand[int(fid)] = i
+
+        split_panel = panel_dir / f"split_{donor_block_id}.png"
+        try:
+            from rendering.render_component import render_candidate_panel
+
+            render_candidate_panel(
+                vertices,
+                faces,
+                cand.tolist(),
+                split_panel,
+                title=f"几何切分 {donor_block_id} → {actual_k} 块",
+                image_size=self.config.image_size,
+                cols=self.config.panel_cols,
+            )
+        except (OSError, ImportError, ValueError) as exc:
+            LOGGER.warning("geometric_split 拼图渲染失败: %s", exc)
+            split_panel = repair_panel if repair_panel.is_file() else None
+            if split_panel is None:
+                return False
+
+        planned = list(child_assignments)[:actual_k]
+        if len(planned) < actual_k:
+            for i in range(len(planned) + 1, actual_k + 1):
+                sem = (
+                    planned[i - 2].semantic
+                    if i - 2 < len(planned)
+                    else (donor_sem or matched_parts[0])
+                )
+                planned.append(
+                    TopologyChildAssignment(index=i, semantic=sem)
+                )
+
+        LOGGER.info(
+            "拓扑 geometric_split: donor=%s 几何切完成 k=%d，VLM 指派子块语义…",
+            donor_block_id,
+            actual_k,
+        )
+        assign_result = assign_geometric_split_children(
+            self.client,
+            split_panel,
+            donor_block_id=donor_block_id,
+            donor_semantic=donor_sem,
+            child_count=actual_k,
+            candidate_semantics=matched_parts,
+            planned_assignments=planned,
+            model=self._resolve_vlm_model(self.config.classification_model),
+        )
+        self._dump_response(
+            responses_dir,
+            f"split_assign_{donor_block_id}",
+            assign_result.to_dict(),
+        )
+        if assign_result.error and not assign_result.assignments:
+            LOGGER.warning(
+                "geometric_split 子块指派失败: %s", assign_result.error
+            )
+            return False
+
+        self._assigned_semantic.pop(donor_block_id, None)
+        block.status = BlockStatus.SPLIT
+        assigned_labels: List[str] = []
+        for i, group_face_ids in enumerate(ordered_groups):
+            child_id = self._next_child_id(donor_block_id)
+            sem = assign_result.assignments.get(
+                i + 1,
+                planned[i].semantic if i < len(planned) else donor_sem,
+            )
+            if sem not in self._part_index:
+                sem = self._fallback_semantic()
+            child = SemanticBlock(
+                block_id=child_id,
+                face_ids=list(group_face_ids),
+                depth=block.depth + 1,
+                parent_id=donor_block_id,
+                status=BlockStatus.PENDING,
+                notes=(
+                    f"topology geometric_split from {donor_block_id} "
+                    f"#{i + 1}→{sem}"
+                ),
+                segmat_done=block.segmat_done,
+            )
+            self._register_block(child)
+            block.children_ids.append(child_id)
+            self._force_assign_block(
+                child,
+                sem,
+                f"topology_geometric_split#{i + 1}→{sem}",
+            )
+            assigned_labels.append(sem)
+
+        self._topology_repairs.append(
+            {
+                "action": "geometric_split",
+                "donor_block_id": donor_block_id,
+                "seed_count": actual_k,
+                "child_assignments": assigned_labels,
+                "reason": reason,
+            }
+        )
+        LOGGER.info(
+            "拓扑 geometric_split %s → %d 子块: %s",
+            donor_block_id,
+            actual_k,
+            assigned_labels,
+        )
+        return True
+
+    def _apply_geometric_topology_cut(
+        self,
+        repair: TopologyRepair,
+        vertices: np.ndarray,
+        faces: np.ndarray,
+        n_faces: int,
+        *,
+        reason: str,
+    ) -> bool:
+        """几何拓扑手术：谱切割 / handle loop / 边界图割精修。"""
+        from geometry.topology_repair import (
+            TopologyRepairResult,
+            refine_surgery_boundary,
+            repair_illegal_adjacency,
+            repair_pseudo_bridge,
+        )
+
+        part_a = repair.from_semantic.strip()
+        part_b = repair.to_semantic.strip()
+        if (
+            part_a not in self._part_index
+            or part_b not in self._part_index
+        ):
+            return False
+
+        face_idx = self._compute_face_semantic_index(n_faces)
+        face_idx = self._propagate_unlabeled_face_indices(face_idx, faces)
+
+        if repair.action == "cut_adjacency":
+            result = repair_illegal_adjacency(
+                vertices,
+                faces,
+                face_idx.tolist(),
+                self.semantic_parts,
+                part_a,
+                part_b,
+            )
+        elif repair.action == "cut_bridge":
+            result = repair_pseudo_bridge(
+                vertices,
+                faces,
+                face_idx.tolist(),
+                self.semantic_parts,
+                part_a,
+                part_b,
+            )
+        elif repair.action == "boundary_refine":
+            from geometry.topology_repair import semantic_boundary_faces
+
+            ia = self._part_index[part_a]
+            ib = self._part_index[part_b]
+            boundary = semantic_boundary_faces(faces, face_idx, ia, ib)
+            overrides, dbg = refine_surgery_boundary(
+                vertices,
+                faces,
+                face_idx.tolist(),
+                self.semantic_parts,
+                boundary,
+            )
+            result = TopologyRepairResult(
+                face_overrides=overrides,
+                strategy="boundary_refine",
+                ok=bool(overrides),
+                debug=dbg,
+            )
+        else:
+            return False
+
+        if not result.ok or not result.face_overrides:
+            LOGGER.warning(
+                "几何拓扑修复无进展: %s %s↔%s debug=%s",
+                repair.action,
+                part_a,
+                part_b,
+                getattr(result, "debug", {}),
+            )
+            return False
+
+        for fid, sem_idx in result.face_overrides.items():
+            if 0 <= int(fid) < n_faces and 0 <= int(sem_idx) < len(
+                self.semantic_parts
+            ):
+                self._topology_face_overrides[int(fid)] = int(sem_idx)
+
+        self._topology_repairs.append(
+            {
+                "action": repair.action,
+                "from_semantic": part_a,
+                "to_semantic": part_b,
+                "num_faces": len(result.face_overrides),
+                "strategy": result.strategy,
+                "reason": reason,
+                "debug": result.debug,
+            }
+        )
+        return True
+
+    def _apply_topology_repair(
+        self,
+        repair: TopologyRepair,
+        vertices: np.ndarray,
+        faces: np.ndarray,
+        n_faces: int,
+        panel_dir: Path,
+        responses_dir: Path,
+    ) -> bool:
+        """执行单条拓扑修复。"""
+        if repair.action in ("cut_adjacency", "cut_bridge", "boundary_refine"):
+            return self._apply_geometric_topology_cut(
+                repair,
+                vertices,
+                faces,
+                n_faces,
+                reason=repair.reason or f"topology {repair.action}",
+            )
+
+        if repair.action == "geometric_split":
+            if not repair.donor_block_id or not repair.child_assignments:
+                return False
+            return self._apply_geometric_split_repair(
+                repair.donor_block_id,
+                repair.seed_count,
+                repair.child_assignments,
+                vertices,
+                faces,
+                panel_dir,
+                responses_dir,
+                reason=repair.reason or "topology geometric_split",
+            )
+
+        if repair.action == "reassign_component":
+            from_sem = repair.from_semantic.strip()
+            to_sem = repair.to_semantic.strip()
+            if (
+                from_sem not in self._part_index
+                or to_sem not in self._part_index
+                or repair.component_index < 1
+            ):
+                return False
+            fids = self._get_topology_component_faces(
+                vertices,
+                faces,
+                n_faces,
+                from_sem,
+                repair.component_index,
+            )
+            if not fids:
+                return False
+            ok = self._reassign_component_faces(
+                fids,
+                to_sem,
+                reason=repair.reason or "topology reassign",
+            )
+            if ok:
+                self._topology_repairs.append(
+                    {
+                        "action": "reassign_component",
+                        "from_semantic": from_sem,
+                        "to_semantic": to_sem,
+                        "component_index": repair.component_index,
+                        "num_faces": len(fids),
+                        "reason": repair.reason,
+                    }
+                )
+            return ok
+
+        return False
+
+    def _repair_topology(
+        self,
+        vertices: np.ndarray,
+        faces: np.ndarray,
+        out_dir: Path,
+        panel_dir: Path,
+        responses_dir: Path,
+        *,
+        progress_cb: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    ) -> None:
+        """收尾：按拓扑约束审计分割结果，VLM 修复 count/attach 违规。"""
+        if not self.config.topology_repair or not self._topology_constraints:
+            return
+
+        n_faces = int(faces.shape[0])
+        repair_model = self._resolve_vlm_model(
+            self.config.topology_repair_model
+            or self.config.empty_semantic_repair_model
+            or self.config.classification_model
+        )
+        max_rounds = max(1, int(self.config.topology_repair_max_rounds))
+
+        for round_idx in range(1, max_rounds + 1):
+            face_idx = self._compute_face_semantic_index(n_faces)
+            face_idx = self._propagate_unlabeled_face_indices(face_idx, faces)
+            audit = audit_topology(
+                vertices,
+                faces,
+                face_idx.tolist(),
+                self.semantic_parts,
+                self._topology_constraints,
+                min_component_faces=self.config.convex_opt_min_component_faces,
+            )
+            self._dump_response(
+                responses_dir,
+                f"topology_audit_r{round_idx:02d}",
+                audit.to_dict(),
+            )
+            if audit.ok:
+                LOGGER.info("拓扑审计通过（round %d）", round_idx)
+                break
+
+            LOGGER.info(
+                "拓扑违规 round %d: %s",
+                round_idx,
+                [v.get("detail") for v in audit.violations],
+            )
+
+            # 先尝试几何工具集自动修复（非法邻接 / 伪桥梁）
+            geo_violations = [
+                v
+                for v in audit.violations
+                if str(v.get("kind", "")).strip().lower()
+                in (
+                    "illegal_adjacency",
+                    "forbidden_adjacency",
+                    "pseudo_bridge",
+                    "handle_loop",
+                )
+            ]
+            if geo_violations:
+                from geometry.topology_repair import apply_geometric_repairs
+
+                if progress_cb:
+                    progress_cb(
+                        "topology_repair",
+                        {
+                            "round": round_idx,
+                            "action": "auto_geometric_repair",
+                            "violations": len(geo_violations),
+                        },
+                    )
+                geo_result = apply_geometric_repairs(
+                    vertices,
+                    faces,
+                    face_idx.tolist(),
+                    self.semantic_parts,
+                    geo_violations,
+                    topology_constraints=self._topology_constraints,
+                    auto_detect_forbidden=False,
+                    refine_boundary=False,
+                    max_repairs=4,
+                )
+                self._dump_response(
+                    responses_dir,
+                    f"topology_geo_repair_r{round_idx:02d}",
+                    {
+                        "strategy": geo_result.strategy,
+                        "ok": geo_result.ok,
+                        "overrides": len(geo_result.face_overrides),
+                        "debug": geo_result.debug,
+                    },
+                )
+                if progress_cb:
+                    progress_cb(
+                        "topology_repair",
+                        {
+                            "round": round_idx,
+                            "action": "auto_geometric_repair_done",
+                            "overrides": len(geo_result.face_overrides),
+                            "ok": geo_result.ok,
+                        },
+                    )
+                if geo_result.ok:
+                    for fid, sem_idx in geo_result.face_overrides.items():
+                        if 0 <= int(fid) < n_faces and 0 <= int(sem_idx) < len(
+                            self.semantic_parts
+                        ):
+                            self._topology_face_overrides[int(fid)] = int(
+                                sem_idx
+                            )
+                    self._topology_repairs.append(
+                        {
+                            "action": "auto_geometric_repair",
+                            "num_faces": len(geo_result.face_overrides),
+                            "strategy": geo_result.strategy,
+                            "reason": "auto illegal_adjacency / pseudo_bridge",
+                        }
+                    )
+                    continue
+
+            if progress_cb:
+                progress_cb(
+                    "topology_repair",
+                    {
+                        "round": round_idx,
+                        "action": "vlm_audit",
+                        "violations": len(audit.violations),
+                    },
+                )
+            repair_png = out_dir / f"topology_repair_r{round_idx:02d}.png"
+            try:
+                render_full_coverage_panel(
+                    vertices,
+                    faces,
+                    face_idx.tolist(),
+                    self.semantic_parts,
+                    repair_png,
+                    title=f"拓扑修复前（round {round_idx}）",
+                    image_size=self.config.image_size,
+                    cols=self.config.panel_cols,
+                )
+            except (OSError, ImportError, ValueError) as exc:
+                LOGGER.warning("拓扑修复图渲染失败: %s", exc)
+                repair_png = out_dir / "full_coverage_mask.png"
+                if not repair_png.is_file():
+                    break
+
+            all_donors: List[Dict[str, Any]] = []
+            for block in self.blocks.values():
+                if block.status != BlockStatus.FULL:
+                    continue
+                sem = self._assigned_semantic.get(block.block_id)
+                if not sem:
+                    continue
+                min_split = max(
+                    self.config.min_block_size * 2,
+                    self.config.min_block_size + 1,
+                )
+                if block.size < min_split:
+                    continue
+                all_donors.append(
+                    {
+                        "block_id": block.block_id,
+                        "semantic": sem,
+                        "faces": block.size,
+                    }
+                )
+            all_donors.sort(key=lambda x: int(x["faces"]), reverse=True)
+
+            plan = resolve_topology_repairs(
+                self.client,
+                repair_png,
+                semantic_parts=self.semantic_parts,
+                topology_constraints=self._topology_constraints,
+                audit=audit,
+                donor_blocks=all_donors,
+                model=repair_model,
+                max_split=self.config.max_seeds_per_split,
+            )
+            self._dump_response(
+                responses_dir,
+                f"topology_repair_r{round_idx:02d}",
+                plan.to_dict(),
+            )
+            if plan.topology_ok and not plan.repairs:
+                LOGGER.info("VLM 判定拓扑合规（round %d）", round_idx)
+                break
+            if not plan.ok:
+                LOGGER.warning(
+                    "拓扑 VLM 修复失败 (%s)，停止拓扑修复",
+                    plan.error,
+                )
+                break
+            if not plan.repairs:
+                break
+
+            progress_made = False
+            for repair in plan.repairs:
+                if progress_cb:
+                    progress_cb(
+                        "topology_repair",
+                        {
+                            "round": round_idx,
+                            "action": repair.action,
+                            "violation": repair.violation,
+                            "from_semantic": repair.from_semantic,
+                            "to_semantic": repair.to_semantic,
+                            "donor_block_id": repair.donor_block_id,
+                            "seed_count": repair.seed_count,
+                        },
+                    )
+                if self._apply_topology_repair(
+                    repair,
+                    vertices,
+                    faces,
+                    n_faces,
+                    panel_dir,
+                    responses_dir,
+                ):
+                    progress_made = True
+
+            if not progress_made:
+                LOGGER.warning("拓扑修复 round %d 无进展，停止", round_idx)
+                break
+
     # ---------- 渲染 ----------
     def _render_block_panel(
         self,
@@ -759,7 +2112,221 @@ class FullCoveragePipeline:
             if arr.size:
                 mask = (arr >= 0) & (arr < n_faces)
                 idx[arr[mask]] = val
+        for fid, sem_idx in self._topology_face_overrides.items():
+            if 0 <= int(fid) < n_faces and 0 <= int(sem_idx) < len(
+                self.semantic_parts
+            ):
+                idx[int(fid)] = int(sem_idx)
         return idx
+
+    def _apply_convex_optimize_final_blocks(
+        self,
+        vertices: np.ndarray,
+        faces: np.ndarray,
+        out_dir: Path,
+        n_faces: int,
+        result: FullCoverageResult,
+        *,
+        boundary_method: str = "planar",
+    ) -> None:
+        """对 VLM 完成后的语义部位做边界优化（平面+handle_loop 或仅 handle_loop）。"""
+        handle_loop_only = str(boundary_method).strip().lower() in (
+            "handle_loop", "handle-loop", "handleloop",
+        )
+        method_label = (
+            "handle_loop" if handle_loop_only else "planar_boundary"
+        )
+        LOGGER.info(
+            "边界优化开始 (method=%s, max_pair_passes=%d) …",
+            method_label,
+            max(1, min(3, self.config.convex_opt_max_swaps // 200 + 1)),
+        )
+        face_idx = self._compute_face_semantic_index(n_faces)
+        face_idx = self._propagate_unlabeled_face_indices(face_idx, faces)
+
+        n_sem = len(self.semantic_parts)
+        assigned = (face_idx >= 0) & (face_idx < n_sem)
+        active_parts = sorted({int(x) for x in face_idx[assigned]})
+        if len(active_parts) < 2:
+            return
+
+        try:
+            from geometry.convex_partition_optimize import (
+                ConvexPartitionOptConfig,
+                map_component_labels_to_semantic,
+                optimize_face_partition_convex_hull,
+                split_semantic_into_connected_components,
+                write_convex_optimize_report,
+            )
+        except ImportError as exc:
+            LOGGER.warning("凸包优化模块不可用: %s", exc)
+            return
+
+        split = split_semantic_into_connected_components(
+            vertices,
+            faces,
+            face_idx,
+            self.semantic_parts,
+            min_component_faces=self.config.convex_opt_min_component_faces,
+        )
+        comp_labels = split.comp_labels.copy()
+        valid_comp = comp_labels >= 0
+        if int(valid_comp.sum()) == 0 or split.num_components < 2:
+            LOGGER.info(
+                "凸包优化跳过：连通块不足 2（components=%d）",
+                split.num_components,
+            )
+            return
+
+        comp_labels_for_opt = comp_labels.copy()
+        comp_labels_for_opt[~valid_comp] = -1
+
+        convex_cfg = ConvexPartitionOptConfig(
+            enabled=True,
+            max_swaps=self.config.convex_opt_max_swaps,
+            min_block_faces=self.config.convex_opt_min_faces,
+            split_connected_components=True,
+            min_component_faces=self.config.convex_opt_min_component_faces,
+            enforce_connectivity=False,
+            image_size=self.config.image_size,
+            panel_cols=self.config.panel_cols,
+            preserve_label_ids=False,
+            stage_title="连通块",
+            verbose=True,
+            boundary_method=boundary_method,
+            max_pair_passes=max(1, min(5, self.config.convex_opt_max_swaps // 200 + 1)),
+        )
+        split_meta = {
+            "num_components": split.num_components,
+            "component_names": list(split.component_names),
+            "comp_part": list(split.comp_part),
+            "min_component_faces": self.config.convex_opt_min_component_faces,
+        }
+        try:
+            opt = optimize_face_partition_convex_hull(
+                vertices, faces, comp_labels_for_opt, convex_cfg,
+            )
+            face_idx_opt = map_component_labels_to_semantic(
+                np.asarray(opt.face_labels, dtype=np.int64),
+                split.comp_part,
+                face_idx,
+            )
+            opt = write_convex_optimize_report(
+                out_dir,
+                vertices,
+                faces,
+                comp_labels_for_opt,
+                opt,
+                convex_cfg,
+                semantic_parts=self.semantic_parts,
+                display_labels_before=face_idx,
+                display_labels_after=face_idx_opt,
+                component_names=split.component_names,
+                comp_labels_split=comp_labels,
+                split_meta=split_meta,
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("语义部位凸包优化失败（沿用 VLM 分块）: %s", exc)
+            return
+
+        self._convex_optimized_face_index = face_idx_opt
+
+        compare_mask = face_idx >= 0
+        changed_ratio = (
+            float(np.mean(face_idx_opt[compare_mask] != face_idx[compare_mask]))
+            if compare_mask.any()
+            else opt.changed_face_ratio
+        )
+        num_faces_changed = int(np.sum(face_idx_opt != face_idx))
+
+        convex_meta = {
+            "enabled": True,
+            "method": (
+                "boundary_handle_loop"
+                if handle_loop_only
+                else "planar_boundary_handle_loop"
+            ),
+            "stage": "connected_components",
+            "num_semantic_parts": len(active_parts),
+            "num_components": split.num_components,
+            "component_names": list(split.component_names),
+            "component_split": split_meta,
+            "num_swaps": opt.num_swaps,
+            "num_faces_changed": num_faces_changed,
+            "num_connectivity_relabels": opt.num_connectivity_relabels,
+            "energy_before": opt.metrics_before.active_total_energy,
+            "energy_after": opt.metrics_after.active_total_energy,
+            "energy_delta": opt.energy_delta,
+            "changed_face_ratio": changed_ratio,
+            "parts_before": opt.metrics_before.per_part_list(
+                self.semantic_parts,
+            ),
+            "parts_after": opt.metrics_after.per_part_list(
+                self.semantic_parts,
+            ),
+            "elapsed_seconds": opt.elapsed_seconds,
+            "report_html": (
+                str(opt.report_html) if opt.report_html else None
+            ),
+            "log_json": str(opt.log_json) if opt.log_json else None,
+            "before_png": str(opt.before_png) if opt.before_png else None,
+            "after_png": str(opt.after_png) if opt.after_png else None,
+        }
+        result.extra["convex_optimize"] = convex_meta
+
+        before_rel = opt.before_png.name if opt.before_png else ""
+        after_rel = opt.after_png.name if opt.after_png else ""
+        report_rel = (
+            opt.report_html.name
+            if opt.report_html is not None
+            else "convex_optimize_report.html"
+        )
+        img_pair = ""
+        if before_rel and after_rel:
+            img_pair = (
+                f'<div style="display:flex;gap:12px;flex-wrap:wrap;'
+                f'margin-top:10px">'
+                f'<figure style="margin:0">'
+                f'<img src="{_html.escape(before_rel)}" '
+                f'style="max-width:320px;border:1px solid #d2d2d7;'
+                f'border-radius:8px" alt="convex before"/>'
+                f'<figcaption style="font-size:12px;color:#6e6e73">'
+                f'优化前</figcaption></figure>'
+                f'<figure style="margin:0">'
+                f'<img src="{_html.escape(after_rel)}" '
+                f'style="max-width:320px;border:1px solid #d2d2d7;'
+                f'border-radius:8px" alt="convex after"/>'
+                f'<figcaption style="font-size:12px;color:#6e6e73">'
+                f'优化后</figcaption></figure></div>'
+            )
+        self._convex_opt_extra_html = (
+            f'<section class="legend-panel">'
+            f'<h2>凸包边界优化（语义部位）</h2>'
+            f'<p class="muted">VLM 完成后先拆 {split.num_components} 个连通块'
+            f'（{len(active_parts)} 个语义部位内不连通区域独立优化），'
+            f'再松弛边界（不合并删块）；'
+            f'贪婪交换 <b>{opt.num_swaps}</b> 次，'
+            f'实际变更 <b>{num_faces_changed}</b> 面；'
+            f'活跃部位凹度能量 '
+            f'<b>{opt.metrics_before.active_total_energy:.4f}</b> → '
+            f'<b>{opt.metrics_after.active_total_energy:.4f}</b> '
+            f'(Δ={opt.energy_delta:+.4f})；'
+            f'变更比例 <b>{100 * changed_ratio:.2f}%</b>。'
+            f' <a href="{_html.escape(report_rel)}">完整报告</a></p>'
+            f'{img_pair}</section>'
+        )
+        LOGGER.info(
+            "凸包优化: sem_parts=%d components=%d swaps=%d changed_faces=%d "
+            "E_active %.4f→%.4f (Δ=%.4f) ratio=%.2f%%",
+            len(active_parts),
+            split.num_components,
+            opt.num_swaps,
+            num_faces_changed,
+            opt.metrics_before.active_total_energy,
+            opt.metrics_after.active_total_energy,
+            opt.energy_delta,
+            100 * changed_ratio,
+        )
 
     def _color_map_for_status(self) -> Dict[str, Tuple[int, int, int]]:
         cmap: Dict[str, Tuple[int, int, int]] = {
@@ -843,7 +2410,9 @@ class FullCoveragePipeline:
                 bv = select_best_view(
                     self.client, thumb_path,
                     hint,
-                    model=self.config.view_select_model,
+                    model=self._resolve_vlm_model(
+                        self.config.view_select_model
+                    ),
                 )
                 bv.thumbnails_panel = thumb_path
 
@@ -909,11 +2478,23 @@ class FullCoveragePipeline:
             return results
 
         def _do(bid: str, panel: Path):
+            block = self.blocks.get(bid)
+            parent_matched = self._parent_matched_for_block(block)
+            depth = int(block.depth) if block is not None else 0
+            at_max = depth >= int(self.config.max_depth)
             return bid, classify_multi_label(
                 self.client,
                 panel,
                 self.semantic_parts,
-                model=self.config.classification_model,
+                block_id=bid,
+                parent_id=(block.parent_id if block else "") or "",
+                parent_matched=parent_matched,
+                at_max_depth=at_max,
+                current_depth=depth,
+                max_depth=int(self.config.max_depth),
+                model=self._resolve_vlm_model(
+                    self.config.classification_model
+                ),
             )
 
         workers = max(1, int(self.config.parallel_vlm_workers))
@@ -1077,6 +2658,8 @@ class FullCoveragePipeline:
         extra_html = (
             f'<div class="extra">{esc(extra_note)}</div>' if extra_note else ""
         )
+        if self._convex_opt_extra_html:
+            extra_html += self._convex_opt_extra_html
 
         # 语义图例 + 计数
         legend_rows: List[str] = []
@@ -1334,7 +2917,7 @@ class FullCoveragePipeline:
             self.client,
             overview_path,
             hint=self.config.enumerate_hint,
-            model=self.config.enumerate_model,
+            model=self._resolve_vlm_model(self.config.enumerate_model),
             min_parts=self.config.enumerate_min_parts,
             max_parts=self.config.enumerate_max_parts,
         )
@@ -1358,6 +2941,111 @@ class FullCoveragePipeline:
         )
         return list(enumeration.parts), enumeration, overview_path
 
+    def _resolve_split_strategy(
+        self,
+        panel_path: Optional[Path],
+        *,
+        seed_count: int,
+        matched_parts: Optional[List[str]] = None,
+        block_faces: int = 0,
+        split_stage: str = "main",
+        strategy_hint_override: Optional[str] = None,
+    ) -> SplitStrategyResponse:
+        forced = str(
+            strategy_hint_override or self.config.split_strategy or "spectral"
+        ).strip().lower()
+        if not self.config.vlm_split_strategy:
+            return infer_split_strategy_heuristic(
+                block_faces=block_faces,
+                strategy_hint=forced,
+                seed_count=seed_count,
+            )
+        semantic_ctx = "、".join(matched_parts or []) or "全覆盖语义细分"
+        return ask_split_strategy(
+            self.client,
+            panel_path,
+            semantic_context=semantic_ctx,
+            seed_count=seed_count,
+            matched_parts=matched_parts,
+            block_faces=block_faces,
+            split_stage=split_stage,
+            strategy_hint=forced,
+            fallback="spectral",
+            model=self._resolve_vlm_model(
+                self.config.split_strategy_model
+                or self.config.classification_model
+            ),
+        )
+
+    def _resolve_split_strategy_after_failure(
+        self,
+        panel_path: Optional[Path],
+        *,
+        seed_count: int,
+        matched_parts: Optional[List[str]],
+        block_faces: int,
+        split_stage: str,
+        previous_strategy: str,
+        failure_reason: str,
+        tried_strategies: Sequence[str],
+    ) -> SplitStrategyResponse:
+        forced = str(self.config.split_strategy or "spectral").strip().lower()
+        semantic_ctx = "、".join(matched_parts or []) or "全覆盖语义细分"
+        model = self._resolve_vlm_model(
+            self.config.split_strategy_model or self.config.classification_model
+        )
+        if self.config.split_retry_with_vlm:
+            return ask_split_strategy_retry(
+                self.client,
+                panel_path,
+                semantic_context=semantic_ctx,
+                seed_count=seed_count,
+                matched_parts=matched_parts,
+                block_faces=block_faces,
+                split_stage=split_stage,
+                strategy_hint=forced,
+                previous_strategy=previous_strategy,
+                failure_reason=failure_reason,
+                tried_strategies=list(tried_strategies),
+                fallback="geodesic_fps",
+                model=model,
+            )
+        return infer_split_strategy_retry(
+            block_faces=block_faces,
+            tried_strategies=list(tried_strategies),
+            failure_reason=failure_reason,
+            seed_count=seed_count,
+        )
+
+    def _run_timed_strategy_split(
+        self,
+        vertices: np.ndarray,
+        faces: np.ndarray,
+        face_ids: Sequence[int],
+        seed_count: int,
+        strat_resp: SplitStrategyResponse,
+    ) -> Tuple[Optional[SubBlockSplit], Optional[str]]:
+        params = strat_resp.params or {}
+        return split_block_by_strategy_timed(
+            self.config.split_timeout_seconds,
+            vertices=vertices,
+            faces=faces,
+            face_ids=face_ids,
+            seed_count=seed_count,
+            strategy=strat_resp.strategy,
+            lambda_smooth=float(params.get("lambda_smooth", 1.0)),
+            lambda_concave=float(params.get("lambda_concave", 0.85)),
+            scalar_weight=float(params.get("scalar_weight", 0.35)),
+            geodesic_weight=params.get("geodesic_weight"),
+            curvature_weight=params.get("curvature_weight"),
+            concavity_weight=params.get("concavity_weight"),
+            lloyd_iter=int(params.get("lloyd_iter", 0)),
+            num_rays=int(params.get("num_rays", 16)),
+            cone_angle_deg=float(params.get("cone_angle_deg", 60.0)),
+            contraction_iters=int(params.get("contraction_iters", 5)),
+            graph_vertex_budget=params.get("graph_vertex_budget"),
+        )
+
     # ---------- 单块决策 ----------
     def _split_block_by_seeds(
         self,
@@ -1367,12 +3055,15 @@ class FullCoveragePipeline:
         seed_count: int,
         *,
         responses_dir: Path,
+        panel_path: Optional[Path] = None,
+        matched_parts: Optional[List[str]] = None,
+        strategy_hint_override: Optional[str] = None,
+        progress_cb: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ) -> Optional[List[List[int]]]:
-        """对单个 block 走 CC → segmat → FPS 级联，返回每个子块的 face_id 列表，
-        或 None 表示分裂失败（调用方 → ABANDONED）。
+        """对单个 block 走 CC → segmat → VLM 策略几何切，返回子块 face_id 列表。
 
-        - 未做过 segmat：先 CC（多个 CC 则直接采用），否则 segmat。
-        - segmat 之后：只走 FPS-Voronoi-Lloyd，K = seed_count。
+        - 未做过 segmat：先 CC（多个 CC 则直接采用），否则 VLM 选策略 + segmat。
+        - segmat 之后：VLM 选策略 + K=seed_count 几何切。
         """
         # Step A: 连通分量（仅未做过 segmat 的块）
         if not block.segmat_done:
@@ -1394,15 +3085,30 @@ class FullCoveragePipeline:
                 )
                 return cc_groups
 
-        # Step B: segmat 第一次切（仅未做过的）
+        # Step B: segmat 预切（默认跳过）
+        if not block.segmat_done and self.config.skip_segmat:
+            block.segmat_done = True
         if not block.segmat_done:
+            strat_resp = self._resolve_split_strategy(
+                panel_path,
+                seed_count=seed_count,
+                matched_parts=matched_parts,
+                block_faces=block.size,
+                split_stage="segmat",
+            )
             segmat = _segmat_split_groups(
-                vertices, faces, block.face_ids,
+                vertices,
+                faces,
+                block.face_ids,
+                strat_resp,
                 min_clusters=max(2, min(3, seed_count)),
                 max_clusters=max(seed_count, 4),
             )
             block.seed_decision = {
                 "mode": "segmat",
+                "strategy": strat_resp.strategy,
+                "strategy_reason": strat_resp.reason,
+                "strategy_params": strat_resp.params,
                 "k_actual": segmat.get("k_actual", 0),
                 "component_sizes": segmat.get("sizes", []),
                 "seed_count_target": seed_count,
@@ -1424,22 +3130,119 @@ class FullCoveragePipeline:
             )
             block.segmat_done = True
 
-        # Step C: FPS-Voronoi-Lloyd
-        try:
-            split = split_block_by_geodesic_fps(
+        # Step C: 选策略 + 几何切（超时/未收敛则换策略重试）
+        max_retries = max(0, int(self.config.split_strategy_max_retries))
+        tried: List[str] = []
+        strat_hint = strategy_hint_override
+        if strat_hint is None and block.force_split:
+            if "coverage_geometric_resplit" in (block.notes or ""):
+                strat_hint = "skeleton"
+        strat_resp = self._resolve_split_strategy(
+            panel_path,
+            seed_count=seed_count,
+            matched_parts=matched_parts,
+            block_faces=block.size,
+            split_stage="main",
+            strategy_hint_override=strat_hint,
+        )
+        split = None
+        last_failure = ""
+        attempts_log: List[Dict[str, Any]] = []
+
+        for attempt in range(max_retries + 1):
+            if attempt > 0:
+                strat_resp = self._resolve_split_strategy_after_failure(
+                    panel_path,
+                    seed_count=seed_count,
+                    matched_parts=matched_parts,
+                    block_faces=block.size,
+                    split_stage="main",
+                    previous_strategy=tried[-1] if tried else "",
+                    failure_reason=last_failure,
+                    tried_strategies=tried,
+                )
+                LOGGER.warning(
+                    "block %s 分裂重试 %d/%d: %s → strategy=%s (%s)",
+                    block.block_id,
+                    attempt,
+                    max_retries,
+                    last_failure,
+                    strat_resp.strategy,
+                    strat_resp.reason,
+                )
+                if progress_cb:
+                    progress_cb(
+                        "split_strategy_retry",
+                        {
+                            "block_id": block.block_id,
+                            "attempt": attempt,
+                            "max_retries": max_retries,
+                            "previous_strategy": tried[-1] if tried else "",
+                            "failure": last_failure,
+                            "new_strategy": strat_resp.strategy,
+                            "reason": strat_resp.reason,
+                        },
+                    )
+
+            LOGGER.info(
+                "block %s 几何切: strategy=%s faces=%d k=%d (%s)",
+                block.block_id,
+                strat_resp.strategy,
+                block.size,
+                seed_count,
+                strat_resp.reason,
+            )
+            if progress_cb:
+                progress_cb(
+                    "split_geometry",
+                    {
+                        "block_id": block.block_id,
+                        "strategy": strat_resp.strategy,
+                        "faces": block.size,
+                        "seed_count": seed_count,
+                        "attempt": attempt,
+                        "reason": strat_resp.reason,
+                    },
+                )
+            split, run_error = self._run_timed_strategy_split(
                 vertices,
                 faces,
                 block.face_ids,
-                seed_count=seed_count,
+                seed_count,
+                strat_resp,
             )
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.warning(
-                "block %s geodesic_fps 失败: %s", block.block_id, exc
+            needs_retry, retry_reason = split_needs_strategy_retry(
+                split, error=run_error
             )
+            attempts_log.append(
+                {
+                    "attempt": attempt,
+                    "strategy": strat_resp.strategy,
+                    "error": run_error,
+                    "retry_reason": retry_reason,
+                    "num_clusters": int(split.num_clusters) if split else 0,
+                }
+            )
+            if not needs_retry:
+                break
+            last_failure = retry_reason or run_error or "unknown"
+            tried.append(strat_resp.strategy)
+            if attempt >= max_retries:
+                LOGGER.warning(
+                    "block %s 分裂策略重试用尽 (%s)，最后 strategy=%s",
+                    block.block_id,
+                    last_failure,
+                    strat_resp.strategy,
+                )
+                break
+
+        if split is None:
             block.seed_decision = {
-                "mode": "geodesic_fps",
+                "mode": strat_resp.strategy,
                 "seed_count_target": seed_count,
-                "error": str(exc),
+                "strategy_reason": strat_resp.reason,
+                "error": last_failure,
+                "attempts": attempts_log,
             }
             self._dump_response(
                 responses_dir, f"{block.block_id}_seed", block.seed_decision
@@ -1447,10 +3250,13 @@ class FullCoveragePipeline:
             return None
 
         block.seed_decision = {
-            "mode": "geodesic_fps",
+            "mode": strat_resp.strategy,
             "seed_count_target": seed_count,
+            "strategy_reason": strat_resp.reason,
+            "strategy_params": strat_resp.params,
             "num_clusters": split.num_clusters,
             "debug": split.debug,
+            "attempts": attempts_log,
         }
         self._dump_response(
             responses_dir, f"{block.block_id}_seed", block.seed_decision
@@ -1499,6 +3305,28 @@ class FullCoveragePipeline:
         result.semantic_parts = list(parts)
         result.enumeration = enumeration
         result.overview_panel = overview_path
+
+        self._topology_constraints = self._resolve_topology_constraints(
+            parts, enumeration, overview_path
+        )
+        try:
+            topo_path = out_dir / "topology_constraints.json"
+            topo_path.write_text(
+                json.dumps(
+                    {
+                        "semantic_parts": list(parts),
+                        "topology_constraints": [
+                            c.to_dict() for c in self._topology_constraints
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            result.extra["topology_constraints"] = str(topo_path)
+        except OSError as exc:
+            LOGGER.warning("写 topology_constraints.json 失败: %s", exc)
 
         # ---- Step 2: 视角选择 ----
         self._iter_progress_pngs = []
@@ -1661,27 +3489,45 @@ class FullCoveragePipeline:
                     )
 
             # --- Pre-pass B: 并行 multi-label ---
-            cls_tasks: List[Tuple[str, Path]] = list(iter_panel.items())
+            cls_tasks: List[Tuple[str, Path]] = []
+            for bid, panel in iter_panel.items():
+                blk = self.blocks.get(bid)
+                if (
+                    blk is not None
+                    and blk.force_split
+                    and blk.classification
+                    and len(self._matched_parts_from_cls_dict(blk.classification)) >= 2
+                ):
+                    continue
+                cls_tasks.append((bid, panel))
             cls_cache = self._batch_multi_label(cls_tasks)
 
-            # --- 决策主循环 ---
+            # --- Pre-pass C: 写入全部分类结果 ---
             for block_id in queue:
                 block = self.blocks[block_id]
                 if block.status != BlockStatus.PENDING:
                     continue
                 panel_path = iter_panel.get(block_id)
                 if panel_path is None:
-                    continue  # 已在 Pre-pass A 处理
-
+                    continue
                 cls = cls_cache.get(block_id)
                 if cls is None:
-                    # 兜底：串行重试一次
                     try:
+                        parent_matched = self._parent_matched_for_block(block)
+                        at_max = block.depth >= int(self.config.max_depth)
                         cls = classify_multi_label(
                             self.client,
                             panel_path,
                             self.semantic_parts,
-                            model=self.config.classification_model,
+                            block_id=block_id,
+                            parent_id=block.parent_id or "",
+                            parent_matched=parent_matched,
+                            at_max_depth=at_max,
+                            current_depth=int(block.depth),
+                            max_depth=int(self.config.max_depth),
+                            model=self._resolve_vlm_model(
+                                self.config.classification_model
+                            ),
                         )
                     except (RuntimeError, ValueError) as exc:
                         LOGGER.warning(
@@ -1689,37 +3535,36 @@ class FullCoveragePipeline:
                             block_id, exc,
                         )
                         cls = MultiLabelClassification(error=str(exc))
-
-                block.classification = {
-                    "matched_parts": list(cls.matched_parts),
-                    "is_background": bool(cls.is_background),
-                    "dominant": cls.dominant,
-                    "confidences": dict(cls.confidences),
-                    "notes": cls.notes,
-                    "provider": cls.provider,
-                    "model": cls.model,
-                    "elapsed_seconds": cls.elapsed_seconds,
-                    "error": cls.error,
-                }
-                self._dump_response(
-                    responses_dir,
-                    f"{block_id}_classify",
-                    block.classification,
+                self._write_block_classification(
+                    block, cls, responses_dir, progress_cb=progress_cb
                 )
-                if progress_cb:
-                    progress_cb(
-                        "classified",
-                        {
-                            "block_id": block_id,
-                            "matched": list(cls.matched_parts),
-                            "is_background": bool(cls.is_background),
-                        },
-                    )
 
-                n_matched = len(cls.matched_parts)
+            # --- Pre-pass D: 分裂子块语义覆盖（必须在再切分决策之前）---
+            self._audit_split_coverage_before_decisions(
+                queue,
+                iter_panel,
+                responses_dir,
+                progress_cb=progress_cb,
+            )
+
+            # --- 决策主循环（基于 block.classification，含覆盖修复）---
+            for block_id in queue:
+                block = self.blocks[block_id]
+                if block.status != BlockStatus.PENDING:
+                    continue
+                if block_id not in iter_panel:
+                    continue  # 已在 Pre-pass A 处理
+
+                cls_dict = block.classification or {}
+                matched_parts = self._matched_parts_from_cls_dict(cls_dict)
+                dominant = str(cls_dict.get("dominant") or "").strip()
+                if not matched_parts and dominant:
+                    matched_parts = [dominant]
+
+                n_matched = len(matched_parts)
 
                 if n_matched == 0:
-                    sem = self._fallback_semantic(cls, block=block)
+                    sem = self._fallback_semantic(block=block)
                     self._force_assign_block(
                         block, sem, f"forced_assign(empty→{sem})"
                     )
@@ -1727,13 +3572,13 @@ class FullCoveragePipeline:
 
                 # matched=1 → 归到该语义
                 if n_matched == 1:
-                    sem = cls.matched_parts[0]
+                    sem = matched_parts[0]
                     if sem not in self._part_index:
                         LOGGER.warning(
                             "block %s matched=%r 不在 part_index，强制兜底",
                             block_id, sem,
                         )
-                        sem = self._fallback_semantic(cls, block=block)
+                        sem = self._fallback_semantic(block=block)
                         self._force_assign_block(
                             block, sem, f"forced_assign(unknown→{sem})"
                         )
@@ -1747,13 +3592,13 @@ class FullCoveragePipeline:
 
                 # matched ≥ 2：需要继续切
                 if block.depth >= self.config.max_depth:
-                    dom = cls.dominant or cls.matched_parts[0]
+                    dom = dominant or matched_parts[0]
                     if dom not in self._part_index:
-                        dom = self._fallback_semantic(cls, block=block)
+                        dom = self._fallback_semantic(block=block)
                     self._force_assign_block(
                         block,
                         dom,
-                        f"max_depth→{dom} (matched={cls.matched_parts})",
+                        f"max_depth→{dom} (matched={matched_parts})",
                     )
                     if progress_cb:
                         progress_cb(
@@ -1762,33 +3607,62 @@ class FullCoveragePipeline:
                         )
                     continue
 
-                seed_count = max(
+                seed_count = block.seed_count or max(
                     2,
                     min(
                         int(self.config.max_seeds_per_split),
                         n_matched,
                     ),
                 )
+                if n_matched > seed_count:
+                    LOGGER.warning(
+                        "block %s matched=%d 但 seed_count=%d（max_seeds_per_split）；"
+                        "几何切分后将以覆盖检测补全缺失语义",
+                        block_id,
+                        n_matched,
+                        seed_count,
+                    )
+                panel_path = iter_panel.get(block_id)
+                LOGGER.info(
+                    "block %s 开始几何分裂: faces=%d matched=%s seed_count=%d",
+                    block_id,
+                    block.size,
+                    matched_parts,
+                    seed_count,
+                )
+                if progress_cb:
+                    progress_cb(
+                        "split_start",
+                        {
+                            "block_id": block_id,
+                            "faces": block.size,
+                            "matched": list(matched_parts),
+                            "seed_count": seed_count,
+                        },
+                    )
                 sub_groups = self._split_block_by_seeds(
                     vertices,
                     faces,
                     block,
                     seed_count=seed_count,
                     responses_dir=responses_dir,
+                    panel_path=panel_path,
+                    matched_parts=list(matched_parts),
+                    progress_cb=progress_cb,
                 )
                 if not sub_groups or len(sub_groups) < 2:
                     # 分裂失败：保守地把这个块归到 dominant 语义
-                    dom = cls.dominant or cls.matched_parts[0]
+                    dom = dominant or matched_parts[0]
                     if dom in self._part_index:
                         block.status = BlockStatus.FULL
                         self._assigned_semantic[block_id] = dom
                         block.notes = (
                             block.notes
                             + f" | split_failed → assigned={dom}"
-                            f" (matched={cls.matched_parts})"
+                            f" (matched={matched_parts})"
                         ).strip(" |")
                     else:
-                        dom = self._fallback_semantic(cls, block=block)
+                        dom = self._fallback_semantic(block=block)
                         self._force_assign_block(
                             block, dom, f"split_failed→{dom}"
                         )
@@ -1799,8 +3673,16 @@ class FullCoveragePipeline:
                         )
                     continue
 
+                if len(sub_groups) != seed_count:
+                    LOGGER.warning(
+                        "block %s 分裂组数 %d != seed_count %d（已做连通块校正）",
+                        block_id,
+                        len(sub_groups),
+                        seed_count,
+                    )
                 # 成功分裂
                 block.status = BlockStatus.SPLIT
+                block.force_split = False
                 for group_face_ids in sub_groups:
                     child_id = self._next_child_id(block_id)
                     child = SemanticBlock(
@@ -1812,7 +3694,7 @@ class FullCoveragePipeline:
                         notes=(
                             f"split from {block_id} "
                             f"(k={len(sub_groups)}, "
-                            f"matched={cls.matched_parts})"
+                            f"matched={matched_parts})"
                         ),
                         # 与父块的 segmat_done 一致：父块已做过几何切分（CC或segmat或FPS），
                         # 子块再切只会走 FPS（K=新一轮 matched 数）
@@ -1827,18 +3709,40 @@ class FullCoveragePipeline:
                         {
                             "block_id": block_id,
                             "seed_count": seed_count,
-                            "matched": list(cls.matched_parts),
+                            "matched": list(matched_parts),
                             "children": list(block.children_ids),
+                            "strategy": (
+                                (block.seed_decision or {}).get("strategy")
+                                or (block.seed_decision or {}).get("mode")
+                            ),
                         },
                     )
 
             # 每轮末尾：写迭代时间线 + 刷新 live report
+            if progress_cb:
+                progress_cb(
+                    "iteration_end",
+                    {
+                        "iteration": iteration,
+                        "queue_after": len(next_queue),
+                        "phase": "save_progress",
+                    },
+                )
             try:
                 self._save_iteration_progress(
                     out_dir, vertices, faces, iteration=iteration,
                 )
             except Exception as exc:  # noqa: BLE001
                 LOGGER.warning("iter %d 时间线 PNG 失败: %s", iteration, exc)
+            if progress_cb:
+                progress_cb(
+                    "iteration_end",
+                    {
+                        "iteration": iteration,
+                        "queue_after": len(next_queue),
+                        "phase": "live_report",
+                    },
+                )
             try:
                 self._update_live_report(
                     out_dir,
@@ -1850,10 +3754,43 @@ class FullCoveragePipeline:
                 )
             except Exception as exc:  # noqa: BLE001
                 LOGGER.warning("live report 更新失败: %s", exc)
+            if progress_cb:
+                progress_cb(
+                    "iteration_end",
+                    {
+                        "iteration": iteration,
+                        "queue_after": len(next_queue),
+                        "phase": "coverage_audit",
+                    },
+                )
 
+            end_panel_by_id: Dict[str, Path] = dict(iter_panel)
+            for bid, block in self.blocks.items():
+                if bid in end_panel_by_id:
+                    continue
+                if block.panel_path:
+                    p = Path(block.panel_path)
+                    if p.is_file():
+                        end_panel_by_id[bid] = p
+            self._audit_all_split_coverage(
+                end_panel_by_id,
+                responses_dir,
+                next_queue,
+                progress_cb=progress_cb,
+            )
             queue = next_queue
 
+        LOGGER.info("主循环结束（%d 轮），进入收尾阶段 …", iteration)
+        if progress_cb:
+            progress_cb(
+                "main_loop_done",
+                {"iterations": iteration, "num_blocks": len(self.blocks)},
+            )
+        if progress_cb:
+            progress_cb("finalize", {"phase": "assignments"})
         self._finalize_block_assignments()
+        if progress_cb:
+            progress_cb("finalize", {"phase": "empty_semantic_repair"})
         self._repair_empty_semantics(
             vertices,
             faces,
@@ -1862,6 +3799,32 @@ class FullCoveragePipeline:
             responses_dir,
             progress_cb=progress_cb,
         )
+        if progress_cb:
+            progress_cb("finalize", {"phase": "topology_repair"})
+        self._repair_topology(
+            vertices,
+            faces,
+            out_dir,
+            panel_dir,
+            responses_dir,
+            progress_cb=progress_cb,
+        )
+
+        # ---- Step 4c: 边界优化（语义部位，VLM 完成后）----
+        if self.config.convex_boundary_opt:
+            if progress_cb:
+                progress_cb("finalize", {"phase": "convex_boundary_opt"})
+            self._apply_convex_optimize_final_blocks(
+                vertices, faces, out_dir, n_faces, result,
+                boundary_method="planar",
+            )
+        elif self.config.boundary_handle_loop:
+            if progress_cb:
+                progress_cb("finalize", {"phase": "boundary_handle_loop"})
+            self._apply_convex_optimize_final_blocks(
+                vertices, faces, out_dir, n_faces, result,
+                boundary_method="handle_loop",
+            )
 
         # ---- Step 5: 产出 ----
         result.num_iterations = iteration
@@ -1869,8 +3832,11 @@ class FullCoveragePipeline:
             1 for b in self.blocks.values() if b.status != BlockStatus.SPLIT
         )
 
-        face_idx = self._compute_face_semantic_index(n_faces)
-        face_idx = self._propagate_unlabeled_face_indices(face_idx, faces)
+        if self._convex_optimized_face_index is not None:
+            face_idx = self._convex_optimized_face_index.copy()
+        else:
+            face_idx = self._compute_face_semantic_index(n_faces)
+            face_idx = self._propagate_unlabeled_face_indices(face_idx, faces)
         result.face_semantic_index = face_idx.tolist()
 
         sem_groups: Dict[str, List[int]] = {n: [] for n in self.semantic_parts}
@@ -1915,7 +3881,14 @@ class FullCoveragePipeline:
                 result.face_semantic_index,
                 self.semantic_parts,
                 coverage_panel,
-                title="VLM 全覆盖语义分割（按部位上色）",
+                title=(
+                    "VLM 全覆盖语义分割"
+                    + (
+                        "（凸包优化后）"
+                        if self._convex_optimized_face_index is not None
+                        else "（按部位上色）"
+                    )
+                ),
                 image_size=self.config.image_size,
                 cols=self.config.panel_cols,
             )
@@ -1967,9 +3940,16 @@ class FullCoveragePipeline:
                 n: len(v) for n, v in sem_groups.items()
             },
             "empty_semantic_repairs": list(self._empty_semantic_repairs),
+            "topology_constraints": [
+                c.to_dict() for c in self._topology_constraints
+            ],
+            "topology_repairs": list(self._topology_repairs),
+            "split_coverage_repairs": list(self._split_coverage_repairs),
         }
         if enumeration is not None:
             tree_extra["enumeration"] = enumeration.to_dict()
+        if result.extra.get("convex_optimize"):
+            tree_extra["convex_optimize"] = result.extra["convex_optimize"]
         tree_path = export_tree_json(
             self.blocks,
             out_dir / "block_tree.json",
@@ -1999,6 +3979,8 @@ class FullCoveragePipeline:
 
         # 最终单文件 HTML 复盘报告
         if self.config.generate_report:
+            if progress_cb:
+                progress_cb("finalize", {"phase": "report_html"})
             try:
                 # 延迟 import 避免 pipeline 包内循环依赖
                 from .full_coverage_report import generate_full_coverage_report
@@ -2045,7 +4027,11 @@ def run_full_coverage(
     panel_cols: int = 4,
     classification_model: Optional[str] = None,
     enumerate_model: Optional[str] = None,
-    max_seeds_per_split: int = 6,
+    max_seeds_per_split: int = 4,
+    split_strategy: str = "spectral",
+    split_strategy_model: Optional[str] = None,
+    skip_segmat: bool = True,
+    vlm_split_strategy: bool = False,
     parallel_vlm_workers: int = 1,
     save_responses: bool = True,
     live_report: bool = True,
@@ -2055,6 +4041,17 @@ def run_full_coverage(
     view_select_semantic_hint: str = "",
     single_view_image_size: int = 720,
     generate_report: bool = True,
+    convex_boundary_opt: bool = True,
+    boundary_handle_loop: bool = False,
+    convex_opt_max_swaps: int = 800,
+    convex_opt_min_faces: int = 8,
+    convex_opt_min_component_faces: int = 20,
+    topology_repair: bool = True,
+    topology_repair_model: Optional[str] = None,
+    topology_repair_max_rounds: int = 3,
+    split_timeout_seconds: float = 60.0,
+    split_strategy_max_retries: int = 2,
+    split_retry_with_vlm: bool = True,
     progress_cb: Optional[Callable[[str, Dict[str, Any]], None]] = None,
 ) -> FullCoverageResult:
     """函数式封装，等价于 ``FullCoveragePipeline(client, cfg).run(...)``。"""
@@ -2070,6 +4067,10 @@ def run_full_coverage(
         classification_model=classification_model,
         enumerate_model=enumerate_model,
         max_seeds_per_split=max_seeds_per_split,
+        split_strategy=split_strategy,
+        split_strategy_model=split_strategy_model,
+        skip_segmat=skip_segmat,
+        vlm_split_strategy=vlm_split_strategy,
         parallel_vlm_workers=parallel_vlm_workers,
         save_responses=save_responses,
         live_report=live_report,
@@ -2079,6 +4080,17 @@ def run_full_coverage(
         view_select_semantic_hint=view_select_semantic_hint,
         single_view_image_size=single_view_image_size,
         generate_report=generate_report,
+        convex_boundary_opt=convex_boundary_opt,
+        boundary_handle_loop=boundary_handle_loop,
+        convex_opt_max_swaps=convex_opt_max_swaps,
+        convex_opt_min_faces=convex_opt_min_faces,
+        convex_opt_min_component_faces=convex_opt_min_component_faces,
+        topology_repair=topology_repair,
+        topology_repair_model=topology_repair_model,
+        topology_repair_max_rounds=topology_repair_max_rounds,
+        split_timeout_seconds=split_timeout_seconds,
+        split_strategy_max_retries=split_strategy_max_retries,
+        split_retry_with_vlm=split_retry_with_vlm,
     )
     pipeline = FullCoveragePipeline(client, cfg)
     return pipeline.run(

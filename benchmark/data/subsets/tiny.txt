@@ -1,0 +1,15 @@
+airplane__coarse_b00_004
+belt__coarse_b2f_025
+bed__coarse_b04_017
+balance_scale__coarse_b2d_026
+bench__coarse_b05_030
+arcade_machine__coarse_b2b_026
+axe__coarse_b2c_038
+bath_tub__coarse_b2e_029
+bbq_grill__coarse_b03_00c
+bag__coarse_b01_002
+air_conditioning_unit__coarse_b2a_01d
+bird_house__coarse_b07_003
+bicycle__coarse_b06_007
+basket__coarse_b02_000
+binoculars__coarse_b30_024

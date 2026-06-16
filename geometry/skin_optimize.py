@@ -34,6 +34,7 @@ except ImportError as exc:  # pragma: no cover
 from .semantic_rig import (
     RigAnimation,
     SemanticSkeleton,
+    axis_angle_matrix,
     blend_skinning_at_seams,
     make_test_animation,
 )
@@ -101,6 +102,9 @@ class SkinOptimizeConfig:
     boundary_partition_iters: int = 12
     boundary_dijkstra_passes: int = 2
     boundary_label_hops: int = 2
+    # 动画形变能量：边界顶点改绑到相邻骨时，按给定动画姿态下其关联边的拉伸变化
+    # 加权，让初始分块边界朝「VLM 动画下形变最小」方向移动（0=纯几何，不启用）。
+    w_partition_motion: float = 2.0
 
     # 硬权重退火：进入四大指标前，先松后紧拉普拉斯扩散
     anneal_pre_diffuse: bool = True
@@ -171,6 +175,7 @@ class SkinOptimizeConfig:
             joint_log_interval=8,
             use_voxel_vk=True,
             write_partition_report=False,
+            w_partition_motion=0.0,
         )
 
 
@@ -872,6 +877,9 @@ class _PartitionMetricState:
         groove: np.ndarray,
         neighbors: List[List[int]],
         energy_spec: PartitionEnergySpec,
+        *,
+        pose_mats: Optional[np.ndarray] = None,
+        w_motion: float = 0.0,
     ) -> None:
         self.vertices = vertices
         self.part = part
@@ -884,6 +892,19 @@ class _PartitionMetricState:
         self.bnd_len = np.zeros(self.num_bones, dtype=np.float64)
         self._rebuild_vol()
         self._rebuild_bnd_len()
+        # 动画形变项：(P,B,4,4) 各姿态各骨蒙皮矩阵 + 齐次顶点；w_motion<=0 时关闭
+        self.w_motion = float(w_motion)
+        self.pose_mats = (
+            pose_mats
+            if (pose_mats is not None and len(pose_mats) > 0 and self.w_motion > 0.0)
+            else None
+        )
+        self.motion_on = self.pose_mats is not None
+        self.vh = (
+            np.hstack([vertices, np.ones((len(vertices), 1))])
+            if self.motion_on
+            else None
+        )
 
     def _rebuild_vol(self) -> None:
         self.vol.fill(0.0)
@@ -929,6 +950,30 @@ class _PartitionMetricState:
         e = sp.w_volume * _ratio_sq_penalty(vr, sp.volume_ratio_target)
         e += sp.w_area * _ratio_sq_penalty(ar, sp.area_ratio_target)
         return float(e)
+
+    def _local_motion_penalty(self, v: int, label: int) -> float:
+        """顶点 v 绑到骨 ``label`` 时，其关联边在各动画姿态下的平均超伸惩罚。
+
+        近似把顶点视为刚绑到 ``label`` 骨：对每个姿态用该骨蒙皮矩阵变形 v，与邻
+        点（按各自当前标号变形）比较边长，取 ``max(l_def/l_rest - 1, 0)``，对边求
+        和、对姿态取平均。改标号只改 v 的变形，故是 O(deg×P) 的局部量。
+        """
+        if not self.motion_on:
+            return 0.0
+        nbrs = self.neighbors[v]
+        if not nbrs:
+            return 0.0
+        vd_v = (self.pose_mats[:, label] @ self.vh[v])[:, :3]  # (P,3)
+        pen = 0.0
+        for n in nbrs:
+            bn = int(self.part[n])
+            vd_n = (self.pose_mats[:, bn] @ self.vh[n])[:, :3]  # (P,3)
+            rest = float(np.linalg.norm(self.vertices[v] - self.vertices[n]))
+            if rest < 1e-12:
+                continue
+            ratio = np.linalg.norm(vd_v - vd_n, axis=1) / rest
+            pen += float(np.mean(np.maximum(ratio - 1.0, 0.0)))
+        return pen
 
     def _local_concavity_bonus(self, v: int, label: int) -> float:
         g = float(self.groove[v])
@@ -980,7 +1025,14 @@ class _PartitionMetricState:
         )
         dE_conc *= self.spec.w_concavity
 
-        return dE_vol + dE_area + dE_smooth + dE_stick + dE_conc
+        dE_motion = 0.0
+        if self.motion_on:
+            dE_motion = self.w_motion * (
+                self._local_motion_penalty(v, new_b)
+                - self._local_motion_penalty(v, old)
+            )
+
+        return dE_vol + dE_area + dE_smooth + dE_stick + dE_conc + dE_motion
 
     def _inc_bnd_edge(self, u: int, v: int, sign: float) -> None:
         if int(self.part[u]) == int(self.part[v]):
@@ -1309,11 +1361,15 @@ def relax_partition_boundary(
     *,
     edges: Optional[np.ndarray] = None,
     neighbors: Optional[List[List[int]]] = None,
+    pose_mats: Optional[np.ndarray] = None,
+    w_motion: float = 0.0,
 ) -> np.ndarray:
     """
-    指标驱动边界松弛：体积比 / 表面积比 / 凹陷深度 + Agent 能量权重。
+    指标驱动边界松弛：体积比 / 表面积比 / 凹陷深度 + Agent 能量权重
+    （+ 可选的动画形变能量 ``pose_mats``/``w_motion``）。
 
-    仅更新边界顶点标号，使缝口对齐语义凹槽且比例接近 Agent 目标。
+    仅更新边界顶点标号，使缝口对齐语义凹槽、比例接近 Agent 目标，且在给定动画
+    姿态下边拉伸更小。
     """
     num_v = len(part)
     if edges is None:
@@ -1324,6 +1380,7 @@ def relax_partition_boundary(
     vm = _vertex_mass_weights(vertices, faces)
     state = _PartitionMetricState(
         vertices, part.copy(), vm, groove, neighbors, energy_spec,
+        pose_mats=pose_mats, w_motion=w_motion,
     )
 
     iters = max(int(cfg.boundary_partition_iters), 0)
@@ -1410,6 +1467,8 @@ def refine_partition_step(
     *,
     edges: Optional[np.ndarray] = None,
     neighbors: Optional[List[List[int]]] = None,
+    pose_mats: Optional[np.ndarray] = None,
+    w_motion: float = 0.0,
 ) -> np.ndarray:
     """单步分块更新：默认指标+Agent 边界松弛，否则 direct argmax。"""
     mode = (cfg.partition_mode or "metric").lower()
@@ -1422,6 +1481,7 @@ def refine_partition_step(
     return relax_partition_boundary(
         verts, faces, part, part0, lap, one_iter, energy_spec,
         edges=edges, neighbors=neighbors,
+        pose_mats=pose_mats, w_motion=w_motion,
     )
 
 
@@ -1604,6 +1664,30 @@ def poses_from_animations(
         return raw
     idx = np.linspace(0, len(raw) - 1, max(max_poses, 1), dtype=int)
     return [raw[int(i)] for i in idx]
+
+
+def _pose_bone_skin_matrices(
+    skeleton: SemanticSkeleton,
+    poses: Sequence[Dict[int, float]],
+) -> np.ndarray:
+    """各动画姿态下每根骨的 LBS 蒙皮矩阵，返回 (P, B, 4, 4)。
+
+    用于分块边界松弛时**局部**评估「某顶点改绑到相邻骨后，其关联边在各动画
+    姿态下的拉伸如何变化」，从而让边界朝「动画形变最小」的方向移动。
+    关节在分块阶段固定，故可一次性预计算后复用。
+    """
+    n_bones = skeleton.num_bones
+    if not poses:
+        return np.zeros((0, n_bones, 4, 4), dtype=np.float64)
+    mats: List[np.ndarray] = []
+    for ang in poses:
+        rmap: Dict[int, np.ndarray] = {}
+        for bi, a in ang.items():
+            if abs(float(a)) < 1e-9:
+                continue
+            rmap[int(bi)] = axis_angle_matrix(skeleton.bone_axis(int(bi)), float(a))
+        mats.append(skeleton.bone_skin_matrices(rmap))
+    return np.asarray(mats, dtype=np.float64)
 
 
 def resolve_mo_poses(
@@ -2466,6 +2550,15 @@ def optimize_semantic_skin(
                 image_path=partition_image_path,
                 spec_override=partition_energy_spec,
             )
+        # 预计算动画姿态下各骨蒙皮矩阵（关节在分块阶段固定，可复用）
+        part_pose_mats: Optional[np.ndarray] = None
+        if energy_spec is not None and cfg.w_partition_motion > 0.0 and mo_poses:
+            part_pose_mats = _pose_bone_skin_matrices(skeleton, mo_poses)
+            if cfg.verbose:
+                print(
+                    f"[part-opt] 动画形变项启用: 姿态数={len(mo_poses)} "
+                    f"w_motion={cfg.w_partition_motion}"
+                )
         if energy_spec is not None and lap is not None:
             for cy in range(max(1, cfg.outer_cycles)):
                 if cfg.verbose:
@@ -2477,6 +2570,8 @@ def optimize_semantic_skin(
                     part_new = refine_partition_step(
                         skeleton, part, part0, u0, w, lap, cfg, energy_spec,
                         edges=edges, neighbors=neighbors,
+                        pose_mats=part_pose_mats,
+                        w_motion=cfg.w_partition_motion,
                     )
                     u0_try = u0
                     if cfg.anneal_pre_diffuse and cfg.anneal_stages > 0:

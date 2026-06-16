@@ -30,11 +30,14 @@ from geometry.grouped_split import (
     GroupedSplitResult,
     split_block_by_vlm_grouping,
 )
+from geometry.partition_methods import split_block_by_strategy
 from geometry.seed_split import (
+    SplitStrategyResponse,
     _extract_submesh,
+    ask_seed_and_strategy,
     ask_seed_count,
+    infer_split_strategy_fallback,
     split_block_by_connected_components,
-    split_block_by_geodesic_fps,
     split_block_by_spectral_seeds,
 )
 from geometry.spectral_cluster import (
@@ -56,7 +59,7 @@ from rendering.render_component import (
 from rendering.view_thumbnails import render_thumbnails_panel
 from vlm.classifier import classify_component
 from vlm.client import VLMClient
-from vlm.prompts import LABEL_FULL, LABEL_NONE, LABEL_PARTIAL
+from vlm.prompts import LABEL_FULL, LABEL_NONE, LABEL_PARTIAL, ObjectContext
 from vlm.review import ProgressReview, review_progress
 from vlm.view_selector import BestViewSelection, select_best_view
 
@@ -117,9 +120,17 @@ class SemanticRefinementConfig:
     grouped_split_n_candidates: int = 8       # 过分割成多少个候选区
     grouped_split_max_groups: int = 4         # VLM 最多合并成多少组
     # 分裂策略：
-    #   "geodesic_fps" —— 在子 mesh 上做测地 FPS 选 K 个种子 + 测地 Voronoi 划分（默认）
-    #   "spectral"     —— 旧的 normalize-cut 谱聚类（fallback / 兼容老行为）
-    split_strategy: str = "geodesic_fps"
+    #   "auto"         —— VLM 根据语义上下文自动选择（默认）
+    #   "graph_cut"    —— 图割法（凹槽吸附、边界平滑）
+    #   "spectral"     —— 谱聚类（拓扑/姿态鲁棒）
+    #   "cvt"          —— 变分质心 Voronoi（均匀紧凑）
+    #   "sdf"          —— 形状直径函数（肢体粗细）
+    # split_strategy：auto=全权交给 VLM；非 auto 仅作倾向提示
+    split_strategy: str = "auto"
+    split_strategy_model: Optional[str] = None
+    # 跳过 segmat 预切（默认开）：少一层碎片，不牺牲语义观察
+    skip_segmat: bool = True
+    vlm_split_strategy: bool = False  # 保留兼容；策略选择已始终走 VLM
     # 并行 VLM 请求开关：每轮迭代里把 N 个块的 classify（observe+reason）放进
     # ThreadPoolExecutor 同时跑。1 = 完全串行（默认，与旧行为一致）。
     # 渲染 (pyvista/VTK) 仍串行（线程不安全）；ask_seed_count 也仍串行
@@ -138,6 +149,11 @@ class SemanticRefinementConfig:
     view_select_model: Optional[str] = None
     # 单视角渲染分辨率（像素）。VLM 不看这张图，只是 HTML 展示用，可以开高一点。
     single_view_image_size: int = 720
+    # 物体上下文（通用部件分割用）：物体类别 + 候选部件清单。注入到 classify 的
+    # observe / reason 阶段，作为命名词表，让 VLM 在非人形物体上也能稳定描述部件。
+    # 为空时 prompt 退化为开放词表（与旧行为一致）。
+    object_category: str = ""
+    candidate_parts: Optional[List[str]] = None
 
 
 class SemanticRefinementPipeline:
@@ -156,6 +172,10 @@ class SemanticRefinementPipeline:
         # 视角选择 + 迭代时间线（在 run() 里被初始化 / 填充）
         self._best_view: Optional[BestViewSelection] = None
         self._iter_progress_pngs: List[Path] = []
+        self._object_context = ObjectContext(
+            category=config.object_category or "",
+            candidate_parts=list(config.candidate_parts or []),
+        )
 
     # ---------- 树工具 ----------
     def _next_child_id(self, parent_id: str) -> str:
@@ -210,6 +230,71 @@ class SemanticRefinementPipeline:
             blk.notes = (blk.notes + f" | terminated_by_vlm({reason})").strip(" |")
         return accepted
 
+    def _resolve_split_strategy(
+        self,
+        panel_path: Path,
+        *,
+        seed_count: int,
+        covered_parts: Optional[List[str]] = None,
+        semantic_parts: Optional[List[str]] = None,
+        extra_parts: Optional[List[str]] = None,
+        matched_parts: Optional[List[str]] = None,
+        block_faces: int = 0,
+        split_stage: str = "main",
+    ) -> SplitStrategyResponse:
+        """运行时由 VLM 根据语义、block_faces 与可选 CLI 提示选择策略。"""
+        from geometry.seed_split import ask_split_strategy
+
+        forced = str(self.config.split_strategy or "auto").strip().lower()
+        return ask_split_strategy(
+            self.client,
+            panel_path,
+            semantic_context=self.config.semantic,
+            seed_count=seed_count,
+            covered_parts=covered_parts,
+            semantic_parts=semantic_parts,
+            extra_parts=extra_parts,
+            matched_parts=matched_parts,
+            block_faces=block_faces,
+            split_stage=split_stage,
+            strategy_hint=forced,
+            model=self.config.split_strategy_model or self.config.seed_model,
+        )
+
+    def _geometry_split(
+        self,
+        vertices: np.ndarray,
+        faces: np.ndarray,
+        face_ids: Sequence[int],
+        seed_count: int,
+        strat_resp: SplitStrategyResponse,
+        vertex_scalars: Optional[np.ndarray],
+    ):
+        """按 VLM/CLI 选定的策略做几何分裂。"""
+        params = strat_resp.params or {}
+        scalar_w = float(
+            params.get("scalar_weight", self.config.scalar_weight)
+        )
+        return split_block_by_strategy(
+            vertices,
+            faces,
+            face_ids,
+            seed_count,
+            strat_resp.strategy,
+            lambda_smooth=float(params.get("lambda_smooth", 1.0)),
+            lambda_concave=float(params.get("lambda_concave", 0.85)),
+            scalar_weight=scalar_w,
+            geodesic_weight=params.get("geodesic_weight"),
+            curvature_weight=params.get("curvature_weight"),
+            concavity_weight=params.get("concavity_weight"),
+            lloyd_iter=int(params.get("lloyd_iter", 0)),
+            num_rays=int(params.get("num_rays", 16)),
+            cone_angle_deg=float(params.get("cone_angle_deg", 60.0)),
+            contraction_iters=int(params.get("contraction_iters", 5)),
+            graph_vertex_budget=params.get("graph_vertex_budget"),
+            vertex_scalars=vertex_scalars,
+        )
+
     # ---------- 几何 segmat 预分割 ----------
     def _segmat_split(
         self,
@@ -217,20 +302,12 @@ class SemanticRefinementPipeline:
         faces: np.ndarray,
         face_ids: Sequence[int],
         vertex_scalars: Optional[np.ndarray],
+        strat_resp: SplitStrategyResponse,
         *,
         min_clusters: int = 3,
         max_clusters: int = 8,
     ) -> Dict[str, Any]:
-        """单连通块的第一次几何切。
-
-        统一走 **测地 FPS + Voronoi + Lloyd 平衡**：
-          ① 子 mesh 顶点图（边权 = 欧氏边长）
-          ② 测地最远点采样选 K = max_clusters 个种子顶点
-          ③ Lloyd 迭代：Voronoi 划分 + 簇内 3D 重心更新种子，让 K 片切分大小相近
-          ④ 顶点 label → 面 label，再做一次连通性清洗
-        K 取 max_clusters；Lloyd 后实际簇数可能因 mask 退化而少于 K。
-        不再做谱聚类（user 明确反馈 spectral 退化为轴向切片，不可用）。
-        """
+        """单连通块的第一次几何切（VLM 选定策略 + auto-K）。"""
         face_ids_list = list(face_ids)
         if len(face_ids_list) <= 1:
             return {"groups": [], "error": "block too small"}
@@ -241,48 +318,29 @@ class SemanticRefinementPipeline:
             if n_v <= max(min_clusters, 4) or len(sub_f) <= 1:
                 return {"groups": [], "error": "submesh too small"}
 
-            from geometry.seed_split import (
-                _build_submesh_vertex_graph,
-                _geodesic_fps_seeds,
-                _lloyd_relax_geodesic,
-                enforce_per_label_face_connectivity,
-            )
-
-            graph = _build_submesh_vertex_graph(sub_v, sub_f)
             k_target = int(np.clip(max_clusters, min_clusters, max(2, n_v - 1)))
-            fps_seeds = _geodesic_fps_seeds(graph, sub_v, k_target)
-            if len(fps_seeds) < 2:
-                return {"groups": [], "error": "fps 不足 2 个种子"}
-            seeds_final, v_labels = _lloyd_relax_geodesic(
-                graph, sub_v, list(fps_seeds), n_iter=8
+            split = self._geometry_split(
+                vertices,
+                faces,
+                face_ids_list,
+                k_target,
+                strat_resp,
+                vertex_scalars,
             )
+            if split.num_clusters <= 1:
+                return {"groups": [], "error": "segmat 退化为 1 簇"}
 
-            sub_face_labels = vertex_labels_to_face_labels(v_labels, sub_f)
-            arr = np.asarray(sub_face_labels, dtype=np.int64)
-            arr = enforce_per_label_face_connectivity(sub_f, arr)
-            mode = "geodesic_fps_voronoi_lloyd"
-            sp_dbg = {
-                "method": mode,
-                "k_requested": k_target,
-                "fps_seeds": list(fps_seeds),
-                "lloyd_seeds": list(seeds_final),
-            }
-
-            used = sorted({int(x) for x in arr})
-            groups: List[List[int]] = []
-            for k in used:
-                idx = np.flatnonzero(arr == k)
-                if idx.size == 0:
-                    continue
-                groups.append([face_ids_list[i] for i in idx.tolist()])
-            k_actual = len(groups)
+            groups = split.sub_face_groups
+            mode = strat_resp.strategy
             return {
                 "groups": groups,
-                "k_actual": int(k_actual),
-                "k_eigengap": int(k_actual),
+                "k_actual": int(split.num_clusters),
+                "k_eigengap": int(split.num_clusters),
                 "sizes": [len(g) for g in groups],
                 "mode": mode,
-                "spectral_debug": sp_dbg if isinstance(sp_dbg, dict) else None,
+                "strategy_reason": strat_resp.reason,
+                "strategy_params": strat_resp.params,
+                "spectral_debug": split.debug,
             }
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("segmat split 失败: %s", exc)
@@ -663,6 +721,7 @@ class SemanticRefinementPipeline:
                 panel,
                 self.config.semantic,
                 model=self.config.classification_model,
+                context=self._object_context,
             )
 
         workers = max(1, int(self.config.parallel_vlm_workers))
@@ -1017,6 +1076,7 @@ class SemanticRefinementPipeline:
                             panel_path,
                             self.config.semantic,
                             model=self.config.classification_model,
+                            context=self._object_context,
                         )
                 block.classification = {
                     "label": cls.label,
@@ -1175,15 +1235,39 @@ class SemanticRefinementPipeline:
                         )
                     continue
 
-                # Step 2b: 单连通块第一次切 → 几何 segmat（auto-K 谱聚类）
-                # 不走 VLM 给 K，直接按特征值 gap 估计 K，等价于跑过一遍
-                # face_segment_labels.json。segmat 子块再切才走 VLM-K + FPS-spectral。
+                # Step 2b: segmat 预切（默认跳过，减少碎片与耗时）
+                if not block.segmat_done and self.config.skip_segmat:
+                    block.segmat_done = True
                 if not block.segmat_done:
+                    segmat_k = max(
+                        3,
+                        min(
+                            self.config.max_seeds,
+                            len(cls.covered_parts) + 1,
+                        ),
+                    )
+                    strat_resp = self._resolve_split_strategy(
+                        panel_path,
+                        seed_count=segmat_k,
+                        covered_parts=cls.covered_parts,
+                        semantic_parts=cls.semantic_parts,
+                        extra_parts=cls.extra_parts,
+                        block_faces=block.size,
+                        split_stage="segmat",
+                    )
                     segmat_split = self._segmat_split(
-                        vertices, faces, block.face_ids, vertex_scalars
+                        vertices,
+                        faces,
+                        block.face_ids,
+                        vertex_scalars,
+                        strat_resp,
+                        max_clusters=segmat_k,
                     )
                     block.seed_decision = {
                         "mode": "segmat",
+                        "strategy": strat_resp.strategy,
+                        "strategy_reason": strat_resp.reason,
+                        "strategy_params": strat_resp.params,
                         "k_actual": segmat_split.get("k_actual", 0),
                         "k_eigengap": segmat_split.get("k_eigengap", 0),
                         "component_sizes": segmat_split.get("sizes", []),
@@ -1220,6 +1304,7 @@ class SemanticRefinementPipeline:
                                     "seed_count": len(sub_groups),
                                     "children": list(block.children_ids),
                                     "mode": "segmat",
+                                    "strategy": strat_resp.strategy,
                                 },
                             )
                         continue
@@ -1422,59 +1507,109 @@ class SemanticRefinementPipeline:
                         )
                     continue
 
-                # ---- 模式 B（默认）：ask_seed_count + 几何分裂 ----
-                seed_resp = ask_seed_count(
-                    self.client,
-                    panel_path,
-                    self.config.semantic,
-                    max_seeds=self.config.max_seeds,
-                    fallback=max(2, min(self.config.max_seeds, len(cls.covered_parts) + 1)),
-                    model=self.config.seed_model,
-                    covered_parts=cls.covered_parts,
-                    semantic_parts=cls.semantic_parts,
-                    extra_parts=cls.extra_parts,
-                    block_faces=block.size,
+                # ---- 模式 B：auto=一次 VLM(seed+strategy)；强制策略=仅 seed ----
+                n_observed = max(
+                    len(cls.covered_parts),
+                    len(cls.semantic_parts) + len(cls.extra_parts),
                 )
+                fallback_k = max(2, min(self.config.max_seeds, n_observed or 2))
+                if str(self.config.split_strategy or "auto").strip().lower() == "auto":
+                    combined = ask_seed_and_strategy(
+                        self.client,
+                        panel_path,
+                        self.config.semantic,
+                        max_seeds=self.config.max_seeds,
+                        fallback_seed=fallback_k,
+                        model=self.config.seed_model,
+                        covered_parts=cls.covered_parts,
+                        semantic_parts=cls.semantic_parts,
+                        extra_parts=cls.extra_parts,
+                        block_faces=block.size,
+                    )
+                    seed_count = combined.seed_count
+                    strat_resp = SplitStrategyResponse(
+                        strategy=combined.strategy,
+                        reason=combined.reason,
+                        params=combined.params,
+                        error=combined.error,
+                    )
+                    seed_reason = combined.reason
+                    seed_error = combined.error
+                else:
+                    seed_resp = ask_seed_count(
+                        self.client,
+                        panel_path,
+                        self.config.semantic,
+                        max_seeds=self.config.max_seeds,
+                        fallback=fallback_k,
+                        model=self.config.seed_model,
+                        covered_parts=cls.covered_parts,
+                        semantic_parts=cls.semantic_parts,
+                        extra_parts=cls.extra_parts,
+                        block_faces=block.size,
+                    )
+                    seed_count = seed_resp.seed_count
+                    seed_reason = seed_resp.reason
+                    seed_error = seed_resp.error
+                    strat_resp = self._resolve_split_strategy(
+                        panel_path,
+                        seed_count=seed_count,
+                        covered_parts=cls.covered_parts,
+                        semantic_parts=cls.semantic_parts,
+                        extra_parts=cls.extra_parts,
+                        block_faces=block.size,
+                        split_stage="main",
+                    )
                 block.seed_decision = {
-                    "seed_count": seed_resp.seed_count,
-                    "reason": seed_resp.reason,
-                    "error": seed_resp.error,
-                    "strategy": self.config.split_strategy,
+                    "seed_count": seed_count,
+                    "reason": seed_reason,
+                    "error": seed_error,
+                    "strategy": strat_resp.strategy,
+                    "strategy_reason": strat_resp.reason,
+                    "strategy_params": strat_resp.params,
+                    "strategy_error": strat_resp.error,
+                    "split_strategy_mode": self.config.split_strategy,
+                    "vlm_split_strategy": self.config.vlm_split_strategy,
+                    "skip_segmat": self.config.skip_segmat,
                 }
-                block.seed_count = seed_resp.seed_count
+                block.seed_count = seed_count
                 self._dump_response(
                     responses_dir, f"{block_id}_seed", block.seed_decision
                 )
 
                 split = None
-                used_strategy = self.config.split_strategy
+                used_strategy = strat_resp.strategy
                 try:
-                    split = split_block_by_geodesic_fps(
+                    split = self._geometry_split(
                         vertices,
                         faces,
                         block.face_ids,
-                        seed_count=seed_resp.seed_count,
-                        vertex_scalars=vertex_scalars,
-                        scalar_weight=self.config.scalar_weight,
+                        seed_count,
+                        strat_resp,
+                        vertex_scalars,
                     )
                     if split.num_clusters <= 1:
                         raise RuntimeError(
-                            f"geodesic_fps 退化为 1 簇 (debug={split.debug})"
+                            f"{used_strategy} 退化为 1 簇 (debug={split.debug})"
                         )
                 except Exception as exc:  # noqa: BLE001
-                    # geodesic_fps 内部已有 coord_kmeans 兜底；若仍失败则放弃
-                    # 该 block，不再走谱聚类（user 已明确剔除 spectral 路径）。
                     LOGGER.warning(
-                        "block %s geodesic_fps+lloyd 失败，放弃: %s", block_id, exc,
+                        "block %s %s 分裂失败，放弃: %s",
+                        block_id,
+                        used_strategy,
+                        exc,
                     )
                     block.status = BlockStatus.ABANDONED
                     block.notes = (
-                        block.notes + " | geodesic_split_failed"
+                        block.notes + f" | {used_strategy}_split_failed"
                     ).strip(" |")
                     if progress_cb:
                         progress_cb(
                             "abandoned",
-                            {"block_id": block_id, "reason": "geodesic_split_failed"},
+                            {
+                                "block_id": block_id,
+                                "reason": f"{used_strategy}_split_failed",
+                            },
                         )
                     continue
 
@@ -1514,7 +1649,7 @@ class SemanticRefinementPipeline:
                         "split",
                         {
                             "block_id": block_id,
-                            "seed_count": seed_resp.seed_count,
+                            "seed_count": seed_count,
                             "children": list(block.children_ids),
                             "strategy": used_strategy,
                         },
@@ -1856,13 +1991,18 @@ def run_semantic_refinement(
     vlm_grouped_split: bool = False,
     grouped_split_n_candidates: int = 8,
     grouped_split_max_groups: int = 4,
-    split_strategy: str = "geodesic_fps",
+    split_strategy: str = "auto",
+    split_strategy_model: Optional[str] = None,
+    skip_segmat: bool = True,
+    vlm_split_strategy: bool = False,
     parallel_vlm_workers: int = 1,
     live_report: bool = True,
     live_report_refresh_seconds: int = 10,
     select_best_view: bool = True,
     view_select_model: Optional[str] = None,
     single_view_image_size: int = 720,
+    object_category: str = "",
+    candidate_parts: Optional[List[str]] = None,
     progress_cb: Optional[Callable[[str, Dict[str, Any]], None]] = None,
 ) -> SemanticRefinementResult:
     """函数式封装。"""
@@ -1882,12 +2022,17 @@ def run_semantic_refinement(
         grouped_split_n_candidates=grouped_split_n_candidates,
         grouped_split_max_groups=grouped_split_max_groups,
         split_strategy=split_strategy,
+        split_strategy_model=split_strategy_model,
+        skip_segmat=skip_segmat,
+        vlm_split_strategy=vlm_split_strategy,
         parallel_vlm_workers=parallel_vlm_workers,
         live_report=live_report,
         live_report_refresh_seconds=live_report_refresh_seconds,
         select_best_view=select_best_view,
         view_select_model=view_select_model,
         single_view_image_size=single_view_image_size,
+        object_category=object_category,
+        candidate_parts=candidate_parts,
     )
     pipeline = SemanticRefinementPipeline(client, cfg)
     return pipeline.run(

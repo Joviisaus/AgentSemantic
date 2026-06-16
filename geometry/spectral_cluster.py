@@ -1,7 +1,10 @@
 """
-Mesh 谱聚类分割：基于网格邻接图与几何/畸变特征，对 medoid 姿态 mesh 做部件划分。
+Mesh 测地聚类：3D 网格 → 测地坐标系（2D）→ K-means 定种子 → 测地 Voronoi 分块。
 
-供 mesh_distortion_analyzer.py 调用；渲染结果写入 output/<模型>/spectral_clustering/。
+流程：
+  1. FPS 选 2 个坐标地标，每点嵌入 (d1, d2) = 到地标的测地距离
+  2. 在 2D 测地坐标里 K-means，质心吸附回网格点 → k 个聚类种子
+  3. 在测地图上对 k 个种子做 Dijkstra Voronoi 分配（沿网格边，保证单连通）
 """
 
 from __future__ import annotations
@@ -12,26 +15,48 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-
-try:
-    from scipy.sparse import csr_matrix, diags, eye
-    from scipy.sparse.linalg import eigsh
-    from scipy.sparse.linalg import ArpackNoConvergence
-except ImportError as exc:
-    raise ImportError("谱聚类需要 scipy: pip install scipy") from exc
+from scipy.sparse import csr_matrix
 
 
 DEFAULT_MIN_CLUSTERS = 3
-DEFAULT_MAX_CLUSTERS = 24
-DEFAULT_FEATURE_SIGMA = 0.0  # 0 = 用边特征距离中位数自动估计
+EMBED_DIM = 2
+# 以凹度为主导：实测中沿凹槽/接缝/关节走界的切分质量最好，因此默认让 concavity_weight
+# 显著高于测地与曲率项。测地项保留少量权重以避免凹腔种子被饿成碎簇、把平滑区域淹成巨块。
+# 凹陷/接缝特别明显时可由上层（VLM/CLI）再上调 concavity_weight 到 0.75~0.85。
+DEFAULT_GEODESIC_WEIGHT = 0.20
+DEFAULT_CURVATURE_WEIGHT = 0.15
+DEFAULT_CONCAVITY_WEIGHT = 0.70
+
+
+def resolve_spectral_energy_weights(
+    geodesic_weight: Optional[float] = None,
+    curvature_weight: Optional[float] = None,
+    concavity_weight: Optional[float] = None,
+) -> Tuple[float, float, float]:
+    """归一化谱聚类三项能量权重（测地 / 曲率 / 凹度）。"""
+    raw = [
+        float(geodesic_weight)
+        if geodesic_weight is not None
+        else DEFAULT_GEODESIC_WEIGHT,
+        float(curvature_weight)
+        if curvature_weight is not None
+        else DEFAULT_CURVATURE_WEIGHT,
+        float(concavity_weight)
+        if concavity_weight is not None
+        else DEFAULT_CONCAVITY_WEIGHT,
+    ]
+    raw = [max(0.0, x) for x in raw]
+    total = float(sum(raw))
+    if total <= 1e-12:
+        return (
+            DEFAULT_GEODESIC_WEIGHT,
+            DEFAULT_CURVATURE_WEIGHT,
+            DEFAULT_CONCAVITY_WEIGHT,
+        )
+    return (raw[0] / total, raw[1] / total, raw[2] / total)
 
 
 def resolve_n_clusters(manual: Optional[int]) -> Optional[int]:
-    """
-    解析手动簇数。
-    - None: 自动估计
-    - int >= 1: 手动指定
-    """
     if manual is None:
         return None
     k = int(manual)
@@ -61,8 +86,7 @@ def _kmeans(
     max_iter: int = 100,
     init_centers: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """轻量 KMeans（仅依赖 numpy）。
-    init_centers: 可选，shape (n_clusters, D)，跳过随机初始化。"""
+    """轻量 KMeans（仅依赖 numpy）。"""
     n = len(data)
     if n_clusters <= 1 or n <= 1:
         return np.zeros(n, dtype=np.int64)
@@ -107,150 +131,449 @@ def compute_vertex_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarra
     return vn / np.maximum(vn_norm, 1e-12)
 
 
-def build_vertex_features(
+def build_vertex_geodesic_graph(
     vertices: np.ndarray,
     faces: np.ndarray,
-    vertex_scalars: Optional[np.ndarray] = None,
-    scalar_weight: float = 0.35,
-) -> np.ndarray:
-    """
-    构造谱聚类特征：归一化坐标 + 法向 + 可选标量（如畸变）。
-    返回 (V, D) float64。
-    """
-    center = vertices.mean(axis=0)
-    centered = vertices - center
-    scale = float(np.linalg.norm(centered, axis=1).max())
-    scale = max(scale, 1e-6)
-    pos = centered / scale
-    normals = compute_vertex_normals(vertices, faces)
-
-    chunks = [pos, normals]
-    if vertex_scalars is not None and len(vertex_scalars) == len(vertices):
-        s = np.asarray(vertex_scalars, dtype=np.float64).reshape(-1, 1)
-        s = s / max(float(np.max(np.abs(s))), 1e-12)
-        chunks.append(s * float(scalar_weight))
-    return np.hstack(chunks)
-
-
-def build_weighted_adjacency(
-    faces: np.ndarray,
-    features: np.ndarray,
-    sigma: float = DEFAULT_FEATURE_SIGMA,
 ) -> csr_matrix:
-    """由三角面片 1-邻接边构造对称稀疏亲和矩阵（向量化版本）。"""
-    n = len(features)
-    f = np.asarray(faces, dtype=np.int64)
-    if f.size == 0:
-        return csr_matrix((n, n), dtype=np.float64)
+    """顶点邻接测地图，边权 = 共享边欧氏长度（测地近似）。"""
+    from geometry.partition.common import build_submesh_vertex_graph
 
-    # 三个有向边：(0,1),(1,2),(2,0) —— 后面再加反向边对称化
-    a = np.concatenate([f[:, 0], f[:, 1], f[:, 2]])
-    b = np.concatenate([f[:, 1], f[:, 2], f[:, 0]])
-    valid = a != b  # 退化边
-    a, b = a[valid], b[valid]
-
-    diff = features[a] - features[b]
-    dists = np.linalg.norm(diff, axis=1)
-
-    # 加上反向，得到对称连接
-    rows = np.concatenate([a, b])
-    cols = np.concatenate([b, a])
-    dist_full = np.concatenate([dists, dists])
-
-    if sigma <= 0:
-        sigma = float(np.median(dist_full))
-        sigma = max(sigma, 1e-6)
-
-    weights = np.exp(-0.5 * (dist_full / sigma) ** 2)
-    adj = csr_matrix((weights, (rows, cols)), shape=(n, n), dtype=np.float64)
-    # csr_matrix 在重复 (i,j) 上会累加，这里再做一次 sym 平均确保对称
-    adj = 0.5 * (adj + adj.T)
-    adj.eliminate_zeros()
-    return adj
+    verts = np.asarray(vertices, dtype=np.float64)
+    tris = np.asarray(faces, dtype=np.int64)
+    return build_submesh_vertex_graph(verts, tris)
 
 
-def normalized_graph_laplacian(adjacency: csr_matrix) -> csr_matrix:
-    n = adjacency.shape[0]
-    degree = np.asarray(adjacency.sum(axis=1)).flatten()
-    inv_sqrt = 1.0 / np.sqrt(np.maximum(degree, 1e-12))
-    d_mat = diags(inv_sqrt, format="csr")
-    return eye(n, format="csr", dtype=np.float64) - d_mat @ adjacency @ d_mat
-
-
-def estimate_cluster_count(
-    eigenvalues: np.ndarray,
-    min_clusters: int = DEFAULT_MIN_CLUSTERS,
-    max_clusters: int = DEFAULT_MAX_CLUSTERS,
-) -> int:
-    """根据特征值间隙估计聚类数（跳过第一个近零特征值）。"""
-    if len(eigenvalues) <= 2:
-        return min_clusters
-    vals = np.sort(np.real(eigenvalues))
-    search = vals[1 : min(len(vals), max_clusters + 2)]
-    if len(search) < 2:
-        return min_clusters
-    gaps = np.diff(search)
-    k = int(np.argmax(gaps)) + 1
-    return int(np.clip(k, min_clusters, max_clusters))
-
-
-_DENSE_EIGH_MAX_N = 3000
-
-
-def _solve_smallest_eigs(
-    laplacian, k_eigs: int
-) -> Tuple[np.ndarray, np.ndarray]:
+def build_face_geodesic_graph(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    *,
+    geodesic_weight: Optional[float] = None,
+    curvature_weight: Optional[float] = None,
+    concavity_weight: Optional[float] = None,
+) -> csr_matrix:
     """
-    取 normalized Laplacian 的 k 个最小特征对。
+    面邻接测地图，边权 = 三项能量加权和：
 
-    优先用 ARPACK eigsh(which="SM")；若不收敛则按以下顺序退化：
-      1. ARPACK 放宽 tol / 增加 maxiter；
-      2. 矩阵规模小 (n <= _DENSE_EIGH_MAX_N) 时直接 dense numpy.linalg.eigh；
-      3. 仍然失败则抛 ArpackNoConvergence，让上层走坐标 KMeans 退化路径。
+        E_geo  = 归一化测地步长
+        E_curv = (1 - cosθ) 归一化，刻画一般弯曲/折角
+        E_conc = 凹边(minima rule) 上的 (1 - cosθ)，刻画凹槽/接缝
 
-    注意：刻意不再尝试 shift-invert (sigma=0)，因为它需要 LU 分解，
-    在退化拓扑（孤立顶点 / 重复点）上更容易直接段错误，比单纯不收敛更糟。
+        w(i,j) = wg·E_geo + wc·E_curv + wn·E_conc
     """
-    n = laplacian.shape[0]
-    k_eigs = min(k_eigs, max(1, n - 1))
+    from geometry.partition.common import build_face_adjacency_csr, face_centroids_and_normals
 
-    try:
-        return eigsh(
-            laplacian,
-            k=k_eigs,
-            which="SM",
-            tol=1e-4,
-            maxiter=max(1000, n * 5),
-        )
-    except ArpackNoConvergence:
-        pass
+    verts = np.asarray(vertices, dtype=np.float64)
+    tris = np.asarray(faces, dtype=np.int64)
+    m = int(len(tris))
+    if m == 0:
+        return csr_matrix((0, 0), dtype=np.float64)
 
-    try:
-        return eigsh(
-            laplacian,
-            k=k_eigs,
-            which="SM",
-            tol=1e-2,
-            maxiter=max(5000, n * 20),
-        )
-    except ArpackNoConvergence:
-        pass
+    centroids, normals = face_centroids_and_normals(verts, tris)
+    topo = build_face_adjacency_csr(tris).tocoo()
+    upper = topo.row < topo.col
+    r = topo.row[upper].astype(np.int64)
+    c = topo.col[upper].astype(np.int64)
+    if r.size == 0:
+        return csr_matrix((m, m), dtype=np.float64)
 
-    if n <= _DENSE_EIGH_MAX_N:
-        dense = (
-            laplacian.toarray()
-            if hasattr(laplacian, "toarray")
-            else np.asarray(laplacian)
-        )
-        dense = 0.5 * (dense + dense.T)
-        eigvals, eigvecs = np.linalg.eigh(dense)
-        return eigvals[:k_eigs], eigvecs[:, :k_eigs]
+    dc = centroids[c] - centroids[r]
+    geo = np.maximum(np.linalg.norm(dc, axis=1), 1e-12)
+    cos_ang = np.clip(np.sum(normals[r] * normals[c], axis=1), -1.0, 1.0)
 
-    raise ArpackNoConvergence(
-        f"eigsh failed for n={n}, k={k_eigs}; dense fallback skipped (n>{_DENSE_EIGH_MAX_N})",
-        np.array([]),
-        np.zeros((n, 0)),
+    wg, wc, wn = resolve_spectral_energy_weights(
+        geodesic_weight, curvature_weight, concavity_weight
     )
+
+    # 凹边判据：两面质心相互位于对方法向正侧 → 表面向内折（minima rule）
+    concave = (
+        np.sum(normals[r] * dc, axis=1) + np.sum(normals[c] * (-dc), axis=1)
+    ) > 0.0
+    curv_energy = 1.0 - cos_ang
+    conc_energy = np.where(concave, curv_energy, 0.0)
+
+    geo_n = geo / max(float(np.mean(geo)), 1e-12)
+    curv_n = curv_energy / max(float(np.mean(curv_energy)), 1e-12)
+    if np.any(concave):
+        conc_mean = float(np.mean(conc_energy[concave]))
+        conc_n = conc_energy / max(conc_mean, 1e-12)
+    else:
+        conc_n = conc_energy
+
+    dist = np.maximum(wg * geo_n + wc * curv_n + wn * conc_n, 1e-9)
+
+    rows = np.concatenate([r, c])
+    cols = np.concatenate([c, r])
+    data = np.concatenate([dist, dist])
+    return csr_matrix((data, (rows, cols)), shape=(m, m), dtype=np.float64)
+
+
+def _normalize_distance_features(feats: np.ndarray) -> np.ndarray:
+    """按列归一化测地距离特征到 [0, 1]。"""
+    feats = np.asarray(feats, dtype=np.float64)
+    out = feats.copy()
+    for c in range(out.shape[1]):
+        col = out[:, c]
+        finite = np.isfinite(col)
+        if not np.any(finite):
+            out[:, c] = 0.0
+            continue
+        scale = float(np.max(col[finite]))
+        scale = max(scale, 1e-12)
+        out[:, c] = np.where(finite, col / scale, 1.0)
+    return out
+
+
+def geodesic_embed_2d(
+    graph: csr_matrix,
+    coords: np.ndarray,
+    *,
+    embed_dim: int = EMBED_DIM,
+    seed_indices: Optional[Sequence[int]] = None,
+) -> Tuple[np.ndarray, List[int]]:
+    """
+    投影到测地坐标系：FPS 选 ``embed_dim`` 个地标，
+    每点坐标为到各地标的 Dijkstra 测地距离。
+    """
+    from scipy.sparse.csgraph import dijkstra
+
+    from geometry.partition.geodesic_fps import geodesic_fps_seeds
+
+    n = int(graph.shape[0])
+    d = min(max(1, int(embed_dim)), max(1, n))
+    if n <= 1:
+        return np.zeros((n, d), dtype=np.float64), []
+
+    if seed_indices is not None and len(seed_indices) >= d:
+        seeds = [int(s) for s in seed_indices[:d]]
+    else:
+        seeds = geodesic_fps_seeds(graph, np.asarray(coords, dtype=np.float64), d)
+
+    if not seeds:
+        return np.zeros((n, d), dtype=np.float64), []
+
+    dists = dijkstra(
+        graph,
+        indices=np.asarray(seeds, dtype=np.int64),
+        directed=False,
+    )
+    dists = np.asarray(dists, dtype=np.float64)
+    if dists.ndim == 1:
+        dists = dists.reshape(1, -1)
+    dists = dists.T
+    dists = np.where(np.isfinite(dists), dists, np.inf)
+
+    if dists.shape[1] < d:
+        pad = np.full((n, d - dists.shape[1]), np.inf, dtype=np.float64)
+        dists = np.hstack([dists, pad])
+
+    feats = _normalize_distance_features(dists[:, :d])
+    return feats, seeds
+
+
+def _farthest_point_init(data: np.ndarray, k: int) -> np.ndarray:
+    """确定性最远点初始化（不依赖 RNG，提升对称稳定性）。"""
+    n = len(data)
+    center = data.mean(axis=0)
+    first = int(np.argmax(np.linalg.norm(data - center, axis=1)))
+    chosen = [first]
+    min_d = np.linalg.norm(data - data[first], axis=1)
+    while len(chosen) < k:
+        nxt = int(np.argmax(min_d))
+        chosen.append(nxt)
+        min_d = np.minimum(min_d, np.linalg.norm(data - data[nxt], axis=1))
+    return data[np.asarray(chosen, dtype=np.int64)].copy()
+
+
+def _kmeans_centers(
+    data: np.ndarray,
+    n_clusters: int,
+    *,
+    random_state: int = 0,
+) -> np.ndarray:
+    """K-means 质心（确定性最远点初始化，仅用于在测地坐标系里定位种子）。"""
+    _ = random_state
+    n = len(data)
+    k = min(max(1, int(n_clusters)), n)
+    if k <= 1 or n <= 1:
+        return data[:1].copy()
+
+    centers = _farthest_point_init(data, k)
+    labels = np.full(n, -1, dtype=np.int64)
+    for _ in range(100):
+        dists = np.linalg.norm(data[:, None, :] - centers[None, :, :], axis=2)
+        new_labels = np.argmin(dists, axis=1).astype(np.int64)
+        if np.array_equal(new_labels, labels):
+            break
+        labels = new_labels
+        for ci in range(k):
+            mask = labels == ci
+            if np.any(mask):
+                centers[ci] = data[mask].mean(axis=0)
+    return centers
+
+
+def _cluster_seeds_from_embed_kmeans(
+    embed_2d: np.ndarray,
+    graph: csr_matrix,
+    coords: np.ndarray,
+    n_clusters: int,
+    *,
+    random_state: int = 0,
+) -> List[int]:
+    """在测地 2D 坐标里 K-means 找质心，再吸附到最近网格点作为 Voronoi 种子。"""
+    from geometry.partition.geodesic_fps import geodesic_fps_seeds
+
+    n = int(len(embed_2d))
+    k = min(max(1, int(n_clusters)), n)
+    centers = _kmeans_centers(embed_2d, k, random_state=random_state)
+
+    seeds: List[int] = []
+    used: set[int] = set()
+    for ci in range(k):
+        dist = np.linalg.norm(embed_2d - centers[ci], axis=1)
+        for idx in np.argsort(dist):
+            pick = int(idx)
+            if pick not in used:
+                seeds.append(pick)
+                used.add(pick)
+                break
+
+    if len(seeds) < k:
+        for s in geodesic_fps_seeds(graph, np.asarray(coords, dtype=np.float64), k):
+            si = int(s)
+            if si not in used:
+                seeds.append(si)
+                used.add(si)
+            if len(seeds) >= k:
+                break
+    return seeds[:k]
+
+
+def _potts_regularize_labels(
+    graph: csr_matrix,
+    seed_dists: np.ndarray,
+    labels: np.ndarray,
+    *,
+    smooth_beta: float = 1.0,
+    max_iter: int = 12,
+) -> np.ndarray:
+    """对图 Voronoi 标签做 Potts 能量正则（ICM），消除等距带上的锯齿/棋盘格。
+
+    纯 ``argmin`` 的离散测地 Voronoi 在两种子近等距的带状区域里，会因图距离
+    呈台阶状而让分界面来回锯齿（棋盘格）。这里在**数据项 = 到种子的测地距离**
+    的基础上加一个 **Potts 平滑项 = 相邻面异标签数 × β**，用 ICM 就地迭代最小化
+
+        E(f, l) = dist[l, f] + β · #{邻面标签 ≠ l}
+
+    分界面会被拉直到「测地距离 + 边界长度」的能量最优位置：仅在数据项几乎打平
+    的锯齿处翻转，块内部/真实凹缝边界不动。β 按图边权中位数自适应定标。
+    """
+    from collections import deque
+
+    n = int(graph.shape[0])
+    if n <= 1 or labels.size == 0:
+        return labels
+    k = int(seed_dists.shape[0])
+    if k <= 1:
+        return labels
+
+    indptr = graph.indptr
+    indices = graph.indices
+    data = graph.data
+    if data.size == 0:
+        return labels
+    # 平滑项尺度 = β × 边权中位数：相邻翻转代价 ~ 数步测地距离
+    med_w = float(np.median(data[data > 0])) if np.any(data > 0) else 1.0
+    beta = float(smooth_beta) * med_w
+    if beta <= 0.0:
+        return labels
+
+    big = float(np.max(seed_dists[np.isfinite(seed_dists)]) + 1.0) if np.any(
+        np.isfinite(seed_dists)
+    ) else 1.0
+    cost = np.where(np.isfinite(seed_dists), seed_dists, big)
+    labels = labels.astype(np.int64).copy()
+
+    def _neighbors(fi: int) -> np.ndarray:
+        return indices[indptr[fi]: indptr[fi + 1]]
+
+    def _best_label(fi: int) -> int:
+        nbrs = _neighbors(fi)
+        if nbrs.size == 0:
+            return int(labels[fi])
+        nbr_labels = labels[nbrs]
+        cur = int(labels[fi])
+        cand = set(int(x) for x in nbr_labels.tolist())
+        cand.add(cur)
+        if len(cand) == 1:
+            return cur
+        best_lab = cur
+        best_cost = cost[cur, fi] + beta * float(np.count_nonzero(nbr_labels != cur))
+        for lab in cand:
+            if lab == cur:
+                continue
+            c = cost[lab, fi] + beta * float(np.count_nonzero(nbr_labels != lab))
+            if c < best_cost - 1e-9:
+                best_cost = c
+                best_lab = lab
+        return best_lab
+
+    # 仅处理「边界面」（存在异标签邻居），用活动队列推进；ICM 每次接受的翻转都
+    # 严格降低总能量，故必然收敛，只在分界面附近做局部调整。
+    in_queue = np.zeros(n, dtype=bool)
+    queue: "deque[int]" = deque()
+    for fi in range(n):
+        nbrs = _neighbors(fi)
+        if nbrs.size and np.any(labels[nbrs] != labels[fi]):
+            queue.append(fi)
+            in_queue[fi] = True
+
+    flips_cap = max_iter * max(n, 1)
+    flips = 0
+    while queue and flips < flips_cap:
+        fi = queue.popleft()
+        in_queue[fi] = False
+        new_lab = _best_label(fi)
+        if new_lab == int(labels[fi]):
+            continue
+        labels[fi] = new_lab
+        flips += 1
+        for nb in _neighbors(fi):
+            nb = int(nb)
+            if not in_queue[nb]:
+                queue.append(nb)
+                in_queue[nb] = True
+    return labels
+
+
+def _cluster_from_geodesic_graph(
+    graph: csr_matrix,
+    coords: np.ndarray,
+    n_clusters: int,
+    *,
+    random_state: int = 0,
+    embed_dim: int = EMBED_DIM,
+    face_array: Optional[np.ndarray] = None,
+    smooth_beta: float = 1.0,
+    lloyd_iter: int = 8,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """
+    测地 FPS 定种子 → Lloyd 松弛均衡 → 测地 Voronoi + Potts 正则 最终分块。
+
+    种子用**测地最远点采样（FPS）**铺开，保证在网格上均匀、对称分布——
+    旧版「2D 嵌入 + K-means」在对称结构（如两条腿）上会把多点坍缩到同一坐标，
+    导致种子在一端扎堆、另一端缺失，分出来一边完美、另一边一块从腿连到半个身子。
+    FPS 之后再做 Lloyd 松弛把种子推到各自区域质心、均衡块大小，最后 Potts 正则
+    拉直分界面、消除棋盘格锯齿。
+    """
+    from scipy.sparse.csgraph import dijkstra
+
+    from geometry.partition.geodesic_fps import (
+        geodesic_fps_seeds,
+        lloyd_relax_geodesic,
+    )
+
+    _ = embed_dim, random_state
+    n = int(graph.shape[0])
+    k = int(np.clip(n_clusters, 1, n))
+    if k <= 1 or n <= 1:
+        return np.zeros(n, dtype=np.int64), {}
+
+    coords = np.asarray(coords, dtype=np.float64)
+    seeds = [int(s) for s in geodesic_fps_seeds(graph, coords, k)]
+    if not seeds:
+        return np.zeros(n, dtype=np.int64), {}
+
+    if int(lloyd_iter) > 0:
+        seeds, _ = lloyd_relax_geodesic(
+            graph, coords, list(seeds), n_iter=int(lloyd_iter)
+        )
+
+    seed_dists = np.asarray(
+        dijkstra(
+            graph,
+            indices=np.asarray(seeds, dtype=np.int64),
+            directed=False,
+        ),
+        dtype=np.float64,
+    )
+    if seed_dists.ndim == 1:
+        seed_dists = seed_dists.reshape(1, -1)
+    labels = np.argmin(seed_dists, axis=0).astype(np.int64)
+    labels = _potts_regularize_labels(
+        graph, seed_dists, labels, smooth_beta=smooth_beta
+    )
+
+    if face_array is not None and len(face_array) > 0:
+        from geometry.partition.common import enforce_per_label_face_connectivity
+
+        labels = enforce_per_label_face_connectivity(
+            np.asarray(face_array, dtype=np.int64),
+            labels,
+        )
+
+    return labels, {
+        "cluster_seed_indices": [int(s) for s in seeds],
+        "assignment": "geodesic_fps_lloyd_voronoi_potts",
+        "lloyd_iter": int(lloyd_iter),
+        "potts_beta": float(smooth_beta),
+    }
+
+
+def spectral_cluster_faces(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    n_clusters: int,
+    *,
+    geodesic_weight: Optional[float] = None,
+    curvature_weight: Optional[float] = None,
+    concavity_weight: Optional[float] = None,
+    random_state: int = 0,
+) -> Tuple[np.ndarray, int, Dict[str, Any]]:
+    """面级聚类：测地 2D 嵌入定种子 → 测地 Voronoi 分面。"""
+    from geometry.partition.common import face_centroids_and_normals
+
+    tris = np.asarray(faces, dtype=np.int64)
+    m = int(len(tris))
+    if m == 0:
+        raise ValueError("空 mesh")
+
+    k = int(np.clip(n_clusters, 1, m))
+    if k == 1:
+        return np.zeros(m, dtype=np.int64), 1, {
+            "method": "face_geodesic_trivial",
+            "num_faces": m,
+        }
+
+    verts = np.asarray(vertices, dtype=np.float64)
+    wg, wc, wn = resolve_spectral_energy_weights(
+        geodesic_weight, curvature_weight, concavity_weight
+    )
+    graph = build_face_geodesic_graph(
+        verts,
+        tris,
+        geodesic_weight=wg,
+        curvature_weight=wc,
+        concavity_weight=wn,
+    )
+    centroids, _ = face_centroids_and_normals(verts, tris)
+    labels, extra = _cluster_from_geodesic_graph(
+        graph,
+        centroids,
+        k,
+        random_state=random_state,
+        face_array=tris,
+    )
+
+    return labels, k, {
+        "method": "face_geodesic_fps_lloyd_voronoi",
+        "num_faces": m,
+        "requested_clusters": k,
+        "geodesic_weight": wg,
+        "curvature_weight": wc,
+        "concavity_weight": wn,
+        **extra,
+    }
 
 
 def spectral_cluster_vertices(
@@ -258,62 +581,62 @@ def spectral_cluster_vertices(
     faces: np.ndarray,
     n_clusters: Optional[int] = None,
     *,
-    vertex_scalars: Optional[np.ndarray] = None,
-    scalar_weight: float = 0.35,
     min_clusters: int = DEFAULT_MIN_CLUSTERS,
-    max_clusters: int = DEFAULT_MAX_CLUSTERS,
     random_state: int = 0,
-    init_vertex_indices: Optional[Sequence[int]] = None,
 ) -> Tuple[np.ndarray, int, Dict[str, Any]]:
-    """
-    对网格顶点做谱聚类。
-    返回 vertex_labels, n_clusters, debug_info。
-    """
-    n = len(vertices)
+    """顶点级聚类：测地 2D 嵌入定种子 → 测地 Voronoi 分顶点。"""
+    verts = np.asarray(vertices, dtype=np.float64)
+    tris = np.asarray(faces, dtype=np.int64)
+    n = len(verts)
     if n == 0:
         raise ValueError("空 mesh")
-    n_clusters = resolve_n_clusters(n_clusters)
 
-    features = build_vertex_features(vertices, faces, vertex_scalars, scalar_weight)
-    adjacency = build_weighted_adjacency(faces, features)
-    laplacian = normalized_graph_laplacian(adjacency)
+    resolved = resolve_n_clusters(n_clusters)
+    k = int(np.clip(resolved if resolved is not None else min_clusters, 1, n))
+    if k == 1:
+        return np.zeros(n, dtype=np.int64), 1, {
+            "method": "vertex_geodesic_trivial",
+            "num_vertices": n,
+        }
 
-    k_eigs = min(max(max_clusters + 1, min_clusters + 1), max(2, n - 1))
-    eigenvalues, eigenvectors = _solve_smallest_eigs(laplacian, k_eigs)
+    graph = build_vertex_geodesic_graph(verts, tris)
+    labels, extra = _cluster_from_geodesic_graph(
+        graph, verts, k, random_state=random_state
+    )
+    from geometry.partition.common import enforce_per_label_face_connectivity
 
-    order = np.argsort(eigenvalues)
-    eigenvalues = eigenvalues[order]
-    eigenvectors = eigenvectors[:, order]
+    face_labels = np.asarray(vertex_labels_to_face_labels(labels, tris), dtype=np.int64)
+    face_labels = enforce_per_label_face_connectivity(tris, face_labels)
+    labels = face_labels_to_vertex_labels(tris, face_labels, n)
 
-    if n_clusters is None:
-        n_clusters = estimate_cluster_count(
-            eigenvalues, min_clusters=min_clusters, max_clusters=max_clusters
-        )
-    n_clusters = int(np.clip(n_clusters, 1, n))
-
-    if n_clusters == 1:
-        labels = np.zeros(n, dtype=np.int64)
-    else:
-        emb = eigenvectors[:, 1 : n_clusters + 1]
-        if emb.shape[1] == 0:
-            emb = eigenvectors[:, :1]
-        init_centers = None
-        if init_vertex_indices is not None:
-            idx = np.asarray(list(init_vertex_indices), dtype=np.int64)
-            if idx.size == n_clusters and idx.min() >= 0 and idx.max() < n:
-                init_centers = emb[idx].copy()
-        labels = _kmeans(
-            emb, n_clusters, random_state=random_state, init_centers=init_centers
-        )
-
-    debug = {
+    return labels.astype(np.int64), k, {
         "num_vertices": n,
-        "requested_clusters": n_clusters,
-        "eigenvalues": eigenvalues[: min(len(eigenvalues), max_clusters + 2)].tolist(),
-        "feature_dim": int(features.shape[1]),
-        "scalar_weight": float(scalar_weight),
+        "requested_clusters": k,
+        "method": "vertex_geodesic_2d_voronoi",
+        "auto_clusters": resolved is None,
+        **extra,
     }
-    return labels.astype(np.int64), n_clusters, debug
+
+
+def face_labels_to_vertex_labels(
+    faces: np.ndarray,
+    face_labels: Sequence[int],
+    n_vertices: int,
+) -> np.ndarray:
+    """面标签多数投票回传至顶点。"""
+    f = np.asarray(faces, dtype=np.int64)
+    fl = np.asarray(face_labels, dtype=np.int64)
+    if f.size == 0:
+        return np.zeros(n_vertices, dtype=np.int64)
+
+    max_lab = int(fl.max()) if fl.size else 0
+    votes = np.zeros((n_vertices, max_lab + 1), dtype=np.int64)
+    for vi in range(3):
+        np.add.at(votes, (f[:, vi], fl), 1)
+    has_votes = votes.sum(axis=1) > 0
+    out = np.zeros(n_vertices, dtype=np.int64)
+    out[has_votes] = np.argmax(votes[has_votes], axis=1).astype(np.int64)
+    return out
 
 
 def vertex_labels_to_face_labels(vertex_labels: Sequence[int], faces: np.ndarray) -> List[int]:
@@ -337,7 +660,7 @@ def export_cluster_labels_json(
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload: Dict[str, Any] = {
-        "method": "spectral_clustering",
+        "method": "geodesic_coordinate_clustering",
         "num_clusters": num_clusters,
         "num_vertices": num_vertices,
         "num_faces": len(face_labels),
@@ -382,7 +705,7 @@ def render_spectral_cluster_views(
     elev, azim = DEFAULT_OVERVIEW_VIEW
 
     title = (
-        f"[谱聚类] {render_anim_name or 'medoid'}  "
+        f"[测地聚类] {render_anim_name or 'medoid'}  "
         f"frame={render_frame_index}  t={render_time:.3f}s  "
         f"medoid={render_medoid_score:.4f}  parts={num_clusters}"
     )
@@ -410,10 +733,7 @@ def run_spectral_clustering_on_render_pose(
     output_dir: str | Path,
     *,
     n_clusters: Optional[int] = None,
-    vertex_scalars: Optional[np.ndarray] = None,
-    scalar_weight: float = 0.35,
     min_clusters: int = DEFAULT_MIN_CLUSTERS,
-    max_clusters: int = DEFAULT_MAX_CLUSTERS,
     render: bool = True,
     image_size: int = 640,
     cols: int = 4,
@@ -422,31 +742,33 @@ def run_spectral_clustering_on_render_pose(
     render_time: float = 0.0,
     render_medoid_score: float = 0.0,
 ) -> SpectralClusterResult:
-    """
-    在 medoid 输出姿态上执行谱聚类，导出标签 JSON，并可选渲染到 output_dir。
-
-    n_clusters:
-        None — 按特征值间隙自动估计簇数
-        int >= 1 — 手动指定簇数
-    """
+    """在 medoid 姿态上执行测地坐标聚类并导出标签 JSON。"""
     work_dir = Path(output_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
     result = SpectralClusterResult(ok=False, work_dir=work_dir)
     requested_clusters = resolve_n_clusters(n_clusters)
 
     try:
-        vertex_labels, num_clusters, debug = spectral_cluster_vertices(
-            np.asarray(vertices, dtype=np.float64),
-            np.asarray(faces, dtype=np.int64),
-            n_clusters=requested_clusters,
-            vertex_scalars=vertex_scalars,
-            scalar_weight=scalar_weight,
-            min_clusters=min_clusters,
-            max_clusters=max_clusters,
-        )
-        face_labels = vertex_labels_to_face_labels(vertex_labels, faces)
+        verts = np.asarray(vertices, dtype=np.float64)
+        tris = np.asarray(faces, dtype=np.int64)
+        if requested_clusters is not None:
+            face_label_arr, num_clusters, debug = spectral_cluster_faces(
+                verts,
+                tris,
+                requested_clusters,
+            )
+            vertex_labels = face_labels_to_vertex_labels(tris, face_label_arr, len(verts))
+            face_labels = [int(x) for x in face_label_arr]
+        else:
+            vertex_labels, num_clusters, debug = spectral_cluster_vertices(
+                verts,
+                tris,
+                n_clusters=None,
+                min_clusters=min_clusters,
+            )
+            face_labels = vertex_labels_to_face_labels(vertex_labels, tris)
     except (ValueError, ImportError, OSError) as exc:
-        result.message = f"谱聚类失败: {exc}"
+        result.message = f"测地聚类失败: {exc}"
         return result
 
     labels_path = export_cluster_labels_json(
@@ -487,14 +809,14 @@ def run_spectral_clustering_on_render_pose(
             result.extra["panel_png"] = str(panel_path)
             result.extra["overview_png"] = str(overview_path)
         except (ImportError, OSError, ValueError) as exc:
-            result.message = f"谱聚类完成但渲染失败: {exc}"
+            result.message = f"测地聚类完成但渲染失败: {exc}"
             result.ok = True
             return result
 
     result.ok = True
-    auto_note = "" if requested_clusters is not None else "（自动估计簇数）"
+    auto_note = "" if requested_clusters is not None else f"（默认 k={min_clusters}）"
     result.message = (
-        f"谱聚类完成: {num_clusters} 个部件{auto_note}, "
+        f"测地聚类完成: {num_clusters} 个部件{auto_note}, "
         f"标签 {labels_path.name}"
     )
     return result

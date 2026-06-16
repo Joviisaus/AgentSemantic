@@ -657,6 +657,28 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="在平滑蒙皮基础上微调关节（默认仅更新权重，较快）",
     )
     g.add_argument(
+        "--optimize-partition", action="store_true",
+        help=(
+            "在蒙皮优化中细化初始分块边界：按 Agent 几何能量 + VLM 动画形变能量"
+            "驱动，边界朝『给定动画下边拉伸最小』方向移动（需 --optimize-skin）。"
+        ),
+    )
+    g.add_argument(
+        "--partition-motion-weight", type=float, default=2.0,
+        help=(
+            "--optimize-partition 时动画形变能量对边界移动的权重"
+            "（0=纯几何能量，默认 2.0）。动画姿态优先用 VLM 生成，"
+            "无则回退检验动画(--angle)。"
+        ),
+    )
+    g.add_argument(
+        "--no-part-energy", action="store_true",
+        help=(
+            "跳过用 VLM 设计分块几何能量（默认会调一次带整览图的网络请求，可能很慢）。"
+            "改用默认几何能量；--optimize-partition 的动画形变优化照常生效，可完全离线。"
+        ),
+    )
+    g.add_argument(
         "--no-joint-opt", action="store_true",
         help=argparse.SUPPRESS,
     )
@@ -872,6 +894,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         from geometry.skin_optimize import SkinOptimizeConfig, optimize_semantic_skin
 
         do_joints = bool(args.joint_opt) and not args.no_joint_opt
+        do_partition = bool(args.optimize_partition)
         opt_cfg = (
             SkinOptimizeConfig.fast()
             if args.fast_skin_opt
@@ -881,14 +904,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 partition_refine_iters=args.part_opt_iter,
                 joint_max_iter=args.joint_opt_iter,
                 optimize_joints=do_joints,
+                optimize_partition=do_partition,
+                w_partition_motion=float(args.partition_motion_weight),
+                use_agent_partition_energy=not args.no_part_energy,
                 verbose=True,
             )
         )
         if args.fast_skin_opt:
-            opt_cfg = replace(opt_cfg, optimize_joints=do_joints, verbose=True)
+            opt_cfg = replace(
+                opt_cfg,
+                optimize_joints=do_joints,
+                optimize_partition=do_partition,
+                w_partition_motion=float(args.partition_motion_weight),
+                use_agent_partition_energy=not args.no_part_energy,
+                # fast 预设默认关掉分块；显式 --optimize-partition 时补回迭代步数
+                partition_refine_iters=(
+                    args.part_opt_iter if do_partition else opt_cfg.partition_refine_iters
+                ),
+                verbose=True,
+            )
         print(
             "[skin-opt] 指标分块 + u0 退火扩散 + 网格调和蒙皮"
             + (" + 关节 GRPO" if opt_cfg.optimize_joints else "（未加 --joint-opt，跳过关节迭代）")
+            + (
+                f" + 分块边界优化(动画形变 w={opt_cfg.w_partition_motion:g})"
+                if opt_cfg.optimize_partition and opt_cfg.partition_refine_iters > 0
+                else ""
+            )
         )
         part_vlm = None
         if opt_cfg.use_agent_partition_energy:

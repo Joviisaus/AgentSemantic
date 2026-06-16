@@ -1649,15 +1649,13 @@ def main() -> None:
         if n_clusters is not None:
             print(f"[spectral] 手动指定簇数: {n_clusters}")
         else:
-            print("[spectral] 簇数: 自动估计")
+            print(f"[spectral] 簇数: 默认 k={3}")
         t_spectral = time.perf_counter()
         spectral_result = run_spectral_clustering_on_render_pose(
             result.render_vertices,
             mesh.faces,
             spectral_cluster_dir,
             n_clusters=n_clusters,
-            vertex_scalars=result.render_frame_combined,
-            scalar_weight=args.spectral_scalar_weight,
             render=not args.no_render,
             image_size=args.image_size,
             cols=args.cols,

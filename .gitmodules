@@ -1,3 +1,6 @@
 [submodule "third_party/SEG-MAT"]
 	path = third_party/SEG-MAT
 	url = https://github.com/clinplayer/SEG-MAT.git
+[submodule "third_party/NEO"]
+	path = third_party/NEO
+	url = https://github.com/Adversarr/NEO.git

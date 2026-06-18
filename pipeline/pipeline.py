@@ -26,21 +26,13 @@ from geometry.blocks import (
     export_tree_json,
     gather_face_status,
 )
-from geometry.grouped_split import (
-    GroupedSplitResult,
-    split_block_by_vlm_grouping,
-)
 from geometry.seed_split import (
     _extract_submesh,
     ask_seed_count,
     split_block_by_connected_components,
     split_block_by_geodesic_fps,
-    split_block_by_spectral_seeds,
 )
-from geometry.spectral_cluster import (
-    spectral_cluster_vertices,
-    vertex_labels_to_face_labels,
-)
+from geometry.spectral_cluster import vertex_labels_to_face_labels
 from rendering.render_component import (
     ACCEPTED_RGB,
     DIM_RGB,
@@ -97,7 +89,6 @@ class SemanticRefinementConfig:
     min_block_size: int = 20
     image_size: int = 512
     panel_cols: int = 4
-    scalar_weight: float = 0.35
     save_intermediate_panels: bool = True
     save_responses: bool = True
     classification_model: Optional[str] = None
@@ -110,16 +101,8 @@ class SemanticRefinementConfig:
     # 每轮迭代结束后让 VLM 看一眼「整模型染色进度图」并自评 + 决定是否终止。
     # max_depth 仍是硬上限。
     vlm_self_review: bool = False
-    # partial 块改用「过分割 + VLM 一次性分组」代替 ask_seed_count + 谱聚类。
-    # 子块 label 直接由 VLM 给（full/partial/none），可跳过下一轮的 classify。
-    # 实际上多视角候选编号 VLM 难以在 12 视角间保持一致，已不推荐主流程开启。
-    vlm_grouped_split: bool = False
-    grouped_split_n_candidates: int = 8       # 过分割成多少个候选区
-    grouped_split_max_groups: int = 4         # VLM 最多合并成多少组
-    # 分裂策略：
-    #   "geodesic_fps" —— 在子 mesh 上做测地 FPS 选 K 个种子 + 测地 Voronoi 划分（默认）
-    #   "spectral"     —— 旧的 normalize-cut 谱聚类（fallback / 兼容老行为）
-    split_strategy: str = "geodesic_fps"
+    # 分裂算法与 full_coverage 保持一致：ask_seed_count 后统一走
+    # connected components → segmat → geodesic FPS/Voronoi/Lloyd。
     # 并行 VLM 请求开关：每轮迭代里把 N 个块的 classify（observe+reason）放进
     # ThreadPoolExecutor 同时跑。1 = 完全串行（默认，与旧行为一致）。
     # 渲染 (pyvista/VTK) 仍串行（线程不安全）；ask_seed_count 也仍串行
@@ -287,6 +270,108 @@ class SemanticRefinementPipeline:
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("segmat split 失败: %s", exc)
             return {"groups": [], "error": str(exc)}
+
+    def _split_block_by_seeds(
+        self,
+        vertices: np.ndarray,
+        faces: np.ndarray,
+        block: SemanticBlock,
+        seed_count: int,
+        *,
+        responses_dir: Path,
+    ) -> Optional[List[List[int]]]:
+        """对单个 block 走 CC → segmat → FPS 级联，返回子块 face_id 分组。
+
+        这与 ``FullCoveragePipeline._split_block_by_seeds`` 保持一致：
+        - 未做过 segmat：先按拓扑连通分量拆；若得到多个 CC，直接采用。
+        - 仍是单连通且未做过 segmat：跑一次 segmat 预切。
+        - 已做过 segmat 或 segmat 失败：只走 geodesic FPS + Voronoi + Lloyd。
+        """
+        # Step A: 连通分量（仅未做过 segmat 的块）
+        if not block.segmat_done:
+            cc_groups = split_block_by_connected_components(
+                vertices,
+                faces,
+                block.face_ids,
+                min_component_faces=max(1, self.config.min_block_size // 2),
+            )
+            if cc_groups is not None and len(cc_groups) >= 2:
+                block.seed_decision = {
+                    "mode": "connected_components",
+                    "num_components": len(cc_groups),
+                    "component_sizes": [len(g) for g in cc_groups],
+                    "seed_count_target": seed_count,
+                }
+                self._dump_response(
+                    responses_dir, f"{block.block_id}_cc", block.seed_decision
+                )
+                return cc_groups
+
+        # Step B: segmat 第一次切（仅未做过的）
+        if not block.segmat_done:
+            segmat = self._segmat_split(
+                vertices,
+                faces,
+                block.face_ids,
+                vertex_scalars=None,
+                min_clusters=max(2, min(3, seed_count)),
+                max_clusters=max(seed_count, 4),
+            )
+            block.seed_decision = {
+                "mode": "segmat",
+                "k_actual": segmat.get("k_actual", 0),
+                "k_eigengap": segmat.get("k_eigengap", 0),
+                "component_sizes": segmat.get("sizes", []),
+                "seed_count_target": seed_count,
+                "error": segmat.get("error"),
+            }
+            self._dump_response(
+                responses_dir, f"{block.block_id}_segmat", block.seed_decision
+            )
+            sub_groups = segmat.get("groups", [])
+            if len(sub_groups) >= 2:
+                block.segmat_done = True
+                return sub_groups
+            LOGGER.info(
+                "block %s segmat 失败 (%s) → 改走 FPS-Voronoi K=%d",
+                block.block_id,
+                segmat.get("error", "unknown"),
+                seed_count,
+            )
+            block.segmat_done = True
+
+        # Step C: FPS-Voronoi-Lloyd
+        try:
+            split = split_block_by_geodesic_fps(
+                vertices,
+                faces,
+                block.face_ids,
+                seed_count=seed_count,
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("block %s geodesic_fps 失败: %s", block.block_id, exc)
+            block.seed_decision = {
+                "mode": "geodesic_fps",
+                "seed_count_target": seed_count,
+                "error": str(exc),
+            }
+            self._dump_response(
+                responses_dir, f"{block.block_id}_seed", block.seed_decision
+            )
+            return None
+
+        block.seed_decision = {
+            "mode": "geodesic_fps",
+            "seed_count_target": seed_count,
+            "num_clusters": split.num_clusters,
+            "debug": split.debug,
+        }
+        self._dump_response(
+            responses_dir, f"{block.block_id}_seed", block.seed_decision
+        )
+        if split.num_clusters <= 1:
+            return None
+        return split.sub_face_groups
 
     # ---------- 渲染 ----------
     def _render_block_panel(
@@ -1121,308 +1206,7 @@ class SemanticRefinementPipeline:
                         )
                     continue
 
-                # Step 2a: 先按连通分量切。**仅在 segmat 之前**：原始 partial 块
-                # 如果是由多块拓扑断开的子 mesh 组成的（典型如「头部+耳朵尖+衣领」
-                # 共享同一 spectral 标签），先免费按 CC 切开。
-                # ⚠️ 已经做过 segmat 的块不再做 CC：FPS-spectral 的子块往往是
-                # 拓扑碎片化的（一片色覆盖几十个不连通小区域），如果再切 CC
-                # 会爆炸性产生几十个微块。
-                cc_groups = None
-                if not block.segmat_done:
-                    cc_groups = split_block_by_connected_components(
-                        vertices,
-                        faces,
-                        block.face_ids,
-                        min_component_faces=max(1, self.config.min_block_size // 2),
-                    )
-                if cc_groups is not None and len(cc_groups) >= 2:
-                    block.seed_decision = {
-                        "mode": "connected_components",
-                        "num_components": len(cc_groups),
-                        "component_sizes": [len(g) for g in cc_groups],
-                    }
-                    self._dump_response(
-                        responses_dir, f"{block_id}_cc", block.seed_decision
-                    )
-                    block.status = BlockStatus.SPLIT
-                    for group_face_ids in cc_groups:
-                        child_id = self._next_child_id(block_id)
-                        child = SemanticBlock(
-                            block_id=child_id,
-                            face_ids=list(group_face_ids),
-                            depth=block.depth + 1,
-                            parent_id=block_id,
-                            status=BlockStatus.PENDING,
-                            notes=(
-                                f"cc-split from {block_id} "
-                                f"(n_cc={len(cc_groups)})"
-                            ),
-                            # 新切出来的 CC 还没做过 segmat，下一轮继续走 segmat
-                            segmat_done=False,
-                        )
-                        self._register_block(child)
-                        block.children_ids.append(child_id)
-                        next_queue.append(child_id)
-                    if progress_cb:
-                        progress_cb(
-                            "split",
-                            {
-                                "block_id": block_id,
-                                "seed_count": len(cc_groups),
-                                "children": list(block.children_ids),
-                                "mode": "connected_components",
-                            },
-                        )
-                    continue
-
-                # Step 2b: 单连通块第一次切 → 几何 segmat（auto-K 谱聚类）
-                # 不走 VLM 给 K，直接按特征值 gap 估计 K，等价于跑过一遍
-                # face_segment_labels.json。segmat 子块再切才走 VLM-K + FPS-spectral。
-                if not block.segmat_done:
-                    segmat_split = self._segmat_split(
-                        vertices, faces, block.face_ids, vertex_scalars
-                    )
-                    block.seed_decision = {
-                        "mode": "segmat",
-                        "k_actual": segmat_split.get("k_actual", 0),
-                        "k_eigengap": segmat_split.get("k_eigengap", 0),
-                        "component_sizes": segmat_split.get("sizes", []),
-                        "error": segmat_split.get("error"),
-                    }
-                    self._dump_response(
-                        responses_dir, f"{block_id}_segmat", block.seed_decision
-                    )
-                    sub_groups = segmat_split.get("groups", [])
-                    if len(sub_groups) >= 2:
-                        block.status = BlockStatus.SPLIT
-                        for group_face_ids in sub_groups:
-                            child_id = self._next_child_id(block_id)
-                            child = SemanticBlock(
-                                block_id=child_id,
-                                face_ids=list(group_face_ids),
-                                depth=block.depth + 1,
-                                parent_id=block_id,
-                                status=BlockStatus.PENDING,
-                                notes=(
-                                    f"segmat from {block_id} "
-                                    f"(k={len(sub_groups)})"
-                                ),
-                                segmat_done=True,  # 子块已是 segmat 产物
-                            )
-                            self._register_block(child)
-                            block.children_ids.append(child_id)
-                            next_queue.append(child_id)
-                        if progress_cb:
-                            progress_cb(
-                                "split",
-                                {
-                                    "block_id": block_id,
-                                    "seed_count": len(sub_groups),
-                                    "children": list(block.children_ids),
-                                    "mode": "segmat",
-                                },
-                            )
-                        continue
-                    # segmat 也切不开（极端情况：超小或退化几何），降级到 VLM-K 路径
-                    LOGGER.warning(
-                        "block %s segmat 失败 (%s)，降级到 VLM-K + FPS-spectral",
-                        block_id,
-                        segmat_split.get("error", "unknown"),
-                    )
-                    block.segmat_done = True  # 标记成已尝试，避免下轮再回来
-
-                # Step 2c: segmat 已做过 → VLM 给 K → FPS+谱聚类（两种模式）
-                if self.config.vlm_grouped_split:
-                    # ---- 模式 A：过分割 + VLM 一次性分组 ----
-                    grouped_panel = panel_dir / f"block_{block_id}_grouped.png"
-                    grp = split_block_by_vlm_grouping(
-                        self.client,
-                        vertices,
-                        faces,
-                        block.face_ids,
-                        self.config.semantic,
-                        grouped_panel,
-                        n_candidates=self.config.grouped_split_n_candidates,
-                        max_groups=self.config.grouped_split_max_groups,
-                        image_size=self.config.image_size,
-                        cols=self.config.panel_cols,
-                        vertex_scalars=vertex_scalars,
-                        scalar_weight=self.config.scalar_weight,
-                        model=self.config.seed_model,
-                    )
-                    block.seed_decision = {
-                        "mode": "grouped",
-                        "n_candidates": grp.n_candidates,
-                        "panel_path": str(grp.panel_path) if grp.panel_path else None,
-                        "groups": [
-                            {
-                                "group_id": g.group_id,
-                                "candidate_ids": g.candidate_ids,
-                                "label": g.label,
-                                "confidence": g.confidence,
-                                "description": g.description,
-                                "face_count": len(g.face_ids),
-                            }
-                            for g in grp.groups
-                        ],
-                        "reason": grp.reason,
-                        "error": grp.error,
-                    }
-                    self._dump_response(
-                        responses_dir, f"{block_id}_grouped", block.seed_decision
-                    )
-
-                    if not grp.ok or len(grp.groups) < 2:
-                        # 兜底：grouped 失败时回退到经典 ask_seed_count + 谱聚类
-                        LOGGER.warning(
-                            "block %s grouped split 失败 (%s)，回退经典谱聚类",
-                            block_id, grp.error,
-                        )
-                        seed_resp = ask_seed_count(
-                            self.client,
-                            panel_path,
-                            self.config.semantic,
-                            max_seeds=self.config.max_seeds,
-                            fallback=max(
-                                2,
-                                min(
-                                    self.config.max_seeds,
-                                    len(cls.covered_parts) + 1,
-                                ),
-                            ),
-                            model=self.config.seed_model,
-                            covered_parts=cls.covered_parts,
-                            semantic_parts=cls.semantic_parts,
-                            extra_parts=cls.extra_parts,
-                            block_faces=block.size,
-                        )
-                        block.seed_count = seed_resp.seed_count
-                        split = split_block_by_spectral_seeds(
-                            vertices,
-                            faces,
-                            block.face_ids,
-                            seed_count=seed_resp.seed_count,
-                            vertex_scalars=vertex_scalars,
-                            scalar_weight=self.config.scalar_weight,
-                        )
-                        if split.num_clusters <= 1:
-                            block.status = BlockStatus.ABANDONED
-                            block.notes = (block.notes + " | split_failed").strip(" |")
-                            if progress_cb:
-                                progress_cb(
-                                    "abandoned",
-                                    {"block_id": block_id, "reason": "split_failed"},
-                                )
-                            continue
-                        block.status = BlockStatus.SPLIT
-                        for group_face_ids in split.sub_face_groups:
-                            child_id = self._next_child_id(block_id)
-                            child = SemanticBlock(
-                                block_id=child_id,
-                                face_ids=list(group_face_ids),
-                                depth=block.depth + 1,
-                                parent_id=block_id,
-                                status=BlockStatus.PENDING,
-                                notes=(
-                                    f"fallback split from {block_id}"
-                                    f" (k={split.num_clusters})"
-                                ),
-                                segmat_done=True,
-                            )
-                            self._register_block(child)
-                            block.children_ids.append(child_id)
-                            next_queue.append(child_id)
-                        if progress_cb:
-                            progress_cb(
-                                "split",
-                                {
-                                    "block_id": block_id,
-                                    "seed_count": seed_resp.seed_count,
-                                    "children": list(block.children_ids),
-                                    "mode": "fallback",
-                                },
-                            )
-                        continue
-
-                    # 成功：每个 VLM 组 → 一个 child block，VLM 的组级 label 直接落到状态：
-                    #   - "full"    → BlockStatus.FULL
-                    #   - "none"    → BlockStatus.NONE
-                    #   - "partial" → BlockStatus.PENDING（pipeline 下一轮分裂）
-                    # 这样 grouped split 一次性完成「分裂 + 子块定性」，不再需要
-                    # 子级 classify。准头由 GROUP_USER_TEMPLATE 的严格门槛 + 'mixed→partial'
-                    # 默认行为来保证。
-                    block.status = BlockStatus.SPLIT
-                    for g in grp.groups:
-                        child_id = self._next_child_id(block_id)
-                        if g.label == LABEL_FULL:
-                            child_status = BlockStatus.FULL
-                        elif g.label == LABEL_NONE:
-                            child_status = BlockStatus.NONE
-                        else:
-                            child_status = BlockStatus.PENDING
-                        note = (
-                            f"grouped split from {block_id} "
-                            f"(group={g.group_id}, vlm_label={g.label}, "
-                            f"cands={g.candidate_ids}, conf={g.confidence:.2f})"
-                        )
-                        if g.description:
-                            note += f" | {g.description}"
-                        child = SemanticBlock(
-                            block_id=child_id,
-                            face_ids=list(g.face_ids),
-                            depth=block.depth + 1,
-                            parent_id=block_id,
-                            status=child_status,
-                            notes=note,
-                            segmat_done=True,
-                        )
-                        # 记录 grouped split 的初判，方便报告查看
-                        child.classification = {
-                            "label": g.label,
-                            "confidence": g.confidence,
-                            "reason": g.description,
-                            "from_grouped_split": True,
-                            "group_id": g.group_id,
-                            "candidate_ids": g.candidate_ids,
-                            "covered_parts": [],
-                            "semantic_parts": [],
-                            "extra_parts": [],
-                            "missing_overlap": None,
-                            "dominant_region": "",
-                            "semantic_area_ratio": None,
-                            "dominant_side": "",
-                            "committed_if_forced": "",
-                            "overridden_from": None,
-                            "provider": grp.provider,
-                            "model": grp.model,
-                            "elapsed_seconds": grp.elapsed_seconds,
-                            "error": None,
-                        }
-                        self._register_block(child)
-                        block.children_ids.append(child_id)
-                        if child_status == BlockStatus.PENDING:
-                            next_queue.append(child_id)
-                        if progress_cb:
-                            progress_cb(
-                                "classified",
-                                {
-                                    "block_id": child_id,
-                                    "label": g.label + "(grouped)",
-                                },
-                            )
-                    if progress_cb:
-                        progress_cb(
-                            "split",
-                            {
-                                "block_id": block_id,
-                                "seed_count": len(grp.groups),
-                                "children": list(block.children_ids),
-                                "mode": "grouped",
-                            },
-                        )
-                    continue
-
-                # ---- 模式 B（默认）：ask_seed_count + 几何分裂 ----
+                # ---- ask_seed_count + 与 full_coverage 一致的几何级联 ----
                 seed_resp = ask_seed_count(
                     self.client,
                     panel_path,
@@ -1439,48 +1223,21 @@ class SemanticRefinementPipeline:
                     "seed_count": seed_resp.seed_count,
                     "reason": seed_resp.reason,
                     "error": seed_resp.error,
-                    "strategy": self.config.split_strategy,
+                    "strategy": "connected_components→segmat→geodesic_fps",
                 }
                 block.seed_count = seed_resp.seed_count
                 self._dump_response(
                     responses_dir, f"{block_id}_seed", block.seed_decision
                 )
 
-                split = None
-                used_strategy = self.config.split_strategy
-                try:
-                    split = split_block_by_geodesic_fps(
-                        vertices,
-                        faces,
-                        block.face_ids,
-                        seed_count=seed_resp.seed_count,
-                        vertex_scalars=vertex_scalars,
-                        scalar_weight=self.config.scalar_weight,
-                    )
-                    if split.num_clusters <= 1:
-                        raise RuntimeError(
-                            f"geodesic_fps 退化为 1 簇 (debug={split.debug})"
-                        )
-                except Exception as exc:  # noqa: BLE001
-                    # geodesic_fps 内部已有 coord_kmeans 兜底；若仍失败则放弃
-                    # 该 block，不再走谱聚类（user 已明确剔除 spectral 路径）。
-                    LOGGER.warning(
-                        "block %s geodesic_fps+lloyd 失败，放弃: %s", block_id, exc,
-                    )
-                    block.status = BlockStatus.ABANDONED
-                    block.notes = (
-                        block.notes + " | geodesic_split_failed"
-                    ).strip(" |")
-                    if progress_cb:
-                        progress_cb(
-                            "abandoned",
-                            {"block_id": block_id, "reason": "geodesic_split_failed"},
-                        )
-                    continue
-
-                block.seed_decision["used_strategy"] = used_strategy
-                block.seed_decision["split_debug"] = split.debug
-                if split.num_clusters <= 1:
+                sub_groups = self._split_block_by_seeds(
+                    vertices,
+                    faces,
+                    block,
+                    seed_count=seed_resp.seed_count,
+                    responses_dir=responses_dir,
+                )
+                if not sub_groups or len(sub_groups) < 2:
                     block.status = BlockStatus.ABANDONED
                     block.notes = (block.notes + " | split_failed").strip(" |")
                     if progress_cb:
@@ -1491,7 +1248,7 @@ class SemanticRefinementPipeline:
                     continue
 
                 block.status = BlockStatus.SPLIT
-                for group_face_ids in split.sub_face_groups:
+                for group_face_ids in sub_groups:
                     child_id = self._next_child_id(block_id)
                     child = SemanticBlock(
                         block_id=child_id,
@@ -1501,9 +1258,9 @@ class SemanticRefinementPipeline:
                         status=BlockStatus.PENDING,
                         notes=(
                             f"split from {block_id} "
-                            f"(k={split.num_clusters},strategy={used_strategy})"
+                            f"(k={len(sub_groups)},mode={block.seed_decision.get('mode')})"
                         ),
-                        segmat_done=True,
+                        segmat_done=block.segmat_done,
                     )
                     self._register_block(child)
                     block.children_ids.append(child_id)
@@ -1516,7 +1273,7 @@ class SemanticRefinementPipeline:
                             "block_id": block_id,
                             "seed_count": seed_resp.seed_count,
                             "children": list(block.children_ids),
-                            "strategy": used_strategy,
+                            "mode": block.seed_decision.get("mode"),
                         },
                     )
 
@@ -1873,15 +1630,10 @@ def run_semantic_refinement(
         min_block_size=min_block_size,
         image_size=image_size,
         panel_cols=panel_cols,
-        scalar_weight=scalar_weight,
         classification_model=classification_model,
         seed_model=seed_model,
         accept_partial_at_max_depth=accept_partial_at_max_depth,
         vlm_self_review=vlm_self_review,
-        vlm_grouped_split=vlm_grouped_split,
-        grouped_split_n_candidates=grouped_split_n_candidates,
-        grouped_split_max_groups=grouped_split_max_groups,
-        split_strategy=split_strategy,
         parallel_vlm_workers=parallel_vlm_workers,
         live_report=live_report,
         live_report_refresh_seconds=live_report_refresh_seconds,

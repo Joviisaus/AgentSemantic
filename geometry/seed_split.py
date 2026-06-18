@@ -48,6 +48,8 @@ def ask_seed_count(
     semantic_parts: Optional[List[str]] = None,
     extra_parts: Optional[List[str]] = None,
     block_faces: int = 0,
+    block_points: Optional[int] = None,
+    media_type: str = "mesh",
 ) -> SeedCountResponse:
     """让 VLM 给出 seed_count，失败时回退到 fallback。
 
@@ -61,6 +63,8 @@ def ask_seed_count(
         semantic_parts=semantic_parts,
         extra_parts=extra_parts,
         block_faces=block_faces,
+        block_points=block_points,
+        media_type="pointcloud" if media_type == "pointcloud" else "mesh",
     )
     try:
         response = client.chat(

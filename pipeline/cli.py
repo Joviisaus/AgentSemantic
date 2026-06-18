@@ -210,39 +210,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "max-depth 仍是硬上限。默认关闭。"
         ),
     )
-    p.add_argument(
-        "--split-strategy",
-        choices=("geodesic_fps", "spectral"),
-        default="geodesic_fps",
-        help=(
-            "分裂策略："
-            "geodesic_fps —— 在子 mesh 上做测地最远点采样选 K 个种子 + 测地 Voronoi 划分（默认，更均衡）；"
-            "spectral —— 旧的归一化割谱聚类（兼容 / fallback）。"
-        ),
-    )
-    p.add_argument(
-        "--vlm-grouped-split",
-        action="store_true",
-        help=(
-            "[实验性，默认关闭] partial 分块改用「过分割 + VLM 一次性分组」。"
-            "实测 12 视角下 VLM 难以稳定指认候选编号，已不推荐主流程使用，保留仅供对比实验。"
-        ),
-    )
-    p.add_argument(
-        "--grouped-split-n-candidates",
-        type=int,
-        default=8,
-        help="--vlm-grouped-split 时每个 partial 块过分割出多少个候选区（2~12，默认 8）",
-    )
-    p.add_argument(
-        "--grouped-split-max-groups",
-        type=int,
-        default=4,
-        help="--vlm-grouped-split 时 VLM 最多把候选合并成多少组（默认 4）",
-    )
     p.add_argument("--image-size", type=int, default=512, help="单视角分辨率")
     p.add_argument("--panel-cols", type=int, default=4, help="拼图列数（默认 4×3=12）")
-    p.add_argument("--scalar-weight", type=float, default=0.35, help="子谱聚类畸变特征权重")
     p.add_argument(
         "--parallel-vlm",
         type=int,
@@ -416,15 +385,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         min_block_size=args.min_block_size,
         image_size=args.image_size,
         panel_cols=args.panel_cols,
-        scalar_weight=args.scalar_weight,
         classification_model=args.model,
         seed_model=args.model,
         accept_partial_at_max_depth=args.accept_partial_at_max_depth,
         vlm_self_review=args.vlm_self_review,
-        vlm_grouped_split=args.vlm_grouped_split,
-        grouped_split_n_candidates=args.grouped_split_n_candidates,
-        grouped_split_max_groups=args.grouped_split_max_groups,
-        split_strategy=args.split_strategy,
         parallel_vlm_workers=args.parallel_vlm,
         live_report=not args.no_live_report,
         live_report_refresh_seconds=args.live_report_refresh,

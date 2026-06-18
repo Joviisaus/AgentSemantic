@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .client import VLMClient, VLMResponse, parse_json_response
 from .prompts import (
@@ -19,6 +19,7 @@ from .prompts import (
     LABEL_PARTIAL,
     VALID_LABELS,
     ObjectContext,
+    _looks_like_portable_prop_semantic,
     build_classify_prompt,
     build_observe_prompt,
     build_reason_prompt,
@@ -98,6 +99,8 @@ def classify_component(
     *,
     model: Optional[str] = None,
     context: Optional[ObjectContext] = None,
+    media_type: str = "mesh",
+    force_terminate: bool = False,
 ) -> ComponentClassification:
     """
     两阶段分类：
@@ -107,12 +110,16 @@ def classify_component(
       2. **推理阶段**：把 covered_parts 当作纯文本，连同 semantic 发回给 VLM，
          让它做集合比较得到 label（这一步不带图）。
 
+    `media_type`: "mesh" | "pointcloud" — 控制渲染说明（三角面 vs 点云小球）。
+    `force_terminate`: 为 True 时在推理阶段注入「强制收尾」说明，强调 committed_if_forced。
+
     任何阶段失败时退化成 label="none" + error。
     """
     image_path = Path(image_path)
+    mt = "pointcloud" if media_type == "pointcloud" else "mesh"
 
     # ---------- 阶段 1：观察 ----------
-    obs_prompt = build_observe_prompt(context)
+    obs_prompt = build_observe_prompt(context, media_type=mt)
     try:
         obs_response: VLMResponse = client.chat(
             user_prompt=obs_prompt.user,
@@ -168,7 +175,13 @@ def classify_component(
         )
 
     # ---------- 阶段 2：推理 ----------
-    rsn_prompt = build_reason_prompt(semantic, covered, context)
+    rsn_prompt = build_reason_prompt(
+        semantic, covered,
+        context,
+        media_type=mt,
+        force_terminate=force_terminate,
+        dominant_region=dominant_region,
+    )
     try:
         rsn_response: VLMResponse = client.chat(
             user_prompt=rsn_prompt.user,
@@ -214,6 +227,14 @@ def classify_component(
     reason = str(rsn_payload.get("reason") or "").strip()
     semantic_parts = _coerce_str_list(rsn_payload.get("semantic_parts"))
     extra = _coerce_str_list(rsn_payload.get("extra_parts"))
+    extra, absorbed = _filter_in_scope_extra_parts(
+        extra, semantic=semantic, semantic_parts=semantic_parts,
+    )
+    if absorbed:
+        LOGGER.info(
+            "classifier absorbed sub-parts into semantic scope (semantic=%r): %s",
+            semantic, absorbed,
+        )
     missing = _coerce_bool(rsn_payload.get("missing_overlap"))
     # 主导边 + 强制承诺
     raw_ratio = rsn_payload.get("semantic_area_ratio")
@@ -273,6 +294,36 @@ def classify_component(
         # dominant 强制改成 balanced，强制承诺改成 none（防止收尾时被认作 full）
         dominant_side = "balanced"
         committed_if_forced = LABEL_NONE
+
+    # —— 手持道具漏检纠正 —— #
+    # 点云/粗粒度观察常只写「躯干+手臂」而漏写嵌在其中的枪/棍等 → 误判 none。
+    promoted_embedded = False
+    if (
+        _looks_like_portable_prop_semantic(semantic)
+        and (missing is True or label == LABEL_NONE)
+        and _covered_may_embed_prop(covered, dominant_region)
+    ):
+        promoted_embedded = True
+        LOGGER.info(
+            "classifier promote embedded prop: semantic=%r covered=%s dominant=%r → partial",
+            semantic, covered, dominant_region,
+        )
+        missing = False
+        sem_name = semantic.strip()
+        if not semantic_parts:
+            semantic_parts = [f"{sem_name}（可能嵌在肢体区域，待切分）"]
+        if not extra:
+            extra = [
+                p for p in covered
+                if isinstance(p, str) and p.strip()
+            ]
+        if semantic_area_ratio is None or semantic_area_ratio <= 0.0:
+            semantic_area_ratio = 0.35
+        dominant_side = "balanced"
+        committed_if_forced = LABEL_NONE
+        if label == LABEL_NONE and overridden_from is None:
+            overridden_from = label
+        label = LABEL_PARTIAL
 
     if missing is True:
         forced = LABEL_NONE
@@ -347,6 +398,109 @@ def _coerce_bool(value: Any) -> Optional[bool]:
 # 内部矛盾检测：从 covered_parts \ semantic_parts 推算"应当出现"的 extra_parts
 # ---------------------------------------------------------------------------
 
+# 语义粗粒度词 → 常识上属于该语义的子部件关键词（用于剔除误报的 extra）
+_SEMANTIC_SCOPE_CHILDREN: Dict[str, Tuple[str, ...]] = {
+    "头": (
+        "耳", "脸", "面", "额", "颅", "脑", "鼻", "眼", "嘴", "口", "颊", "下巴",
+        "颌", "眉", "发", "顶", "鬓", "颞",
+    ),
+    "脸": ("眼", "鼻", "嘴", "口", "颊", "额", "下巴", "眉", "唇"),
+    "面": ("眼", "鼻", "嘴", "口", "颊", "额", "下巴", "眉", "唇"),
+    "手": ("指", "掌", "腕", "拳", "拇"),
+    "脚": ("趾", "踝", "鞋", "掌"),
+    "腿": ("大腿", "小腿", "膝", "踝"),
+    "臂": ("上臂", "前臂", "肘", "腕", "肱", "肱骨"),
+    "躯干": ("胸", "背", "腰", "腹", "臀", "肋", "肩"),
+    "枪": ("管", "握", "扳", "弹", "机", "匣", "托", "瞄", "身"),
+    "水枪": ("管", "握", "扳", "弹", "机", "匣", "身", "泵", "槽"),
+}
+
+
+def _semantic_scope_keys(semantic: str, semantic_parts: Sequence[str]) -> List[str]:
+    """收集用于子部件归属判断的语义锚点（用户词 + semantic_parts）。"""
+    keys: List[str] = []
+    sem = _normalize_part_name(semantic)
+    if sem:
+        keys.append(sem)
+    for sp in semantic_parts:
+        n = _normalize_part_name(sp)
+        if n and n not in keys:
+            keys.append(n)
+    return keys
+
+
+def _part_within_semantic_scope(
+    part: str,
+    *,
+    semantic: str,
+    semantic_parts: Sequence[str],
+) -> bool:
+    """部位是否落在用户语义范围内（含子部件，如耳朵⊂头部）。"""
+    if not part or not part.strip():
+        return False
+    p_norm = _normalize_part_name(part)
+    if not p_norm:
+        return False
+
+    if any(_part_matches(part, sp) for sp in semantic_parts):
+        return True
+
+    for key in _semantic_scope_keys(semantic, semantic_parts):
+        if not key:
+            continue
+        if key in p_norm or p_norm in key:
+            return True
+        for scope_parent, children in _SEMANTIC_SCOPE_CHILDREN.items():
+            if not (_part_matches(key, scope_parent) or scope_parent in key or key in scope_parent):
+                continue
+            for child in children:
+                if child in p_norm or p_norm in child:
+                    return True
+    return False
+
+
+def _filter_in_scope_extra_parts(
+    extras: Sequence[str],
+    *,
+    semantic: str,
+    semantic_parts: Sequence[str],
+) -> Tuple[List[str], List[str]]:
+    """从 extra 中剔除落在语义范围内的子部件。返回 (true_extras, absorbed)。"""
+    true_extras: List[str] = []
+    absorbed: List[str] = []
+    for item in extras:
+        if not isinstance(item, str) or not item.strip():
+            continue
+        if _part_within_semantic_scope(
+            item.strip(), semantic=semantic, semantic_parts=semantic_parts,
+        ):
+            absorbed.append(item.strip())
+        else:
+            true_extras.append(item.strip())
+    return true_extras, absorbed
+
+
+_GRASPING_PART_KEYWORDS: Tuple[str, ...] = (
+    "手", "臂", "掌", "指", "腕", "拳", "肩", "肘", "腋", "肱",
+)
+_PROP_EMBED_CONTEXT_HINTS: Tuple[str, ...] = (
+    "持", "握", "扛", "举", "拿", "提", "端", "伸出", "末端", "物件", "物体",
+    "长条", "棍", "枪", "棒", "瓶", "工具",
+)
+
+
+def _covered_may_embed_prop(
+    covered: Sequence[str],
+    dominant_region: str,
+) -> bool:
+    """肢体覆盖区是否可能嵌着手持道具（观察粒度偏粗时）。"""
+    parts_text = " ".join(str(p) for p in covered if p)
+    blob = f"{parts_text} {dominant_region or ''}"
+    if any(k in blob for k in _GRASPING_PART_KEYWORDS):
+        return True
+    return any(h in blob for h in _PROP_EMBED_CONTEXT_HINTS)
+
+
 # 部位名常见的修饰后缀，匹配前先剥掉它们以做模糊比较。
 _PART_NAME_SUFFIXES: tuple[str, ...] = (
     "整体", "全部", "区域", "部分", "部位", "一带", "一圈",
@@ -396,9 +550,10 @@ def _infer_extra_parts(
     根据 covered_parts 和 semantic_parts（以及用户输入 semantic 关键词）推算 extra_parts。
 
     判定一个 covered 项 `p` 属于 extra 的规则：
-      ① p 与任何 semantic_part 都「指不到一起」（_part_matches=False）
-      ② p 自身也不直接命中 user-side semantic（substring 匹配）
-    满足这两条 → p 是真实的 extra（VLM 不能假装它不存在）。
+      ① p 落在语义范围内（含子部件，如耳朵⊂头部）→ 不是 extra
+      ② p 与任何 semantic_part 都「指不到一起」（_part_matches=False）
+      ③ p 自身也不直接命中 user-side semantic（substring 匹配）
+    满足 ②③ 且非 ① → p 是真实的 extra。
     """
     if not covered:
         return []
@@ -406,6 +561,10 @@ def _infer_extra_parts(
     extras: List[str] = []
     for p in covered:
         if not isinstance(p, str) or not p.strip():
+            continue
+        if _part_within_semantic_scope(
+            p.strip(), semantic=semantic, semantic_parts=semantic_parts,
+        ):
             continue
         # 命中 semantic_parts 视作语义内
         if any(_part_matches(p, sp) for sp in semantic_parts):

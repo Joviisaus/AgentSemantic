@@ -9,13 +9,77 @@ VLM 提示模板：
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Final, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Final, List, Literal, Optional, Sequence, Tuple
 
 LABEL_FULL: Final = "full"
 LABEL_PARTIAL: Final = "partial"
 LABEL_NONE: Final = "none"
 
 VALID_LABELS: Final = (LABEL_FULL, LABEL_PARTIAL, LABEL_NONE)
+
+MediaType = Literal["mesh", "pointcloud"]
+
+LABEL_FULL: Final = "full"
+LABEL_PARTIAL: Final = "partial"
+LABEL_NONE: Final = "none"
+
+VALID_LABELS: Final = (LABEL_FULL, LABEL_PARTIAL, LABEL_NONE)
+
+# ---------------------------------------------------------------------------
+# 输入形态说明 + 判断方法总览（注入各阶段 prompt，让 VLM 知道「图是什么」「怎么判」）
+# ---------------------------------------------------------------------------
+
+RENDER_GUIDE: Final[Dict[str, str]] = {
+    "mesh": (
+        "【图像是什么】\n"
+        "同一块 mesh 的 12 个视角拼图。每个视角里：\n"
+        "  - **鲜艳红/橙色** = 当前待判定的**这一个分块**（三角面着色）；\n"
+        "  - **淡灰色** = 模型其余部分，仅作空间定位，**不属于**当前分块。\n"
+        "红色可能因视角遮挡只在一两个视角里明显——**必须逐视角检查**。"
+    ),
+    "pointcloud": (
+        "【图像是什么】\n"
+        "同一块点云的 12 个视角拼图。每个视角里：\n"
+        "  - **鲜艳红/橙色圆点/小球** = 当前待判定的**这一个分块**的采样点；\n"
+        "  - **淡灰色点** = 整模型其余点云，仅作定位，**不属于**当前分块。\n"
+        "点云比 mesh 稀疏，红色可能呈点簇/点带；**逐视角找齐所有红点**再下结论。\n"
+        "⚠️ 点云特有风险：小型道具/武器可能只是臂弯处一小簇红点，**勿只写笼统「手臂」而漏掉手上物件**。"
+    ),
+}
+
+JUDGMENT_OVERVIEW_TEMPLATE: Final = """【VLM 如何判断 full / partial / none】
+本系统用**两阶段**降低「看到用户语义就乱认」的偏差：
+
+  阶段 1 · **纯观察（带图，不出现语义）**
+    → 只回答：红色高亮**实际覆盖到哪些部位/部件** → 输出 covered_parts
+
+  阶段 2 · **纯逻辑（不带图，只看文字）**
+    → 拿 covered_parts 与用户要找的「{semantic}」做**集合比较** → 输出 label
+
+三类 label 对后续 pipeline 的含义：
+  - **full**    ：红色覆盖范围**全部落在**「{semantic}」内（含其子部件，如头部的耳朵）→ 不再切分
+  - **partial** ：红色越界到语义**外**的独立大部件（如头部块夹了胸部）→ 触发几何再切
+  - **none**    ：红色与「{semantic}」**完全无关** → 整块丢弃
+
+**禁止**跳过观察直接猜 label；**禁止**在观察阶段偷看/联想用户语义。
+"""
+
+FORCE_TERMINATE_NOTE: Final = """
+【强制收尾说明】
+此分块已**无法继续几何切分**（点数过少或已达最大切分深度）。
+你仍须按规则给出 label；同时 `committed_if_forced` 表示：
+「若 pipeline 必须在此刻收工，这块最终算不算语义？」——**只能填 full 或 none**。
+判 full 要非常确定红色主体就是「{semantic}」；有任何夹带非语义部位 → none。
+"""
+
+# 阶段 2 注入：当用户语义是手持/佩戴类道具时
+PROP_SEMANTIC_NOTE_TEMPLATE: Final = """
+【本任务语义类型：独立道具 / 手持物「{semantic}」】
+观察员**可能只写了肢体名**（手臂、躯干）而漏写嵌在其中的道具——这很常见，尤其在点云。
+只要 covered 或 dominant_region 暗示道具可能在持握/肩扛区域，**禁止**直接判 none；
+应判 **partial**，让几何切分把道具从肢体上剥出来。
+"""
+
 
 # 分裂前 VLM 决策：避免切分后语义丢失、触发昂贵的覆盖重选
 SEMANTIC_COVERAGE_DISCIPLINE = """语义覆盖纪律（**必须遵守**，避免分裂后丢部位、触发昂贵 VLM 重选）
@@ -103,6 +167,58 @@ OBSERVE_CONTEXT_HINT = """物体上下文（仅用于命名参考，**不暗示*
 - ⚠️ 候选清单只是命名词表，**不要**因为某部件在清单里就臆断红色覆盖到它。
 """
 
+OBSERVE_ATTACHED_PROPS_BLOCK: Final = """
+**肢体上的附属物 / 手持物（极易漏检，必须单独看）**
+-----------------------------------
+红色若覆盖手臂、手掌、躯干侧面，**不要只写笼统肢体名就结束**：
+Step A. 沿肢体走向找：掌心、指间、前臂末端、肩扛/腋下位置有没有**另一簇**更细长的红点？
+Step B. 若看见与肢体形态不同的突出几何（枪管、棍体、瓶身、刀刃、包袋、头盔…），**必须单独列一项**，
+     用形状命名（如「手持长条形物件」「肩上扛着的棍状物」），**禁止**只写「右臂」了事。
+Step C. 若肢体与物件点云粘成一片、实在分不清边界，写复合项：
+     「右臂及手持物件」「躯干连肩扛物体」——**不要**因此省略物件。
+"""
+
+
+
+OBSERVE_USER_TEMPLATE = """{render_guide}
+{attached_props_block}
+
+{judgment_overview}
+
+==================================
+阶段 1 任务：纯观察（本阶段**不要**出现任何用户语义）
+==================================
+
+请**逐视角**检查 12 张图，把红色高亮**实际**覆盖到的部位/部件精简列出。
+
+**怎么观察（必须按顺序做）**
+-----------------------------------
+Step 1. 从左到右、从上到下扫完 12 个视角；每个视角单独记下「这里有没有鲜艳红/橙」。
+Step 2. 把所有视角里出现红色的位置**合并**成一份部位清单（同一部位多视角只列一次）。
+Step 3. 对每个列出的部位，问自己：「我能在**某一张**图里指着红色说就在这里吗？」
+        - 不能指着说 → **删掉**该项。
+Step 4. 写 `dominant_region`：红色主要集中在模型哪里（一句话）。
+
+观察纪律（违反即视为错误）
+-----------------------------------
+1. **真实分块的红色通常只在 1~3 个相邻部位**。列出 4 项以上时，先删掉不确定的。
+2. **只列鲜艳红/橙色**；淡灰、白、米色**不算**红色。
+3. 红色只擦过边缘、没有明显覆盖 → **不算**覆盖该部位。
+4. 颗粒度参考（按模型类型选用，勿生搬硬套）：
+   - 人形/动物：头/脸/颈/胸/背/腰/上臂/前臂/手/大腿/小腿/脚 …
+   - 道具/机械：枪管/握把/扳机/弹匣/轮/翼/底座 …（用你**在图上看到的**形状命名）
+5. 若**所有视角都没有**鲜艳红色 → `covered_parts` = []，在 notes 里说明。
+
+输出格式（极简）
+-----------------------------------
+{{
+  "covered_parts": ["1~3 项；多于 3 项先自查删项"],
+  "dominant_region": "例如 '集中在枪管中段'、'分布于双腿前侧'、'只在腰部窄环'",
+  "notes": "可选：补充观察细节"
+}}
+"""
+
+
 OBSERVE_USER_PROMPT = """这是同一个 3D 物体的 12 个视角拼接渲染。
 图中每个视角里只有**一个**分块被涂成**鲜艳红/橙色**，其他几何全部是淡灰色。
 {context_block}
@@ -140,6 +256,101 @@ REASON_SYSTEM_PROMPT = (
     "用户会告诉你：(1) 视觉观察员之前列出的 covered_parts（红色覆盖的物体部件）；"
     "(2) 用户要找的语义。你只需要按规则做集合比较并输出 JSON。"
 )
+
+REASON_USER_TEMPLATE_POINTCLOUD = """{judgment_overview}
+{force_terminate_note}
+{prop_semantic_note}
+==================================
+阶段 2 任务：纯逻辑推理（**无图**，只看文字）
+==================================
+
+阶段 1 观察结果：
+  covered_parts = {covered_parts_json}
+  dominant_region = {dominant_region_json}
+
+用户要找的语义：「{semantic}」
+
+**推理步骤（必须按顺序执行，并把中间结果写入 JSON 字段）**
+-----------------------------------
+Step 1 → 填 `semantic_parts`：
+  想清楚「{semantic}」在这个模型上对应哪些部位（通常 1~3 项）。
+  - 人形例：语义=「头发」→ ["头顶发型"]；语义=「腰带」→ ["腰部一圈条带"]
+  - 道具例：语义=「水枪」→ ["枪身/枪管整体"] 或更细的 ["握把","枪管"]（按 covered_parts 粒度对齐）
+  - **包容性补全**：covered=["头部整体"]、语义=「头发」→ semantic_parts 仍应写出头发（视作头部整体里包含头发）
+  - covered 与语义区域**完全无关**时（如语义=「头发」，covered=["小腿"]）→ semantic_parts = []
+
+Step 2 → 填 `extra_parts`（**只计真正越界的部位，子部件不算 extra**）：
+  extra_parts = covered_parts 里**落在语义范围之外**的部位。
+  
+  ⚠️ **语义包含 / 子部件规则（极重要，违反会导致无意义再切分）**：
+  - 用户语义往往是**粗粒度**总称；covered 里更细的子部位若常识上**属于**该语义，**必须并入语义，不能写进 extra**。
+  - 语义=「头部」：耳朵、面部、额头、颅顶、后脑、下巴、鼻子、眼睛、嘴巴、脸颊、头发、发型
+    **都是头部的一部分** → extra 必须为 []（即使观察员分开写了「头部」「耳朵」）
+  - 语义=「面部」：眼睛、鼻子、嘴巴、额头、脸颊、下巴 **属于面部** → 不算 extra
+  - 语义=「头发」：头顶尖发、后脑发束属于头发；**面部、耳朵、颈部不属于头发** → 可算 extra
+  - 语义=「水枪」：枪管、握把、扳机、弹匣 **都属于水枪** → 彼此不算 extra
+  - 语义=「腰带」：腰部条带是语义；腹部、后背、腿部 **越界** → 算 extra
+  
+  **只有** covered 里出现了语义**范围外**的独立大部件，才填 extra 并判 partial。
+  例：语义=「头部」，covered=["头部","耳朵"] → extra=[] → **full**（不是 partial）
+  例：语义=「头部」，covered=["头部","颈部","胸前"] → extra=["颈部","胸前"] → partial
+  例：语义=「头发」，covered=["头发","面部"] → extra=["面部"] → partial
+
+  笼统部位要拆开时：covered=["头部整体"]、语义=「头发」→ extra 写「头部除头发外区域」
+
+Step 3 → 填 `missing_overlap`：
+  covered 与语义区域完全无交集 → true；否则 false
+  
+  ⚠️ **手持 / 佩戴 / 独立道具类语义**（枪、剑、棍、瓶、包、帽、工具…）：
+  - 观察员只写了「躯干」「手臂」等肢体、**没写出道具名**，不代表一定无关！
+  - 道具常**嵌在**手臂/手掌/肩扛区域的红点里；只要 covered 含 **手/臂/掌/指/腕** 或
+    dominant_region 暗示「伸出、持握、肩扛、末端有物」→ **missing_overlap 必须为 false**，
+    semantic_parts 写「{semantic}（可能嵌在肢体覆盖区内，待切分）」→ label 倾向 **partial**
+  - 只有 covered **全是**与道具无关的远端肢体（如语义=「水枪」但红色只在「左脚/尾巴」）才可 true
+  例：语义=「水枪」，covered=["躯干","右臂"] → **不可判 none**；missing_overlap=false，partial
+  例：语义=「水枪」，covered=["手持长条物件","右臂"] → missing_overlap=false，partial 或 full
+  例：语义=「水枪」，covered=["左小腿"] → missing_overlap=true，none
+
+Step 4 → 估 `semantic_area_ratio`（0~1，红色里语义占多大比例）：
+  几乎全是语义 → ≥0.85；一半一半 → ≈0.5；绝大部分是 extra → ≤0.2
+  **诚实估**：脸大头发小，比例就要小
+
+Step 5 → 填 `dominant_side`（由 ratio 推导）：
+  ratio ≥ 0.7 → "semantic"；ratio ≤ 0.3 → "extra"；中间 → "balanced"
+
+Step 6 → 填 `label`（决定要不要继续切）：
+  ┌─ covered 为空 ────────────────────────────→ "none"
+  ├─ missing_overlap=true（确与语义完全无关）──→ "none"
+  ├─ extra_parts 非空（语义外大部件或肢体混道具）→ "partial"
+  └─ extra 为空 且 covered 与语义有交集 ──────→ "full"
+
+  **不要**因为观察员把同一语义拆成多个子部位名（头+耳、枪管+握把）就判 partial——
+  子部位已全部落在语义范围内时，应直接 **full**，避免无意义再切分。
+
+Step 7 → 填 `committed_if_forced`（**严**，强制收尾时最终承诺，仅 full/none）：
+  dominant_side="semantic" 且 ratio ≥ 0.7 → "full"
+  其它任何情况（extra / balanced / 不确定）→ "none"
+  **宁漏勿滥**：extra 主导的块绝不能承诺 full
+
+**核心原则：子部件归并 + 越界才切**
+- 语义范围内的子部位（耳朵之于头部、握把之于水枪）**不是** extra，应判 **full**
+- 只有红色明显越界到语义外的大部件时，才判 **partial** 触发几何再切
+- committed_if_forced（收尾用）仍偏严：语义占比 ≥0.7 且 extra 为空 → full
+
+只能输出如下 JSON（缺字段视为错误）：
+{{
+  "semantic_parts": ["..."],
+  "extra_parts": ["..."],
+  "missing_overlap": true | false,
+  "semantic_area_ratio": 0.0~1.0,
+  "dominant_side": "semantic" | "extra" | "balanced",
+  "label": "full" | "partial" | "none",
+  "committed_if_forced": "full" | "none",
+  "confidence": 0.0~1.0,
+  "reason": "一句中文：红色覆盖了什么、语义占比多少、为何给这个 label/committed_if_forced"
+}}
+"""
+
 
 REASON_USER_TEMPLATE = """前面的视觉观察员已经把"红色高亮覆盖的物体部件"列出来：
 covered_parts = {covered_parts_json}
@@ -500,6 +711,57 @@ class ObjectContext:
         return "\n（物体上下文：" + "；".join(bits) + "）"
 
 
+def _media_defaults(media_type: str) -> Dict[str, Any]:
+    if media_type == "pointcloud":
+        return {
+            "size_unit": "点",
+            "large_threshold": 3000,
+        }
+    return {
+        "size_unit": "面",
+        "large_threshold": 3000,
+    }
+
+
+def build_classify_prompt(semantic: str, *, media_type: MediaType = "mesh") -> ClassifyPrompt:
+    guide = RENDER_GUIDE.get(media_type, RENDER_GUIDE["mesh"])
+    overview = JUDGMENT_OVERVIEW_TEMPLATE.format(semantic=semantic.strip())
+    return ClassifyPrompt(
+        system=CLASSIFY_SYSTEM_PROMPT,
+        user=CLASSIFY_USER_TEMPLATE.format(
+            semantic=semantic.strip(),
+            render_guide=guide,
+            judgment_overview=overview,
+        ),
+    )
+
+
+def _looks_like_portable_prop_semantic(semantic: str) -> bool:
+    """用户语义是否像手持/佩戴/独立道具（而非人体部位）。"""
+    s = semantic.strip()
+    if not s:
+        return False
+    prop_hints = (
+        "枪", "剑", "刀", "棍", "杖", "瓶", "杯", "壶", "包", "袋", "帽", "盔", "盾",
+        "弓", "箭", "锤", "斧", "铲", "锄", "筒", "炮", "机", "械", "具", "器", "棒",
+        "铲", "鞭", "链", "铃", "笛", "琴", "伞", "扇", "镜", "灯", "钥", "币", "牌",
+        "箱", "盒", "罐", "碗", "盘", "勺", "叉", "筷", "笔", "刷", "锯", "钳", "锤",
+    )
+    body_hints = (
+        "头", "脸", "面", "发", "颈", "胸", "背", "腰", "腹", "臀", "腿", "脚", "趾",
+        "手", "指", "臂", "肘", "膝", "眼", "鼻", "嘴", "耳", "牙", "爪", "尾", "翼",
+    )
+    if any(h in s for h in prop_hints):
+        # 「机枪手」这类含人体词但核心是枪的，仍当道具
+        if s.endswith("手") and len(s) <= 4:
+            return False
+        return True
+    # 纯造词/英文名等：无人体部位特征时保守不注入
+    return not any(h in s for h in body_hints)
+
+
+
+
 def build_classify_prompt(semantic: str, context: Optional["ObjectContext"] = None) -> ClassifyPrompt:
     return ClassifyPrompt(
         system=CLASSIFY_SYSTEM_PROMPT,
@@ -507,8 +769,24 @@ def build_classify_prompt(semantic: str, context: Optional["ObjectContext"] = No
     )
 
 
-def build_observe_prompt(context: Optional["ObjectContext"] = None) -> ClassifyPrompt:
-    """阶段 1：纯观察，不出现 semantic（避免确认偏差），但可注入物体类别 + 候选部件。"""
+def build_observe_prompt(
+    context: Optional["ObjectContext"] = None,
+    *,
+    media_type: MediaType = "mesh",
+) -> ClassifyPrompt:
+    """阶段 1：纯观察，不出现 semantic（避免确认偏差）。"""
+    if media_type == "pointcloud":
+        sem_placeholder = "（阶段 2 才会告知，本阶段禁止猜测）"
+        guide = RENDER_GUIDE.get(media_type, RENDER_GUIDE["mesh"])
+        overview = JUDGMENT_OVERVIEW_TEMPLATE.format(semantic=sem_placeholder)
+        return ClassifyPrompt(
+            system=OBSERVE_SYSTEM_PROMPT,
+            user=OBSERVE_USER_TEMPLATE.format(
+                render_guide=guide,
+                attached_props_block=OBSERVE_ATTACHED_PROPS_BLOCK,
+                judgment_overview=overview,
+            ),
+        )
     context_block = context.observe_block() if context is not None else ""
     return ClassifyPrompt(
         system=OBSERVE_SYSTEM_PROMPT,
@@ -520,18 +798,49 @@ def build_reason_prompt(
     semantic: str,
     covered_parts: list[str],
     context: Optional["ObjectContext"] = None,
+    *,
+    media_type: MediaType = "mesh",
+    force_terminate: bool = False,
+    dominant_region: str = "",
 ) -> ClassifyPrompt:
     """阶段 2：拿阶段 1 的 covered_parts 与语义做纯文本逻辑判定。"""
     import json as _json
+
+    sem = semantic.strip()
+    if media_type == "pointcloud":
+        force_note = (
+            FORCE_TERMINATE_NOTE.format(semantic=sem)
+            if force_terminate
+            else ""
+        )
+        prop_note = (
+            PROP_SEMANTIC_NOTE_TEMPLATE.format(semantic=sem)
+            if _looks_like_portable_prop_semantic(sem)
+            else ""
+        )
+        dom = (dominant_region or "").strip() or "（未提供）"
+        return ClassifyPrompt(
+            system=REASON_SYSTEM_PROMPT,
+            user=REASON_USER_TEMPLATE_POINTCLOUD.format(
+                judgment_overview=JUDGMENT_OVERVIEW_TEMPLATE.format(semantic=sem),
+                force_terminate_note=force_note,
+                prop_semantic_note=prop_note,
+                semantic=sem,
+                covered_parts_json=_json.dumps(covered_parts, ensure_ascii=False),
+                dominant_region_json=_json.dumps(dom, ensure_ascii=False),
+            ),
+        )
+
     context_block = context.reason_block() if context is not None else ""
     return ClassifyPrompt(
         system=REASON_SYSTEM_PROMPT,
         user=REASON_USER_TEMPLATE.format(
-            semantic=semantic.strip(),
+            semantic=sem,
             covered_parts_json=_json.dumps(covered_parts, ensure_ascii=False),
             context_block=context_block,
         ),
     )
+
 
 
 # ---------------------------------------------------------------------------
@@ -1441,6 +1750,41 @@ def build_split_strategy_prompt(
     )
 
 
+SEED_USER_TEMPLATE_POINTCLOUD = """{render_guide}
+
+用户给定的语义区域：「{semantic}」
+
+上一轮分类的结构化结果（**先验事实**，优先采信，不要凭图片推翻）：
+- covered_parts（红色覆盖的所有部位）= {covered_parts_json}
+- semantic_parts（其中属于「{semantic}」的部位）= {semantic_parts_json}
+- extra_parts（红色多出来、不属于语义的部位）= {extra_parts_json}
+- 当前块规模 ≈ {block_size} {size_unit}
+
+==================================
+任务：估计 seed_count（切成几个子块）
+==================================
+
+**目标**：切完后，**至少有一个子块只覆盖 semantic_parts**，其它子块落在 extra_parts 上。
+
+**怎么估 seed_count（按顺序想）**
+-----------------------------------
+Step 1. 数 covered_parts 里有几个**不同部位** → 基准 = max(2, 部位数 + 1)
+Step 2. 若 extra_parts 含大块躯干/头部/整段肢体 → 至少给 4（几何上难一刀切开）
+Step 3. 块越大（>{large_threshold} {size_unit}）越倾向多切，复杂时给 4~5
+Step 4. 仅当 covered_parts 只有 1 个小区域 → 才允许 seed_count=2
+Step 5. 上限 {max_seeds}
+
+例：covered=[头顶尖发, 整张脸, 颈部] → 3 部位 → 建议 4（留边界余量）
+例：covered=[枪管, 握把]、semantic=[枪管] → 建议 3~4，把握把剥出去
+
+只能返回如下 JSON：
+{{
+  "seed_count": <int, 通常 3 或 4，复杂时 5；最少 2，最多 {max_seeds}>,
+  "reason": "中文：列了几个部位、为何需要这个 seed_count"
+}}
+"""
+
+
 def build_seed_prompt(
     semantic: str,
     *,
@@ -1449,28 +1793,44 @@ def build_seed_prompt(
     semantic_parts: list[str] | None = None,
     extra_parts: list[str] | None = None,
     block_faces: int = 0,
+    block_points: int | None = None,
+    media_type: MediaType = "mesh",
 ) -> ClassifyPrompt:
-    """生成 seed_count 询问提示。如果传入了 covered/extra 等上下文，
-    VLM 就不用再凭图片臆测，能更稳地给出更高的 seed_count。
-    """
+    """生成 seed_count 询问提示。"""
     import json as _json
+
+    if media_type == "pointcloud":
+        defaults = _media_defaults(media_type)
+        block_size = int(block_points if block_points is not None else block_faces)
+        guide = RENDER_GUIDE.get(media_type, RENDER_GUIDE["mesh"])
+        return ClassifyPrompt(
+            system=SEED_SYSTEM_PROMPT,
+            user=SEED_USER_TEMPLATE_POINTCLOUD.format(
+                render_guide=guide,
+                semantic=semantic.strip(),
+                max_seeds=max(2, int(max_seeds)),
+                covered_parts_json=_json.dumps(covered_parts or [], ensure_ascii=False),
+                semantic_parts_json=_json.dumps(semantic_parts or [], ensure_ascii=False),
+                extra_parts_json=_json.dumps(extra_parts or [], ensure_ascii=False),
+                block_size=block_size,
+                size_unit=defaults["size_unit"],
+                large_threshold=defaults["large_threshold"],
+            ),
+        )
 
     return ClassifyPrompt(
         system=SEED_SYSTEM_PROMPT,
         user=SEED_USER_TEMPLATE.format(
             semantic=semantic.strip(),
             max_seeds=max(2, int(max_seeds)),
-            covered_parts_json=_json.dumps(
-                covered_parts or [], ensure_ascii=False
-            ),
-            semantic_parts_json=_json.dumps(
-                semantic_parts or [], ensure_ascii=False
-            ),
+            covered_parts_json=_json.dumps(covered_parts or [], ensure_ascii=False),
+            semantic_parts_json=_json.dumps(semantic_parts or [], ensure_ascii=False),
             extra_parts_json=_json.dumps(extra_parts or [], ensure_ascii=False),
             block_faces=int(block_faces),
             semantic_coverage_discipline=SEMANTIC_COVERAGE_DISCIPLINE,
         ),
     )
+
 
 
 # ---------------------------------------------------------------------------

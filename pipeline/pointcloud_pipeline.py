@@ -48,20 +48,42 @@ from geometry.pointcloud_cluster import (
     DEFAULT_NORMAL_WEIGHT,
     split_points,
 )
-from geometry.seed_split import ask_seed_count
-from rendering.heatmap_renderer import DEFAULT_OVERVIEW_VIEW
+from geometry.pointcloud_partition import (
+    VALID_POINT_STRATEGIES,
+    ask_point_split_strategy,
+    default_point_split_params,
+    split_points_by_strategy,
+)
+from pipeline.geometry_postprocess import (
+    analyze_selected_components,
+    apply_ops as _postprocess_apply_ops,
+    ask_component_split_decision,
+    ask_postprocess_ops,
+    build_neighbor_index,
+    compute_selection_metrics,
+    op_keep_components,
+)
+from geometry.seed_split import SplitStrategyResponse, ask_seed_count
+from rendering.heatmap_renderer import DEFAULT_OVERVIEW_VIEW, VIEW_GRID
 from rendering.pointcloud_render import (
     STATUS_COLOR_MAP,
+    component_color_legend,
+    compute_point_normals,
+    render_pointcloud_components_panel,
     render_pointcloud_highlight_panel,
     render_pointcloud_overview,
     render_pointcloud_segmentation_panel,
     render_pointcloud_status_view,
     render_pointcloud_thumbnails_panel,
 )
-from vlm.classifier import classify_component
+from vlm.classifier import ask_revive_pick, classify_component
 from vlm.client import VLMClient
 from vlm.prompts import LABEL_FULL, LABEL_NONE, LABEL_PARTIAL
-from vlm.view_selector import BestViewSelection, select_best_view
+from vlm.view_selector import (
+    BestViewSelection,
+    select_best_view,
+    select_diverse_view_indices,
+)
 
 LOGGER = logging.getLogger("pipeline.pointcloud_pipeline")
 
@@ -83,6 +105,14 @@ class PointCloudRefinementConfig:
     split_curvature_weight: float = DEFAULT_CURVATURE_WEIGHT  # 曲率指标权重(feature_spectral)
     split_convexity_weight: float = 0.0      # 凹凸/凸包指标权重(feature_spectral，>0 启用)
     split_normal_weight: float = DEFAULT_NORMAL_WEIGHT        # 法向权重(feature_spectral)
+    # ---- VLM 选分块策略（与 mesh pipeline 对齐）----
+    # 每个 partial 块分裂前，让 VLM 看高亮图，从 6 种点云策略（graph_cut / spectral /
+    # cvt / sdf / skeleton / geodesic_fps）里挑一种 + 给参数（曲率指标 curvature_weight、
+    # 凸包/凹凸指标 concavity_weight 等）。NEO 仅在所选策略为 spectral 时介入加速。
+    ask_split_strategy: bool = True
+    # 策略提示 / 强制：auto=每块由 VLM 决定；指定 6 种之一则强制该策略（不调 VLM 选策略）。
+    split_strategy: str = "auto"
+    split_strategy_model: Optional[str] = None
     # NEO 后端：开启后在 run() 开始时对整朵点云**一次性**前馈预测全局 LBO 特征空间，
     # 之后所有子块分裂走 lbo_spectral，直接切片复用全局特征向量 + KMeans，
     # 不再每块重算 scipy eigsh（大点云上快很多）。NEO 跑在独立 .conda-neo 环境。
@@ -113,9 +143,40 @@ class PointCloudRefinementConfig:
     # 注意：只影响展示图，不影响分类（分类仍用 12 视角高亮拼图）。
     select_best_view: bool = True
     view_select_model: Optional[str] = None
+    # 分类视角子集：选完最佳展示视角后，让 VLM 同时决定后续「逐块三分类高亮拼图」用几张视角。
+    # 视角越少越精，能看清语义即可——视角太多会让 VLM 在拼图里反复找红色、产生幻觉、虚报部位。
+    # select_classify_views=True 时由 VLM 决定数量与具体视角（在 select_best_view 那一步一起出）；
+    # classify_view_count>0 时强制固定张数（以 best view 为中心按角度互补挑），不问 VLM；
+    # 关闭 select_best_view 或 VLM 选择失败时，退回 default_classify_view_count 张（角度互补）。
+    select_classify_views: bool = True
+    classify_view_count: int = 0          # >0 强制固定张数；0=自动（VLM 决定 / 兜底默认）
+    default_classify_view_count: int = 4  # 兜底默认张数
+    min_classify_views: int = 2           # VLM 可选的最少张数
+    max_classify_views: int = 6           # VLM 可选的最多张数（上限 = 全部 12 视角）
     # VLM 三分类 / ask_seed_count 并发数。>1 时一批块并行调 VLM（HTTP IO），
     # 等待期间主线程继续处理 force_split 等几何分块（见 run() 三轮 pass）。
     parallel_vlm_workers: int = 4
+    # ---- 几何后处理（最终掩码清洗）----
+    # 主循环结束后，对最终 full 选区算几何指标（凸包/solidity、边缘平滑度、曲率、碎片、
+    # 空洞、离群），喂给 VLM 让它挑形态学清洗算子（去小岛/去离群/平滑边界/填洞/保留最大块），
+    # 在 kNN 图上执行后得到更干净的最终分块。失败安全回退原始 mask。
+    postprocess: bool = True
+    postprocess_max_rounds: int = 2       # 体检→VLM→清洗 最多迭代几轮（VLM 判干净即停）
+    postprocess_model: Optional[str] = None
+    # 选区分裂成「两个都很大」的连通域时，结合语义+分色渲染请 VLM 判断该保留哪些块、
+    # 丢弃溢出到别的部件的那块。一个连通域占比 ≥ 该阈值才算「大」（避免对小岛触发）。
+    postprocess_large_component_fraction: float = 0.15
+    # ---- VLM 跨迭代记忆 ----
+    # 每轮三分类前，把此前各块已落定的判定（full / none / partial→split）汇总成文字摘要，
+    # 注入到 reason 阶段的 prompt（不进 observe 阶段，避免确认偏差），让 VLM 保持跨迭代记忆、
+    # 判定彼此一致（不重复认领、不与已定父块矛盾）。
+    vlm_memory: bool = True
+    vlm_memory_max_entries: int = 40         # 摘要里最多保留多少条最近判定，控制 token
+    # ---- 兜底复活 ----
+    # 整轮跑完队列清空后，若全模型 0 个 full 块（语义完全没找到），强制让 VLM 从所有候选叶块里
+    # 挑最可能是该语义的一个，复活成 full，避免返回空掩码。
+    revive_when_empty: bool = True
+    revive_max_candidates: int = 8           # 喂给 VLM 选择的候选叶块上限（含高亮图）
 
 
 @dataclass
@@ -155,8 +216,13 @@ class PointCloudRefinementPipeline:
         self._counter_per_parent: Dict[str, int] = {}
         self._iter_progress_pngs: List[Path] = []
         self._best_view: Optional[BestViewSelection] = None
+        # VLM（或兜底）选定的「分类视角子集」(elev, azim)，逐块高亮拼图只渲染这些视角。
+        # None / 空 = 用全部 VIEW_GRID（12 视角，旧行为）。
+        self._classify_views: Optional[List[Tuple[float, float]]] = None
         # NEO 全局特征空间（整朵点云一次性前馈得到，子块分裂复用）。None=未用 NEO。
         self._neo_eigvecs: Optional[np.ndarray] = None
+        # 整朵点云每点 PCA 法向 (N, 3)，一次性算好供所有渲染做逐点法向 shader。
+        self._point_normals: Optional[np.ndarray] = None
 
     # ---------- 展示视角 ----------
     def _display_view(self) -> Tuple[float, float]:
@@ -193,6 +259,13 @@ class PointCloudRefinementPipeline:
                     status[pid] = tag
         return status
 
+    # ---------- 分类视角子集 ----------
+    def _n_classify_views(self) -> int:
+        """当前逐块分类拼图实际用的视角数（喂给 prompt，让它如实知道有几张图）。"""
+        if self._classify_views:
+            return len(self._classify_views)
+        return len(VIEW_GRID)
+
     # ---------- 渲染 ----------
     def _render_block_panel(self, block: SemanticBlock, panel_dir: Path) -> Path:
         # 标题不写 semantic，避免给 VLM 暗示（确认偏差）。
@@ -206,6 +279,8 @@ class PointCloudRefinementPipeline:
             image_size=(self.config.image_size, self.config.image_size),
             cols=self.config.panel_cols,
             point_size=self.config.point_size,
+            views=self._classify_views,
+            normals=self._point_normals,
         )
 
     def _dump_response(self, responses_dir: Path, block_id: str, payload: Dict[str, Any]) -> None:
@@ -241,28 +316,62 @@ class PointCloudRefinementPipeline:
         )
 
     # ---------- 分裂 ----------
-    def _split_block(self, block: SemanticBlock, seed_count: int) -> List[SemanticBlock]:
-        # NEO 开启且全局特征空间就绪时，强制走 lbo_spectral：子块直接切片全局
-        # 特征向量 + KMeans（不再每块重算 eigsh）。否则用 config 指定的方法。
-        if self._neo_eigvecs is not None:
-            method = "lbo_spectral"
-        else:
-            method = self.config.split_method
-        sub = split_points(
+    def _default_strategy(self) -> str:
+        """无 VLM 选策略时的默认 / 强制策略。"""
+        s = str(self.config.split_strategy or "auto").strip().lower()
+        if s in VALID_POINT_STRATEGIES:
+            return s
+        # auto 但未调 VLM，或 legacy split_method：feature_spectral/lbo_spectral → spectral
+        method = str(self.config.split_method or "").strip().lower()
+        if method == "geodesic_fps":
+            return "geodesic_fps"
+        return "spectral"
+
+    def _resolve_strat_resp(
+        self, strat_resp: Optional[SplitStrategyResponse]
+    ) -> SplitStrategyResponse:
+        if strat_resp is not None and strat_resp.strategy:
+            return strat_resp
+        strat = self._default_strategy()
+        return SplitStrategyResponse(
+            strategy=strat,
+            reason="默认策略（未调用 VLM 选策略）",
+            params=default_point_split_params(strat),
+        )
+
+    def _split_block(
+        self,
+        block: SemanticBlock,
+        seed_count: int,
+        strat_resp: Optional[SplitStrategyResponse] = None,
+    ) -> List[SemanticBlock]:
+        # 由 VLM（或默认）选定的策略 + 参数做几何分裂；NEO 仅在 spectral 时介入加速。
+        resolved = self._resolve_strat_resp(strat_resp)
+        strategy = resolved.strategy
+        params = resolved.params or {}
+        precomputed = self._neo_eigvecs if strategy == "spectral" else None
+
+        sub = split_points_by_strategy(
             self.points,
             block.face_ids,
-            seed_count=seed_count,
-            method=method,
+            seed_count,
+            strategy,
+            lambda_smooth=float(params.get("lambda_smooth", 1.0)),
+            lambda_concave=float(params.get("lambda_concave", 0.85)),
+            scalar_weight=float(params.get("scalar_weight", 0.35)),
+            curvature_weight=params.get("curvature_weight", self.config.split_curvature_weight),
+            concavity_weight=params.get("concavity_weight", self.config.split_convexity_weight),
+            normal_weight=float(params.get("normal_weight", self.config.split_normal_weight)),
+            lloyd_iter=int(params.get("lloyd_iter", self.config.split_lloyd_iter)),
+            num_rays=int(params.get("num_rays", 16)),
+            cone_angle_deg=float(params.get("cone_angle_deg", 60.0)),
+            contraction_iters=int(params.get("contraction_iters", 5)),
             n_neighbors=self.config.split_n_neighbors,
-            lloyd_iter=self.config.split_lloyd_iter,
-            split_cc_first=self.config.split_cc_first,
             enforce_connectivity=self.config.split_enforce_connectivity,
-            curvature_weight=self.config.split_curvature_weight,
-            convexity_weight=self.config.split_convexity_weight,
-            normal_weight=self.config.split_normal_weight,
-            precomputed_eigvecs=self._neo_eigvecs,
+            precomputed_eigvecs=precomputed,
             random_state=0,
         )
+        neo_tag = "+neo" if precomputed is not None else ""
         children: List[SemanticBlock] = []
         for group in sub.sub_point_groups:
             if not group:
@@ -274,7 +383,7 @@ class PointCloudRefinementPipeline:
                 depth=block.depth + 1,
                 parent_id=block.block_id,
                 status=BlockStatus.PENDING,
-                notes=f"split({sub.debug.get('strategy','')})",
+                notes=f"split({strategy}{neo_tag}:{sub.debug.get('strategy','')})",
             )
             self._register_block(child)
             block.children_ids.append(child_id)
@@ -300,6 +409,7 @@ class PointCloudRefinementPipeline:
                 color_map=self._LIVE_COLOR_MAP,
                 background="transparent",
                 point_size=self.config.point_size,
+                normals=self._point_normals,
             )
         except (OSError, ValueError, ImportError) as exc:
             LOGGER.warning("iter %d 进度图渲染失败: %s", iteration, exc)
@@ -334,6 +444,7 @@ class PointCloudRefinementPipeline:
                 color_map=self._LIVE_COLOR_MAP,
                 background="transparent",
                 point_size=self.config.point_size,
+                normals=self._point_normals,
             )
             rendered = True
         except (OSError, ValueError, ImportError) as exc:
@@ -376,9 +487,19 @@ class PointCloudRefinementPipeline:
                 + (' · <span class="muted">fallback 默认视角</span>' if bv.fallback
                    else f' · conf={bv.confidence:.2f}')
             )
+            cv_html = ""
+            if self._classify_views:
+                cv_nums = "、".join(
+                    f"#{i + 1}" for i in (self._best_view.classify_view_indices or [])
+                ) or f"{len(self._classify_views)} 张"
+                cv_html = (
+                    f'<div class="view-meta"><b>分类视角子集</b> '
+                    f'{esc(cv_nums)}（共 {len(self._classify_views)} 张，少而精降幻觉）</div>'
+                )
             view_card_html = (
                 '<section class="view-card">'
                 f'<div class="view-meta"><b>展示视角</b> {tag}</div>'
+                f'{cv_html}'
                 f'<div class="view-reason">{esc(bv.reason or "—")}</div>'
                 '</section>'
             )
@@ -479,6 +600,139 @@ class PointCloudRefinementPipeline:
         except OSError as exc:
             LOGGER.warning("live report 写文件失败: %s", exc)
 
+    # ---------- 跨迭代记忆 ----------
+    def _build_memory_digest(self) -> str:
+        """把此前各块已落定的判定汇总成文字摘要，注入下一轮 reason 阶段 prompt。
+
+        只收集非 pending 块（full / none / abandoned / split），每条形如：
+          - block C0.1 (pts=820, depth=2): full (counted as target); covered=[head, ears]
+        最多保留最近 vlm_memory_max_entries 条，控制 token。
+        """
+        if not self.config.vlm_memory:
+            return ""
+        entries: List[str] = []
+        for b in self.blocks.values():
+            if b.status == BlockStatus.PENDING:
+                continue
+            cls = b.classification or {}
+            if b.status == BlockStatus.SPLIT:
+                verdict = f"partial -> split into {len(b.children_ids)} children"
+            elif b.status == BlockStatus.FULL:
+                verdict = "full (counted as target)"
+            elif b.status == BlockStatus.ABANDONED:
+                verdict = "none (abandoned)"
+            else:
+                verdict = "none"
+            covered = cls.get("covered_parts") or []
+            cov = ", ".join(str(c) for c in covered[:4])
+            reason = str(cls.get("reason") or "").strip()
+            if len(reason) > 140:
+                reason = reason[:140] + "..."
+            line = f"- block {b.block_id} (pts={b.size}, depth={b.depth}): {verdict}; covered=[{cov}]"
+            if reason:
+                line += f"; reason={reason}"
+            entries.append(line)
+        if not entries:
+            return ""
+        max_n = max(1, int(self.config.vlm_memory_max_entries))
+        if len(entries) > max_n:
+            entries = entries[-max_n:]
+        return "\n".join(entries)
+
+    # ---------- 兜底复活 ----------
+    def _revive_block(
+        self,
+        responses_dir: Path,
+        responses_log: List[Dict[str, Any]],
+        iteration: int,
+    ) -> Optional[str]:
+        """全模型 0 个 full 时，让 VLM 从候选叶块里挑最可能的一个，复活成 full。
+
+        候选 = 非 split / 非 full 的叶块（none / abandoned）。按已存判定启发式排序后取前
+        revive_max_candidates 个喂给 VLM（带各自高亮图，图标题印有 block id）。VLM 选择失败
+        时回退到启发式最优块。返回被复活的 block_id（无候选则 None）。
+        """
+        leaves = [
+            b for b in self.blocks.values()
+            if b.status in (BlockStatus.NONE, BlockStatus.ABANDONED)
+            and b.block_id != "C0"
+        ]
+        if not leaves:
+            LOGGER.warning("强制复活：无候选叶块（none/abandoned）")
+            return None
+
+        sized = [b for b in leaves if b.size >= self.config.min_block_size]
+        candidates = sized or leaves
+
+        def _score(b: SemanticBlock) -> Tuple[float, float, float, int]:
+            cls = b.classification or {}
+            committed = 1.0 if (cls.get("committed_if_forced") == LABEL_FULL) else 0.0
+            ratio = float(cls.get("semantic_area_ratio") or 0.0)
+            conf = float(cls.get("confidence") or 0.0)
+            return (committed, ratio, conf, int(b.size))
+
+        candidates.sort(key=_score, reverse=True)
+        top = candidates[: max(1, int(self.config.revive_max_candidates))]
+
+        payload: List[Dict[str, Any]] = []
+        images: List[Path] = []
+        for b in top:
+            cls = b.classification or {}
+            payload.append({
+                "block_id": b.block_id,
+                "points": b.size,
+                "covered_parts": cls.get("covered_parts") or [],
+                "dominant_region": cls.get("dominant_region") or "",
+                "extra_parts": cls.get("extra_parts") or [],
+                "semantic_area_ratio": cls.get("semantic_area_ratio"),
+                "prior_reason": cls.get("reason") or "",
+            })
+            if b.panel_path and Path(b.panel_path).is_file():
+                images.append(Path(b.panel_path))
+
+        chosen_id: Optional[str] = None
+        try:
+            chosen_id = ask_revive_pick(
+                self.client,
+                self.config.semantic,
+                payload,
+                image_paths=images,
+                model=self.config.classification_model,
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("ask_revive_pick 异常，回退启发式: %s", exc)
+            chosen_id = None
+
+        block: Optional[SemanticBlock] = None
+        if chosen_id and chosen_id in self.blocks:
+            cand = self.blocks[chosen_id]
+            if cand.status in (BlockStatus.NONE, BlockStatus.ABANDONED):
+                block = cand
+        if block is None:
+            block = top[0]
+            chosen_id = block.block_id
+            LOGGER.info("强制复活：VLM 未给出有效选择，回退启发式最优块 %s", chosen_id)
+
+        prev = block.classification or {}
+        cls = {
+            **prev,
+            "label": LABEL_FULL,
+            "revived": True,
+            "original_label": prev.get("label"),
+        }
+        block.classification = cls
+        block.status = BlockStatus.FULL
+        block.notes = (block.notes + " | revived_no_full").strip(" |")
+        responses_log.append({
+            "block_id": block.block_id, "iteration": iteration, "revived": True, **cls,
+        })
+        self._dump_response(responses_dir, block.block_id, cls)
+        LOGGER.info(
+            "强制复活块 %s 为 full（全模型原本 0 个 full，%d 候选叶块）",
+            chosen_id, len(candidates),
+        )
+        return chosen_id
+
     # ---------- 分类 ----------
     @staticmethod
     def _cls_dict_from_component(cls: Any) -> Dict[str, Any]:
@@ -506,6 +760,7 @@ class PointCloudRefinementPipeline:
         panel_path: Path,
         *,
         force_terminate: bool = False,
+        memory: str = "",
     ) -> Dict[str, Any]:
         cls = classify_component(
             self.client,
@@ -514,6 +769,8 @@ class PointCloudRefinementPipeline:
             model=self.config.classification_model,
             media_type="pointcloud",
             force_terminate=force_terminate,
+            n_views=self._n_classify_views(),
+            memory=memory,
         )
         return self._cls_dict_from_component(cls)
 
@@ -522,6 +779,7 @@ class PointCloudRefinementPipeline:
         tasks: Sequence[Tuple[str, Path]],
         *,
         force_terminate_ids: Optional[Set[str]] = None,
+        memory: str = "",
     ) -> Dict[str, Dict[str, Any]]:
         """并行批量三分类；VLM 等待期间不阻塞其它几何分块（见 run 主循环）。"""
         results: Dict[str, Dict[str, Any]] = {}
@@ -535,6 +793,7 @@ class PointCloudRefinementPipeline:
                 self.blocks[bid],
                 panel,
                 force_terminate=(bid in ft_ids),
+                memory=memory,
             )
 
         workers = max(1, int(self.config.parallel_vlm_workers))
@@ -585,6 +844,7 @@ class PointCloudRefinementPipeline:
                     extra_parts=cls.get("extra_parts"),
                     block_points=block.size,
                     media_type="pointcloud",
+                    n_views=self._n_classify_views(),
                 )
             except Exception as exc:  # noqa: BLE001
                 from geometry.seed_split import SeedCountResponse as SCR
@@ -614,6 +874,79 @@ class PointCloudRefinementPipeline:
                     results[bid] = resp
                 except Exception as exc:  # noqa: BLE001
                     LOGGER.warning("serial ask_seed_count failed %s: %s", bid, exc)
+        return results
+
+    def _batch_ask_split_strategy(
+        self,
+        tasks: Sequence[Tuple[str, Path, Dict[str, Any], int]],
+    ) -> Dict[str, SplitStrategyResponse]:
+        """并行批量让 VLM 选分块策略 + 参数（partial 块）。
+
+        非 auto（强制策略）或关闭 ask_split_strategy 时，直接返回默认策略响应，不调 VLM。
+        """
+        results: Dict[str, SplitStrategyResponse] = {}
+        if not tasks:
+            return results
+
+        forced = str(self.config.split_strategy or "auto").strip().lower()
+        if not self.config.ask_split_strategy or forced in VALID_POINT_STRATEGIES:
+            strat = self._default_strategy()
+            for bid, _panel, _cls, _seed in tasks:
+                results[bid] = SplitStrategyResponse(
+                    strategy=strat,
+                    reason=(
+                        "CLI 强制策略" if forced in VALID_POINT_STRATEGIES
+                        else "未启用 VLM 选策略，用默认"
+                    ),
+                    params=default_point_split_params(strat),
+                )
+            return results
+
+        def _do(bid: str, panel: Path, cls: Dict[str, Any], seed_n: int) -> Tuple[str, SplitStrategyResponse]:
+            block = self.blocks[bid]
+            try:
+                resp = ask_point_split_strategy(
+                    self.client,
+                    panel,
+                    semantic_context=self.config.semantic,
+                    seed_count=seed_n,
+                    covered_parts=cls.get("covered_parts"),
+                    semantic_parts=cls.get("semantic_parts"),
+                    extra_parts=cls.get("extra_parts"),
+                    matched_parts=cls.get("semantic_parts"),
+                    block_points=block.size,
+                    split_stage="main",
+                    strategy_hint=str(self.config.split_strategy or "auto"),
+                    fallback="spectral",
+                    model=self.config.split_strategy_model or self.config.seed_model,
+                )
+            except Exception as exc:  # noqa: BLE001
+                resp = SplitStrategyResponse(strategy="spectral", error=str(exc))
+            return bid, resp
+
+        workers = max(1, int(self.config.parallel_vlm_workers))
+        if workers > 1 and len(tasks) > 1:
+            n = min(workers, len(tasks))
+            LOGGER.info("parallel ask_split_strategy: %d blocks, %d workers", len(tasks), n)
+            with ThreadPoolExecutor(max_workers=n) as ex:
+                futs = {
+                    ex.submit(_do, bid, panel, cls, seed_n): bid
+                    for bid, panel, cls, seed_n in tasks
+                }
+                for fut in as_completed(futs):
+                    bid = futs[fut]
+                    try:
+                        _, resp = fut.result()
+                        results[bid] = resp
+                    except Exception as exc:  # noqa: BLE001
+                        LOGGER.warning("parallel ask_split_strategy failed %s: %s", bid, exc)
+        else:
+            for bid, panel, cls, seed_n in tasks:
+                try:
+                    _, resp = _do(bid, panel, cls, seed_n)
+                    results[bid] = resp
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.warning("serial ask_split_strategy failed %s: %s", bid, exc)
         return results
 
     @staticmethod
@@ -719,6 +1052,7 @@ class PointCloudRefinementPipeline:
                     thumb_path,
                     title=f"候选视角（语义：{self.config.semantic}）",
                     point_size=self.config.point_size,
+                    normals=self._point_normals,
                 )
             except (OSError, ImportError, ValueError) as exc:
                 LOGGER.warning("缩略图渲染失败: %s", exc)
@@ -730,6 +1064,13 @@ class PointCloudRefinementPipeline:
                 bv = select_best_view(
                     self.client, thumb_path, self.config.semantic,
                     model=self.config.view_select_model,
+                    min_classify_views=self.config.min_classify_views,
+                    max_classify_views=self.config.max_classify_views,
+                    default_classify_views=(
+                        self.config.classify_view_count
+                        if self.config.classify_view_count > 0
+                        else self.config.default_classify_view_count
+                    ),
                 )
                 bv.thumbnails_panel = thumb_path
 
@@ -742,6 +1083,7 @@ class PointCloudRefinementPipeline:
                 image_size=self.config.single_view_image_size,
                 background="transparent",
                 point_size=self.config.point_size,
+                normals=self._point_normals,
             )
             bv.overview_png = ov_path
         except (OSError, ImportError, ValueError) as exc:
@@ -756,6 +1098,9 @@ class PointCloudRefinementPipeline:
                         "index_1based": bv.index + 1,
                         "elev": bv.elev,
                         "azim": bv.azim,
+                        "classify_view_indices_1based": [
+                            i + 1 for i in (bv.classify_view_indices or [])
+                        ],
                         "fallback": bv.fallback,
                         "confidence": bv.confidence,
                         "reason": bv.reason,
@@ -779,11 +1124,59 @@ class PointCloudRefinementPipeline:
         )
         return bv
 
+    def _resolve_classify_views(self) -> None:
+        """根据 best_view + 配置，确定逐块分类拼图实际使用的视角子集。
+
+        优先级：
+          1. classify_view_count>0 → 以 best view 为中心按角度互补强制固定张数；
+          2. select_classify_views 且 VLM 给了 classify_view_indices → 用 VLM 的选择；
+          3. 否则（关闭或缺失）→ 用 default_classify_view_count 张角度互补视角。
+        关闭分类视角裁剪（select_classify_views=False 且 classify_view_count<=0）→ None（全 12 视角）。
+        """
+        n_grid = len(VIEW_GRID)
+        bv = self._best_view
+        best_idx = int(bv.index) if bv is not None else 0
+
+        forced = int(self.config.classify_view_count or 0)
+        if forced <= 0 and not self.config.select_classify_views:
+            self._classify_views = None
+            LOGGER.info("分类视角裁剪关闭：逐块仍用全部 %d 视角", n_grid)
+            return
+
+        if forced > 0:
+            idxs = select_diverse_view_indices(best_idx, min(forced, n_grid))
+        elif bv is not None and bv.classify_view_indices:
+            idxs = [i for i in bv.classify_view_indices if 0 <= i < n_grid]
+            if not idxs:
+                idxs = select_diverse_view_indices(
+                    best_idx, self.config.default_classify_view_count
+                )
+        else:
+            idxs = select_diverse_view_indices(
+                best_idx, self.config.default_classify_view_count
+            )
+
+        self._classify_views = [VIEW_GRID[i] for i in idxs]
+        if bv is not None:
+            bv.classify_view_indices = idxs
+        LOGGER.info(
+            "逐块分类视角子集: %s（共 %d 张，全网格 %d；视角越少越降幻觉）",
+            [i + 1 for i in idxs], len(idxs), n_grid,
+        )
+
     # ---------- 主循环 ----------
     def run(self, points: np.ndarray, output_dir: str | Path) -> PointCloudRefinementResult:
         t0 = time.perf_counter()
         self.points = np.asarray(points, dtype=np.float64)[:, :3]
         n_points = len(self.points)
+
+        # 逐点 PCA 法向：一次性算好，所有渲染（高亮拼图/状态图/概览）用它对 base color
+        # 做明暗 shader（扁平点，不画球体）。算不出时退化为无 shader。
+        try:
+            self._point_normals = compute_point_normals(self.points)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("逐点法向计算失败，渲染退回无 shader: %s", exc)
+            self._point_normals = None
 
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -821,6 +1214,11 @@ class PointCloudRefinementPipeline:
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("视角选择失败，使用默认视角: %s", exc)
             self._best_view = None
+        try:
+            self._resolve_classify_views()
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("分类视角子集解析失败，退回全部视角: %s", exc)
+            self._classify_views = None
 
         # ====== 没有初始分块：整朵点云作为根，force_split 直接切第一刀 ======
         root = SemanticBlock(
@@ -900,10 +1298,13 @@ class PointCloudRefinementPipeline:
                     block.notes = f"render_failed: {exc}"
 
             # ----- Pass B（并行 VLM）：批量三分类（含 too_small 块）-----
+            # 跨迭代记忆：把此前各块已落定的判定汇总成文字摘要，注入 reason 阶段 prompt。
+            memory = self._build_memory_digest()
             classify_tasks = list(iter_panel.items())
             cls_cache = self._batch_classify(
                 classify_tasks,
                 force_terminate_ids=force_terminate_ids,
+                memory=memory,
             )
 
             # ----- Pass C（串行决策）：读 cache，partial 再批量 ask_seed_count + 几何分块 -----
@@ -921,7 +1322,7 @@ class PointCloudRefinementPipeline:
                     if cls is None and panel_path is not None:
                         try:
                             cls = self._classify(
-                                block, panel_path, force_terminate=True,
+                                block, panel_path, force_terminate=True, memory=memory,
                             )
                         except (RuntimeError, ValueError, OSError) as exc:
                             LOGGER.warning("too_small classify fallback failed %s: %s", block_id, exc)
@@ -944,7 +1345,7 @@ class PointCloudRefinementPipeline:
                 cls = cls_cache.get(block_id)
                 if cls is None:
                     try:
-                        cls = self._classify(block, panel_path)
+                        cls = self._classify(block, panel_path, memory=memory)
                     except (RuntimeError, ValueError, OSError) as exc:
                         LOGGER.error("classify fallback failed %s: %s", block_id, exc)
                         block.status = BlockStatus.ABANDONED
@@ -984,6 +1385,9 @@ class PointCloudRefinementPipeline:
 
             seed_cache = self._batch_ask_seed_count(partial_seed_tasks)
 
+            # 先确定每个 partial 块的 seed_count，再批量让 VLM 选分块策略 + 参数。
+            strat_tasks: List[Tuple[str, Path, Dict[str, Any], int]] = []
+            seed_resolved: Dict[str, Any] = {}
             for block_id in partial_block_ids:
                 block = self.blocks[block_id]
                 if block.status != BlockStatus.PENDING:
@@ -1000,21 +1404,47 @@ class PointCloudRefinementPipeline:
                             covered_parts=cls.get("covered_parts"),
                             semantic_parts=cls.get("semantic_parts"),
                             extra_parts=cls.get("extra_parts"),
-                            block_faces=block.size,
+                            block_points=block.size,
+                            media_type="pointcloud",
+                            n_views=self._n_classify_views(),
                         )
                     except Exception as exc:  # noqa: BLE001
                         from geometry.seed_split import SeedCountResponse
                         seed_resp = SeedCountResponse(seed_count=2, reason=str(exc))
+                seed_resolved[block_id] = seed_resp
+                strat_tasks.append((block_id, panel_path, cls, seed_resp.seed_count))
+
+            strat_cache = self._batch_ask_split_strategy(strat_tasks)
+
+            for block_id in partial_block_ids:
+                block = self.blocks[block_id]
+                if block.status != BlockStatus.PENDING:
+                    continue
+                cls = block.classification or {}
+                seed_resp = seed_resolved.get(block_id)
+                if seed_resp is None:
+                    continue
                 seed_n = seed_resp.seed_count
                 seed_reason = seed_resp.reason
+                strat_resp = strat_cache.get(block_id) or self._resolve_strat_resp(None)
 
-                children = self._split_block(block, seed_n)
+                children = self._split_block(block, seed_n, strat_resp)
                 if len(children) >= 2:
                     block.status = BlockStatus.SPLIT
                     block.seed_count = seed_n
-                    block.seed_decision = {"seed_count": seed_n, "reason": seed_reason}
+                    block.seed_decision = {
+                        "seed_count": seed_n,
+                        "reason": seed_reason,
+                        "strategy": strat_resp.strategy,
+                        "strategy_reason": strat_resp.reason,
+                        "strategy_params": strat_resp.params,
+                        "strategy_error": strat_resp.error,
+                    }
                     next_queue.extend(c.block_id for c in children)
-                    LOGGER.info("block %s split → %d children", block_id, len(children))
+                    LOGGER.info(
+                        "block %s split → %d children (strategy=%s)",
+                        block_id, len(children), strat_resp.strategy,
+                    )
                 else:
                     self._apply_force_terminate(
                         block, cls, responses_dir, responses_log,
@@ -1035,6 +1465,16 @@ class PointCloudRefinementPipeline:
                 self._render_initial_segmentation(out_dir)
 
             queue = next_queue
+
+        # ====== 兜底复活：整轮跑完后若全模型 0 个 full 块，强制让 VLM 挑一个最可能的复活 ======
+        if self.config.revive_when_empty and not any(
+            b.status == BlockStatus.FULL for b in self.blocks.values()
+        ):
+            LOGGER.info("全模型 0 个 full 块，触发强制复活")
+            try:
+                self._revive_block(responses_dir, responses_log, iteration)
+            except Exception as exc:  # noqa: BLE001 — 复活失败不影响收尾
+                LOGGER.warning("强制复活块失败: %s", exc)
 
         # ====== 收尾 ======
         full_ids: List[int] = []
@@ -1058,6 +1498,13 @@ class PointCloudRefinementPipeline:
             1 for b in self.blocks.values() if b.status != BlockStatus.SPLIT
         )
 
+        # ====== 几何后处理：对最终 full 选区算指标 + VLM 清洗（凸包/边缘/曲率）======
+        if self.config.postprocess:
+            try:
+                self._postprocess_final_mask(out_dir, result)
+            except Exception as exc:  # noqa: BLE001 — 后处理失败不影响主结果
+                LOGGER.warning("几何后处理失败，沿用原始最终掩码: %s", exc)
+
         # 最终掩码图
         mask_png = out_dir / "semantic_mask.png"
         try:
@@ -1069,6 +1516,7 @@ class PointCloudRefinementPipeline:
                 image_size=(self.config.image_size, self.config.image_size),
                 cols=self.config.panel_cols,
                 point_size=self.config.point_size,
+                normals=self._point_normals,
             )
             result.semantic_panel = mask_png
         except (OSError, ImportError, ValueError) as exc:
@@ -1149,6 +1597,225 @@ class PointCloudRefinementPipeline:
         )
         return result
 
+    # ---------- 几何后处理 ----------
+    def _split_large_components(
+        self,
+        pp_dir: Path,
+        mask: np.ndarray,
+        nbr_idx: np.ndarray,
+        metrics_fn,
+    ) -> Tuple[np.ndarray, Optional[Dict[str, Any]]]:
+        """选区分裂成「两个都很大」的连通域时，请 VLM 判断哪些块属于该语义。
+
+        - 仅当存在 ≥2 个占比 ≥ ``postprocess_large_component_fraction`` 的连通域时触发；
+        - 把各大块分色渲染成多视角拼图 + 各块占比 + 语义喂给 VLM；
+        - VLM 返回应保留的块号，丢弃其余（溢出到别的部件的）块。
+        返回 (新 mask, 决策记录 dict 或 None)。任何失败/判定全保留 → 原样返回。
+        """
+        n_neighbors = self.config.split_n_neighbors
+        comps = analyze_selected_components(self.points, mask, n_neighbors)
+        large_thresh = float(self.config.postprocess_large_component_fraction)
+        large = [c for c in comps if c.fraction >= large_thresh]
+        if len(large) < 2:
+            return mask, None
+
+        comp_render = [c.indices.tolist() for c in large]
+        panel_path = pp_dir / "components.png"
+        try:
+            render_pointcloud_components_panel(
+                self.points,
+                comp_render,
+                panel_path,
+                title=f"[postprocess] large components: {component_color_legend(len(large))}",
+                image_size=(self.config.image_size, self.config.image_size),
+                cols=self.config.panel_cols,
+                point_size=self.config.point_size,
+                views=self._classify_views,
+                normals=self._point_normals,
+            )
+        except (OSError, ImportError, ValueError) as exc:
+            LOGGER.warning("postprocess 连通域分色渲染失败: %s", exc)
+            panel_path = None  # type: ignore[assignment]
+
+        decision = ask_component_split_decision(
+            self.client,
+            panel_path,
+            self.config.semantic,
+            large,
+            metrics_fn(mask),
+            media_type="pointcloud",
+            n_views=self._n_classify_views(),
+            model=self.config.postprocess_model or self.config.classification_model,
+        )
+        rec: Dict[str, Any] = {
+            "num_large_components": len(large),
+            "components": [
+                {"id": c.rank, "size": c.size, "fraction": round(c.fraction, 4)} for c in large
+            ],
+            "keep_ranks": decision.keep_ranks,
+            "split": decision.split,
+            "reason": decision.reason,
+            "error": decision.error,
+        }
+        if not decision.split:
+            LOGGER.info("postprocess 连通域判定：全部保留（%d 个大块）", len(large))
+            return mask, rec
+
+        before = int(mask.sum())
+        new_mask = op_keep_components(self.points, mask, n_neighbors, decision.keep_ranks)
+        after = int(new_mask.sum())
+        rec["before"] = before
+        rec["after"] = after
+        rec["delta"] = after - before
+        if after == 0 or np.array_equal(new_mask, mask):
+            LOGGER.info("postprocess 连通域拆分无变化/会清空，保留原 mask")
+            return mask, rec
+        LOGGER.info(
+            "postprocess 连通域拆分：保留块 %s，%d -> %d (%+d)",
+            decision.keep_ranks, before, after, after - before,
+        )
+        return new_mask, rec
+
+    def _postprocess_final_mask(
+        self, out_dir: Path, result: PointCloudRefinementResult
+    ) -> None:
+        """对最终 full 选区做「几何指标体检 + VLM 决策 + 形态学清洗」。
+
+        指标（凸包/solidity、边缘平滑度、曲率、碎片、空洞、离群）由 VLM 据此挑清洗算子；
+        在整朵点云的 kNN 图上执行。把优化后的 mask 写回 result 并落产物到 postprocess/。
+        """
+        n_points = len(self.points)
+        original_full = sorted(set(result.full_point_ids))
+        if n_points == 0 or len(original_full) < 8:
+            return
+
+        pp_dir = out_dir / "postprocess"
+        pp_dir.mkdir(parents=True, exist_ok=True)
+
+        from geometry.pointcloud_cluster import compute_point_normals_and_curvature
+
+        nbr_idx = build_neighbor_index(self.points, n_neighbors=self.config.split_n_neighbors)
+        _normals, curvature = compute_point_normals_and_curvature(
+            self.points, n_neighbors=self.config.split_n_neighbors
+        )
+        mask = np.zeros(n_points, dtype=bool)
+        mask[np.asarray(original_full, dtype=np.int64)] = True
+
+        def _metrics(m: np.ndarray) -> Dict[str, Any]:
+            return compute_selection_metrics(
+                self.points, m,
+                n_neighbors=self.config.split_n_neighbors,
+                nbr_idx=nbr_idx, curvature=curvature,
+            ).to_dict()
+
+        rounds: List[Dict[str, Any]] = []
+        max_rounds = max(1, int(self.config.postprocess_max_rounds))
+        metrics_before = _metrics(mask)
+
+        # 先处理「两个都很大的连通域」：分色渲染 + 语义 → VLM 判断是否拆分（丢弃溢出块），
+        # 在形态学清洗（会无脑保留最大块）之前做，避免误删另一块合法部件。
+        mask, split_rec = self._split_large_components(pp_dir, mask, nbr_idx, _metrics)
+
+        for r in range(1, max_rounds + 1):
+            metrics = _metrics(mask)
+
+            panel_path = pp_dir / f"round_{r:02d}.png"
+            try:
+                render_pointcloud_highlight_panel(
+                    self.points,
+                    np.flatnonzero(mask).tolist(),
+                    panel_path,
+                    title=f"[postprocess r{r}] full={int(mask.sum())}",
+                    image_size=(self.config.image_size, self.config.image_size),
+                    cols=self.config.panel_cols,
+                    point_size=self.config.point_size,
+                    views=self._classify_views,
+                    normals=self._point_normals,
+                )
+            except (OSError, ImportError, ValueError) as exc:
+                LOGGER.warning("postprocess 渲染失败: %s", exc)
+                panel_path = None  # type: ignore[assignment]
+
+            decision = ask_postprocess_ops(
+                self.client,
+                panel_path,
+                self.config.semantic,
+                metrics,
+                media_type="pointcloud",
+                n_views=self._n_classify_views(),
+                model=self.config.postprocess_model or self.config.classification_model,
+            )
+            round_rec: Dict[str, Any] = {
+                "round": r,
+                "metrics": metrics,
+                "ops_requested": decision.ops,
+                "reason": decision.reason,
+                "error": decision.error,
+            }
+            if not decision.ops:
+                rounds.append(round_rec)
+                LOGGER.info("postprocess round %d: VLM 判定无需清洗，停止", r)
+                break
+
+            new_mask, op_log = _postprocess_apply_ops(
+                self.points, mask, decision.ops,
+                n_neighbors=self.config.split_n_neighbors, nbr_idx=nbr_idx,
+            )
+            round_rec["ops_applied"] = op_log
+            rounds.append(round_rec)
+
+            if int(new_mask.sum()) == 0:
+                LOGGER.warning("postprocess round %d 清空选区，回退本轮", r)
+                break
+            if np.array_equal(new_mask, mask):
+                LOGGER.info("postprocess round %d: mask 无变化，停止", r)
+                break
+            mask = new_mask
+
+        new_full = set(int(i) for i in np.flatnonzero(mask).tolist())
+        old_full = set(original_full)
+        removed = old_full - new_full
+        added = new_full - old_full
+
+        none_set = (set(result.none_point_ids) | removed) - added
+        pending_set = set(result.pending_point_ids) - added
+        result.full_point_ids = sorted(new_full)
+        result.none_point_ids = sorted(none_set)
+        result.pending_point_ids = sorted(pending_set)
+
+        metrics_after = _metrics(mask)
+
+        summary = {
+            "semantic": self.config.semantic,
+            "num_points": n_points,
+            "num_full_before": len(old_full),
+            "num_full_after": len(new_full),
+            "num_removed": len(removed),
+            "num_added": len(added),
+            "metrics_before": metrics_before,
+            "metrics_after": metrics_after,
+            "component_split": split_rec,
+            "rounds": rounds,
+        }
+        try:
+            (out_dir / "postprocess.json").write_text(
+                json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except OSError as exc:
+            LOGGER.warning("写 postprocess.json 失败: %s", exc)
+        result.extra["postprocess"] = {
+            "num_full_before": len(old_full),
+            "num_full_after": len(new_full),
+            "num_removed": len(removed),
+            "num_added": len(added),
+            "rounds": len(rounds),
+            "json": str(out_dir / "postprocess.json"),
+        }
+        LOGGER.info(
+            "几何后处理完成: full %d -> %d (removed=%d, added=%d, rounds=%d)",
+            len(old_full), len(new_full), len(removed), len(added), len(rounds),
+        )
+
     def _render_initial_segmentation(self, out_dir: Path) -> None:
         """第一刀切完后，把当前叶子块按块号着色，导出 initial_segmentation.png。"""
         n_points = len(self.points)
@@ -1172,6 +1839,7 @@ class PointCloudRefinementPipeline:
                 image_size=(self.config.image_size, self.config.image_size),
                 cols=self.config.panel_cols,
                 point_size=self.config.point_size,
+                normals=self._point_normals,
             )
         except (OSError, ImportError, ValueError) as exc:
             LOGGER.warning("初始分块图渲染失败: %s", exc)

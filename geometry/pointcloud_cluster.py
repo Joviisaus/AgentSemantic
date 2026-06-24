@@ -31,30 +31,92 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 try:
-    from scipy.sparse import csr_matrix
+    from scipy.sparse import csr_matrix, diags, eye
     from scipy.sparse.csgraph import connected_components
     from scipy.sparse.linalg import eigsh
     from scipy.sparse.linalg import ArpackNoConvergence
 except ImportError as exc:  # pragma: no cover
     raise ImportError("点云谱聚类需要 scipy: pip install scipy") from exc
 
-# 复用 mesh 版谱聚类的核心算子，确保「同一套算法 + 同一套参数」迁移到点云：
-#   - normalized_graph_laplacian / _solve_smallest_eigs：图拉普拉斯 + 最小特征对
-#   - estimate_cluster_count：特征值间隙自动估簇数
-#   - _kmeans：轻量 KMeans
-# 点云相对 mesh 只替换两处「网格专属」环节：
-#   ① compute_vertex_normals（面积加权）→ 局部 PCA 点法向
-#   ② build_weighted_adjacency（三角面 1-邻边）→ kNN 图
+# mesh 版 spectral_cluster 已重构为测地 Voronoi 流程，图拉普拉斯算子改在本模块内联。
 from geometry.spectral_cluster import (
-    DEFAULT_FEATURE_SIGMA,
-    DEFAULT_MAX_CLUSTERS,
     DEFAULT_MIN_CLUSTERS,
     _kmeans,
-    estimate_cluster_count,
-    normalized_graph_laplacian,
     resolve_n_clusters,
-    _solve_smallest_eigs,
 )
+
+# 与旧版 mesh 特征谱聚类对齐的默认参数（点云 feature_spectral 后端专用）。
+DEFAULT_MAX_CLUSTERS = 24
+DEFAULT_FEATURE_SIGMA = 0.0  # 0 = 用边特征距离中位数自动估计
+_DENSE_EIGH_MAX_N = 4000
+
+
+def normalized_graph_laplacian(adjacency: csr_matrix) -> csr_matrix:
+    n = adjacency.shape[0]
+    degree = np.asarray(adjacency.sum(axis=1)).flatten()
+    inv_sqrt = 1.0 / np.sqrt(np.maximum(degree, 1e-12))
+    d_mat = diags(inv_sqrt, format="csr")
+    return eye(n, format="csr", dtype=np.float64) - d_mat @ adjacency @ d_mat
+
+
+def estimate_cluster_count(
+    eigenvalues: np.ndarray,
+    min_clusters: int = DEFAULT_MIN_CLUSTERS,
+    max_clusters: int = DEFAULT_MAX_CLUSTERS,
+) -> int:
+    """根据特征值间隙估计聚类数（跳过第一个近零特征值）。"""
+    if len(eigenvalues) <= 2:
+        return min_clusters
+    vals = np.sort(np.real(eigenvalues))
+    search = vals[1 : min(len(vals), max_clusters + 2)]
+    if len(search) < 2:
+        return min_clusters
+    gaps = np.diff(search)
+    k = int(np.argmax(gaps)) + 1
+    return int(np.clip(k, min_clusters, max_clusters))
+
+
+def _solve_smallest_eigs(
+    laplacian: csr_matrix,
+    k_eigs: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """取 normalized Laplacian 的 k 个最小特征对。"""
+    n = laplacian.shape[0]
+    k_eigs = min(k_eigs, max(1, n - 1))
+
+    try:
+        return eigsh(
+            laplacian,
+            k=k_eigs,
+            which="SM",
+            tol=1e-4,
+            maxiter=max(1000, n * 5),
+        )
+    except ArpackNoConvergence:
+        pass
+
+    try:
+        return eigsh(
+            laplacian,
+            k=k_eigs,
+            which="SM",
+            tol=1e-2,
+            maxiter=max(5000, n * 20),
+        )
+    except ArpackNoConvergence:
+        pass
+
+    if n <= _DENSE_EIGH_MAX_N:
+        dense = laplacian.toarray()
+        dense = 0.5 * (dense + dense.T)
+        eigvals, eigvecs = np.linalg.eigh(dense)
+        return eigvals[:k_eigs], eigvecs[:, :k_eigs]
+
+    raise ArpackNoConvergence(
+        f"eigsh failed for n={n}, k={k_eigs}; dense fallback skipped (n>{_DENSE_EIGH_MAX_N})",
+        np.array([]),
+        np.zeros((n, 0)),
+    )
 
 try:
     from scipy.spatial import cKDTree
@@ -76,7 +138,6 @@ except ImportError as exc:  # pragma: no cover
 
 
 # 解析 dense 特征分解的规模上限（点数高于此值且 ARPACK 失败时直接放弃 dense 回退）。
-_DENSE_EIGH_MAX_N = 4000
 
 
 @dataclass
@@ -708,11 +769,8 @@ def split_points_by_geodesic_fps(
       ④ 逐 label 连通性清洗（修补边界孤立小片）。
     数值失败回退坐标 KMeans。
     """
-    # 复用 mesh seed_split 里"只依赖图 + 点坐标"的通用算法（与网格版完全同算法）。
-    from geometry.seed_split import (
-        _geodesic_fps_seeds,
-        _lloyd_relax_geodesic,
-    )
+    # 复用 mesh partition 里"只依赖图 + 点坐标"的通用算法（与网格版完全同算法）。
+    from geometry.partition.geodesic_fps import geodesic_fps_seeds, lloyd_relax_geodesic
 
     ids = np.asarray(list(point_ids), dtype=np.int64)
     seed_count = max(2, int(seed_count))
@@ -731,10 +789,10 @@ def split_points_by_geodesic_fps(
     fps_error: Optional[str] = None
     try:
         graph = build_point_knn_graph(sub_pts, n_neighbors=n_neighbors)
-        fps_seeds = _geodesic_fps_seeds(graph, sub_pts, seed_count)
+        fps_seeds = geodesic_fps_seeds(graph, sub_pts, seed_count)
         if len(fps_seeds) < 2:
             raise RuntimeError(f"FPS 仅取得 {len(fps_seeds)} 个种子")
-        _seeds_final, labels = _lloyd_relax_geodesic(
+        _seeds_final, labels = lloyd_relax_geodesic(
             graph, sub_pts, list(fps_seeds), n_iter=lloyd_iter
         )
         labels = enforce_per_label_point_connectivity(graph, labels)

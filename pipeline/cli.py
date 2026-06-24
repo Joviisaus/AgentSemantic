@@ -282,6 +282,32 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "但请注意各家 VLM 的 QPS / RPM 限额。渲染 (pyvista) 仍串行。"
         ),
     )
+    # ---- 几何后处理（最终掩码清洗）----
+    p.add_argument(
+        "--no-postprocess",
+        action="store_false",
+        dest="postprocess",
+        help=(
+            "关闭最终掩码几何后处理。默认开启：主循环结束后对最终 full 面集算几何指标"
+            "（凸包/solidity、边缘平滑度、曲率、碎片、空洞、离群），喂给 VLM 让它挑形态学"
+            "清洗算子（去小岛/去离群/平滑边界/填洞/保留最大块），在面质心 kNN 图上执行后"
+            "得到更干净的最终分块；产物写到 output_dir/postprocess/ 与 postprocess.json。"
+        ),
+    )
+    p.set_defaults(postprocess=True)
+    p.add_argument(
+        "--postprocess-rounds",
+        type=int,
+        default=2,
+        metavar="N",
+        help="后处理「体检→VLM→清洗」最多迭代轮数（VLM 判干净即提前停，默认 2）。",
+    )
+    p.add_argument(
+        "--postprocess-model",
+        type=str,
+        default=None,
+        help="后处理决策步骤单独指定 VLM 模型；不传则沿用分类模型。",
+    )
     p.add_argument(
         "--no-live-report",
         action="store_true",
@@ -464,6 +490,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         select_best_view=not args.no_view_select,
         view_select_model=args.view_select_model or args.model,
         single_view_image_size=args.single_view_size,
+        postprocess=args.postprocess,
+        postprocess_max_rounds=max(1, int(args.postprocess_rounds)),
+        postprocess_model=args.postprocess_model or args.model,
         progress_cb=progress,
     )
 
@@ -473,6 +502,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"  initial / final    : {result.num_initial_blocks} / {result.num_final_blocks}")
     print(f"  full faces         : {len(result.full_face_ids)}")
     print(f"  none faces         : {len(result.none_face_ids)}")
+    pp = result.extra.get("postprocess")
+    if pp:
+        print(
+            f"  postprocess        : full {pp['num_full_before']} -> {pp['num_full_after']} "
+            f"(-{pp['num_removed']} / +{pp['num_added']}, {pp['rounds']} 轮)"
+        )
     if result.pending_face_ids:
         print(f"  pending faces      : {len(result.pending_face_ids)}")
     if result.best_view is not None:

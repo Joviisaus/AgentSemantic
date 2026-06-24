@@ -1,0 +1,15 @@
+bag__test0_00142
+motorbike__test0_00015
+laptop__test0_00071
+earphone__test0_00166
+mug__test0_00033
+cap__test0_00186
+car__test0_00000
+knife__test0_00013
+lamp__test0_00003
+chair__test0_00008
+airplane__test0_00021
+skateboard__test0_00180
+pistol__test0_00076
+guitar__test0_00006
+rocket__test0_00553

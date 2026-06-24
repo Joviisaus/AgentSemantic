@@ -15,3 +15,4 @@ dependencies:
       - pillow>=10.0
       - scipy>=1.10
       - requests>=2.31
+      - robust_laplacian>=1.1

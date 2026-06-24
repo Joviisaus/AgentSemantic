@@ -15,7 +15,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from vlm.client import build_vlm_client  # noqa: E402
 from vlm.config import get_provider_config, load_vlm_config  # noqa: E402
 
-PROVIDERS = ["doubao", "qwen", "google", "openai", "anthropic", "zhipu"]
+PROVIDERS = ["doubao", "hy3", "qwen", "google", "openai", "anthropic", "zhipu"]
 
 
 def main() -> int:

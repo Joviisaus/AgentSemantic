@@ -362,6 +362,7 @@ _OPENAI_COMPATIBLE = {
     "deepseek",
     "ollama",
     "custom",
+    "hy3",             # 腾讯 MaaS TokenHub（hy3-preview 等）
     "doubao",          # 火山方舟（Volcengine ARK），兼容 OpenAI Chat Completions
     "volcengine",      # alias
     "ark",             # alias

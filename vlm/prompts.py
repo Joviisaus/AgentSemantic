@@ -1,9 +1,10 @@
-"""
-VLM 提示模板：
-- 三分类（完全符合 / 局部符合 / 完全不符合）
-- 局部符合时估计种子数（用于谱聚类分裂）
 
-约定 VLM 必须返回严格的 JSON，便于稳定解析。
+"""
+VLM prompt templates:
+- Three-way classification (full match / partial match / no match)
+- When partial, estimate seed count (for spectral clustering splits)
+
+VLM responses must be strict JSON for reliable parsing.
 """
 
 from __future__ import annotations
@@ -26,159 +27,174 @@ LABEL_NONE: Final = "none"
 VALID_LABELS: Final = (LABEL_FULL, LABEL_PARTIAL, LABEL_NONE)
 
 # ---------------------------------------------------------------------------
-# 输入形态说明 + 判断方法总览（注入各阶段 prompt，让 VLM 知道「图是什么」「怎么判」）
+# Input modality guide + judgment overview (injected into stage prompts)
 # ---------------------------------------------------------------------------
 
-RENDER_GUIDE: Final[Dict[str, str]] = {
+# {n_views} ???????= VLM ?????????????? _render_guide()?
+RENDER_GUIDE_TEMPLATE: Final[Dict[str, str]] = {
     "mesh": (
-        "【图像是什么】\n"
-        "同一块 mesh 的 12 个视角拼图。每个视角里：\n"
-        "  - **鲜艳红/橙色** = 当前待判定的**这一个分块**（三角面着色）；\n"
-        "  - **淡灰色** = 模型其余部分，仅作空间定位，**不属于**当前分块。\n"
-        "红色可能因视角遮挡只在一两个视角里明显——**必须逐视角检查**。"
+        "[What the image shows]\n "
+        "A {n_views}-view collage of the same mesh block. In each view:\n"
+        "  - **Bright red/orange** = the **single block** under evaluation (triangle face coloring);\n "
+        "  - **Light gray** = the rest of the model, for spatial context only, **not** part of this block.\n " "Red may be visible in only one or two views due to occlusion ? **check every view**."
     ),
     "pointcloud": (
-        "【图像是什么】\n"
-        "同一块点云的 12 个视角拼图。每个视角里：\n"
-        "  - **鲜艳红/橙色圆点/小球** = 当前待判定的**这一个分块**的采样点；\n"
-        "  - **淡灰色点** = 整模型其余点云，仅作定位，**不属于**当前分块。\n"
-        "点云比 mesh 稀疏，红色可能呈点簇/点带；**逐视角找齐所有红点**再下结论。\n"
-        "⚠️ 点云特有风险：小型道具/武器可能只是臂弯处一小簇红点，**勿只写笼统「手臂」而漏掉手上物件**。"
+        "[What the image shows]\n "
+        "A {n_views}-view collage of the same point-cloud block. In each view:\n"
+        "  - **Bright red/orange dots/spheres** = sampled points of the **single block** under evaluation;\n "
+        "  - **Light gray points** = the rest of the model, for context only, **not** part of this block.\n " "Point clouds are sparser than meshes; red may appear as clusters or streaks ? "
+        "**find all red points across views** before concluding.\n "
+        "Point-cloud risk: small held/worn props (weapons, tools) may appear as a tiny red cluster "
+        "in an arm bend ? **do not write a vague label like \"arm\" and miss the held object**."
     ),
 }
 
-JUDGMENT_OVERVIEW_TEMPLATE: Final = """【VLM 如何判断 full / partial / none】
-本系统用**两阶段**降低「看到用户语义就乱认」的偏差：
+# ?? 12 ???VLM ???????? / mesh ????????
+DEFAULT_N_VIEWS: Final[int] = 12
 
-  阶段 1 · **纯观察（带图，不出现语义）**
-    → 只回答：红色高亮**实际覆盖到哪些部位/部件** → 输出 covered_parts
 
-  阶段 2 · **纯逻辑（不带图，只看文字）**
-    → 拿 covered_parts 与用户要找的「{semantic}」做**集合比较** → 输出 label
+def _render_guide(media_type: str, n_views: int = DEFAULT_N_VIEWS) -> str:
+    """???????? RENDER_GUIDE??????????????"?? 12 ?"?????"""
+    tmpl = RENDER_GUIDE_TEMPLATE.get(media_type, RENDER_GUIDE_TEMPLATE["mesh"])
+    return tmpl.format(n_views=max(1, int(n_views)))
 
-三类 label 对后续 pipeline 的含义：
-  - **full**    ：红色覆盖范围**全部落在**「{semantic}」内（含其子部件，如头部的耳朵）→ 不再切分
-  - **partial** ：红色越界到语义**外**的独立大部件（如头部块夹了胸部）→ 触发几何再切
-  - **none**    ：红色与「{semantic}」**完全无关** → 整块丢弃
 
-**禁止**跳过观察直接猜 label；**禁止**在观察阶段偷看/联想用户语义。
+# ???????? RENDER_GUIDE[...] ?????? 12 ????
+RENDER_GUIDE: Final[Dict[str, str]] = {
+    k: v.format(n_views=DEFAULT_N_VIEWS) for k, v in RENDER_GUIDE_TEMPLATE.items()
+}
+
+JUDGMENT_OVERVIEW_TEMPLATE: Final = """[How the VLM assigns full / partial / none]
+This system uses **two stages** to reduce bias from seeing the user semantic too early:
+
+  Stage 1 ? **Pure observation (with image, no semantic)**
+    ? Report only which body parts/regions the red highlight **actually covers** ? output covered_parts
+
+  Stage 2 ? **Pure logic (no image, text only)**
+    ? Compare covered_parts to the user target ?{semantic}? via **set comparison** ? output label
+
+Label meanings for the pipeline:
+  - **full**    : Red coverage **lies entirely within** ?{semantic}? (including sub-parts, e.g. ears under "head") ? no further split
+  - **partial** : Red spills into **independent major parts outside** the semantic (e.g. head block includes chest) ? trigger geometric re-split
+  - **none**    : Red is **completely unrelated** to ?{semantic}? ? discard block
+
+**Forbidden**: skip observation and guess label; **forbidden** to peek at / infer user semantic during observation.
 """
 
 FORCE_TERMINATE_NOTE: Final = """
-【强制收尾说明】
-此分块已**无法继续几何切分**（点数过少或已达最大切分深度）。
-你仍须按规则给出 label；同时 `committed_if_forced` 表示：
-「若 pipeline 必须在此刻收工，这块最终算不算语义？」——**只能填 full 或 none**。
-判 full 要非常确定红色主体就是「{semantic}」；有任何夹带非语义部位 → none。
+[Forced termination note]
+This block **cannot be split further** (too few points or max split depth reached).
+You must still assign label per rules; `committed_if_forced` means:
+"If the pipeline must stop now, does this block finally count as the semantic?" ? **only full or none**.
+Choose full only if you are very sure the red bulk is ?{semantic}?; any non-semantic parts mixed in ? none.
 """
 
-# 阶段 2 注入：当用户语义是手持/佩戴类道具时
+MEMORY_BLOCK_TEMPLATE: Final = """
+[Memory of earlier verdicts on this SAME model & target ?{semantic}?]
+The blocks below are other regions of the **same model** already judged in previous iterations
+(parents that were split, and sibling/cousin leaves). Use them **only for consistency**, not to override what you see:
+  - Do **not** re-claim as semantic a region that another leaf already took as **full** ? avoid double-counting.
+  - If parents/siblings establish that the target concentrates in one area, treat red far from that area as **extra/none**.
+  - Stay consistent with settled verdicts unless the current observation gives a clear reason to differ (note it in `reason`).
+Earlier verdicts (most recent last):
+{memory_entries}
+"""
+
 PROP_SEMANTIC_NOTE_TEMPLATE: Final = """
-【本任务语义类型：独立道具 / 手持物「{semantic}」】
-观察员**可能只写了肢体名**（手臂、躯干）而漏写嵌在其中的道具——这很常见，尤其在点云。
-只要 covered 或 dominant_region 暗示道具可能在持握/肩扛区域，**禁止**直接判 none；
-应判 **partial**，让几何切分把道具从肢体上剥出来。
+[Semantic type: independent prop / held object ?{semantic}?]
+The observer **may have listed only limb names** (arm, torso) and missed the prop embedded in them ? common with point clouds.
+If covered or dominant_region suggests the prop may be in a grip / shoulder-carry region, **do not** assign none directly;
+assign **partial** so geometry can peel the prop off the limb.
 """
 
-
-# 分裂前 VLM 决策：避免切分后语义丢失、触发昂贵的覆盖重选
-SEMANTIC_COVERAGE_DISCIPLINE = """语义覆盖纪律（**必须遵守**，避免分裂后丢部位、触发昂贵 VLM 重选）
+SEMANTIC_COVERAGE_DISCIPLINE = """Semantic coverage discipline (**mandatory** ? avoids losing parts after split and expensive VLM re-selection)
 -----------------------------------
-当前块 matched_parts / covered_parts 列出的是**切分后必须仍能被子块认领**的语义清单。
-几何切分产生 seed_count 个子块后，各子块 matched 的**并集**须覆盖上述**每一项**。
+matched_parts / covered_parts on this block list semantics that **must still be claimable by child blocks** after splitting.
+After geometric split into seed_count children, the **union** of child matched sets must cover **every item** above.
 
-**典型失败（禁止）**：父块 matched=[头, 身体, 手臂]，切完子块并集只剩 [身体, 手臂] → **头消失**。
+**Typical failure (forbidden)**: parent matched=[head, body, arm], after split union is only [body, arm] ? **head lost**.
 
-选 seed_count / strategy 时：
-1. **一项一语义一块**：matched_parts 有 N 项 → seed_count 须 **≥ N**（系统给定 seed_count 时，策略须产出 **≥ seed_count 个几何可区分** 子区域）。
-2. **保护小部位**：头、手、指、耳、角、装饰等占面小、最易被吞并——**禁止**对含多项语义的复合块首选 **cvt** 或「均匀」**geodesic_fps**。
-   优先 **graph_cut**（凹槽/接缝，lambda_concave 取高）、**skeleton**（肢类分叉）、
-   **spectral**（远距/关节分离，concavity_weight 取高）。
-   **凹陷明显**（腋窝、腹股沟、指缝、颈根、装甲接缝、裙摆褶皱等）时：
-   首选 graph_cut 或 spectral；spectral 默认 concavity_weight=0.70 已偏高，
-   此时再上调到 **0.75~0.85**（或 graph_cut 的 lambda_concave≥0.9）。
-3. **策略忌口**：
-   - **cvt**：仅当 matched 各项语义相近、仅需均分面积；**不得**用于头+躯干+四肢等综合块。
-   - **sdf**：按粗细分层，**不能保证**每项语义独占一块。
-   - **geodesic_fps**：语义复合且含小部位时仅作兜底，非首选。
-4. **reason 自检**：简述每项 matched_part 切分后预期落在哪个子块；若某小部位可能被并入邻块，**换 strategy** 并在 reason 写明。
-5. 目标是让后续子块 multi-label 能**逐项勾选**，无需触发覆盖修复重选。"""
+When choosing seed_count / strategy:
+1. **One semantic per piece**: N items in matched_parts ? seed_count must be **? N** (when seed_count is fixed, strategy must yield **? seed_count geometrically distinct** sub-regions).
+2. **Protect small parts**: head, hand, finger, ear, horn, ornament ? small area, easily merged ? **do not** default to **cvt** or uniform **geodesic_fps** on multi-semantic composite blocks.
+   Prefer **graph_cut** (grooves/seams, high lambda_concave), **skeleton** (limb branching),
+   **spectral** (distant/joint separation, high concavity_weight).
+   When **concavities are obvious** (armpit, groin, finger gaps, neck base, armor seams, skirt folds):
+   prefer graph_cut or spectral; spectral default concavity_weight=0.70 is already high;
+   raise further to **0.75~0.85** (or graph_cut lambda_concave?0.9).
+3. **Strategy cautions**:
+   - **cvt**: only when matched items are similar and you need equal area; **not** for head+torso+limbs composites.
+   - **sdf**: coarse-to-fine by thickness; **cannot** guarantee one block per semantic item.
+   - **geodesic_fps**: fallback for ambiguous composites with small parts, not first choice.
+4. **Reason self-check**: briefly state which child each matched_part should land in; if a small part may merge into a neighbor, **change strategy** and note in reason.
+5. Goal: later multi-label on children can **check off each item** without coverage repair re-selection."""
 
-MULTI_LABEL_COVERAGE_DISCIPLINE = """语义覆盖标注纪律（避免分裂后丢部位）
+MULTI_LABEL_COVERAGE_DISCIPLINE = """Multi-label coverage discipline (avoid losing parts after split)
 -----------------------------------
-本块可能由父块几何切分而来。勾选 matched_parts 时：
-1. **小部位也要标**：头、手、指、耳等占面小，但若红色高亮区**确实覆盖**该部位几何，**必须**纳入 matched_parts，禁止因「太小」漏标。
-2. **只标本块几何**：仅当鲜艳红/橙高亮**实际包含**该部位才勾选；勿照搬兄弟子块标注。
-3. **并集意识**：同一父块分裂出的兄弟子块 matched 并集应覆盖父块全部语义；本块若有某缺失语义的几何主体，**必须认领**。
-4. 漏标会导致系统触发昂贵的 VLM 覆盖重选——宁可保守多标本块真实可见部位，也不要漏掉独立几何组件。"""
+This block may come from a parent geometric split. When checking matched_parts:
+1. **Label small parts too**: head, hand, finger, ear ? small area, but if red highlight **actually covers** that geometry, **must** include in matched_parts; do not skip as "too small".
+2. **Only this block's geometry**: check an item only if bright red/orange highlight **actually includes** that part; do not copy sibling labels.
+3. **Union awareness**: sibling blocks from the same parent should union to cover all parent semantics; if this block has geometry for a missing semantic, **must claim it**.
+4. Missing labels trigger expensive VLM coverage re-selection ? prefer conservatively labeling all visible independent components on this block."""
 
-MULTI_LABEL_PARENT_INHERITANCE_DISCIPLINE = """父块语义继承纪律（**必须遵守**）
+MULTI_LABEL_PARENT_INHERITANCE_DISCIPLINE = """Parent semantic inheritance discipline (**mandatory**)
 -----------------------------------
-本块由父块几何分裂而来。父块上一轮已标注的语义清单见上文 **parent_matched**。
+This block was split from a parent. Parent's prior semantic list is **parent_matched** above.
 
-1. **封闭于父块**：matched_parts **原则上只能从 parent_matched 中勾选**。
-   父块**未标注**的语义，**不要**标到本块。
-2. **高把握例外**：仅当你在多视角中**非常确定**（主观 ≥85%）红色高亮区确实覆盖父块未列出的部位时，
-   才可将其加入 matched_parts，并在 confidences 中为该项填写 **≥0.85**。
-3. **不确定时**：从 parent_matched 里选 1~3 项与本块几何最贴合的；勿引入父块未认领的远处语义。
-4. dominant 须在 matched_parts 内，且优先选 parent_matched 中占比最大的一项。"""
+1. **Closed to parent**: matched_parts **should only be chosen from parent_matched**.
+   Do **not** label semantics the parent **did not** list.
+2. **High-confidence exception**: only if you are **very sure** (?85%) across views that red covers a part not in parent_matched,
+   you may add it, with confidences **?0.85** for that item.
+3. **When uncertain**: pick 1~3 items from parent_matched that best fit this block; do not introduce distant semantics the parent did not claim.
+4. dominant must be in matched_parts and prefer the largest share among parent_matched."""
 
-MULTI_LABEL_MAX_DEPTH_DISCIPLINE = """最大切分深度纪律（**已达上限，必须给出最终定论**）
+MULTI_LABEL_MAX_DEPTH_DISCIPLINE = """Max split depth discipline (**at limit ? final decision required**)
 -----------------------------------
-⚠️ 本块已达几何切分**最大深度**（当前 depth={current_depth}，上限 max_depth={max_depth}）。
-**不可能再几何分裂**，你必须给出**唯一、确切**的最终归属。
+This block reached **maximum geometric split depth** (current depth={current_depth}, max_depth={max_depth}).
+**No further geometric split** ? you must give a **single, definitive** final assignment.
 
-1. **matched_parts 只能有 1 项**——从候选中选出红色高亮区**最贴合**的一项。
-2. 即使红色看似跨多个部位（如躯干+大腿连接处），也必须只选 **dominant**
-   （面积占比最大、几何主体所在）一项；**禁止**标 2 项及以上。
-3. 犹豫时在候选中选几何最相关的一项；dominant 与 matched_parts[0] 必须一致。
-4. confidences 为选定项填 **≥0.80**，表示这是最终定论。
-5. 系统会直接接受此项并停止切分——这是最后一轮，请给出明确划分。"""
+1. **matched_parts must have exactly 1 item** ? pick the candidate that best fits the red highlight.
+2. Even if red spans multiple regions (e.g. torso+thigh junction), choose only **dominant**
+   (largest area / main geometry); **forbidden** to list 2+ items.
+3. When unsure, pick the most geometrically relevant candidate; dominant must match matched_parts[0].
+4. confidences for the chosen item **?0.80** ? this is the final call.
+5. The system accepts this and stops splitting ? last round, be decisive."""
 
 CLASSIFY_SYSTEM_PROMPT = (
-    "你是一个严谨的 3D 模型语义分析助手。"
-    "用户给你 12 个不同视角拼接的渲染图：图中只有**一个**分块被高亮（鲜艳红/橙色），"
-    "其它区域是淡灰色，仅作为定位参考。"
-    "你必须先**逐视角观察**、**枚举所有红色覆盖到的部位**，再进行语义比较，最后才给出 label。"
-    "严格按 JSON 格式回答，禁止 Markdown 代码块、禁止任何额外文字。"
+    "You are a rigorous 3D model semantic analysis assistant. "
+    "The user provides a multi-view collage: only **one** block is highlighted (bright red/orange);"
+    "other regions are light gray for context only. "
+    "You must **check every view**, **enumerate all parts covered by red**, then compare semantics, then assign label. " "Reply in strict JSON only ? no Markdown fences, no extra text."
 )
 
-
 # ---------------------------------------------------------------------------
-# 两阶段分类：第 1 阶段「纯观察」——不出现语义，避免确认偏差
+# Two-stage classification: Stage 1 pure observation ? no semantic (avoid confirmation bias)
 # ---------------------------------------------------------------------------
 
 OBSERVE_SYSTEM_PROMPT = (
-    "你是一个严格、克制的 3D 模型视觉观察员。"
-    "在 12 视角拼图里，**只**报告颜色为**鲜艳红/橙**的高亮区域**实际**覆盖到的物体部件/区域。"
-    "不要解释、不要猜测、不要联想任何语义；"
-    "**淡灰色 / 米色 / 白色 / 任何非鲜艳红橙色的部位都不能列入**。"
-    "**真实情况下，单个分块的红色通常只覆盖 1~3 个相邻部件**——"
-    "如果你列出了超过 3 个部件，你**很可能在编造**，请重新只保留你**百分百在某张图里直接看到红色**的那些。"
-    "严格按 JSON 格式回答，禁止 Markdown，禁止额外文字。"
+    "You are a strict, restrained 3D visual observer. "
+    "In the multi-view collage, report **only** which object parts/regions are **actually** covered by **bright red/orange** highlight. " "No explanation, no guessing, no semantic inference; "
+    "**light gray / beige / white / any non-bright-red-orange must not be listed**. " "**In practice, a single block's red usually covers only 1~3 adjacent parts** ? "
+    "if you list more than 3, you are **likely inventing**; keep only parts you can **point to red in at least one view**. " "Strict JSON only ? no Markdown, no extra text."
 )
 
-# 物体上下文块（可选）：物体类别 + 候选部件清单。由 build_observe_prompt /
-# build_reason_prompt 在已知时注入；为空时整段省略，prompt 退化为通用开放词表。
-OBSERVE_CONTEXT_HINT = """物体上下文（仅用于命名参考，**不暗示**红色一定覆盖其中任何一项）
+OBSERVE_CONTEXT_HINT = """Object context (naming reference only ? **does not imply** red covers any listed part)
 -----------------------------------
-- 该物体是一个 **{category}**。{parts_line}
-- 描述红色覆盖部件时**优先**从上述候选名里选用；若红色覆盖到清单外的区域，可自行用简洁名词命名。
-- ⚠️ 候选清单只是命名词表，**不要**因为某部件在清单里就臆断红色覆盖到它。
+- This object is a **{category}**. {parts_line}
+- When naming covered parts, **prefer** names from the candidate list; if red covers something outside the list, use a concise noun.
+- Candidate list is a **vocabulary only** ? **do not** assume red covers a part just because it appears on the list.
 """
 
 OBSERVE_ATTACHED_PROPS_BLOCK: Final = """
-**肢体上的附属物 / 手持物（极易漏检，必须单独看）**
+**Attached / held objects on limbs (easily missed ? inspect separately)**
 -----------------------------------
-红色若覆盖手臂、手掌、躯干侧面，**不要只写笼统肢体名就结束**：
-Step A. 沿肢体走向找：掌心、指间、前臂末端、肩扛/腋下位置有没有**另一簇**更细长的红点？
-Step B. 若看见与肢体形态不同的突出几何（枪管、棍体、瓶身、刀刃、包袋、头盔…），**必须单独列一项**，
-     用形状命名（如「手持长条形物件」「肩上扛着的棍状物」），**禁止**只写「右臂」了事。
-Step C. 若肢体与物件点云粘成一片、实在分不清边界，写复合项：
-     「右臂及手持物件」「躯干连肩扛物体」——**不要**因此省略物件。
+If red covers arm, palm, or torso side, **do not stop at a vague limb name**:
+Step A. Along the limb: palm, fingers, forearm end, shoulder/under-arm ? any **separate cluster** of finer red points?
+Step B. If you see protruding geometry unlike the limb (barrel, rod, bottle, blade, bag, helmet?), **list it separately**,
+     named by shape (e.g. "held elongated object", "rod on shoulder") ? **forbidden** to write only "right arm".
+Step C. If limb and object points merge and boundaries are unclear, use compound items:
+     "right arm and held object", "torso with shoulder-carried object" ? **do not omit the object**.
 """
-
-
 
 OBSERVE_USER_TEMPLATE = """{render_guide}
 {attached_props_block}
@@ -186,159 +202,184 @@ OBSERVE_USER_TEMPLATE = """{render_guide}
 {judgment_overview}
 
 ==================================
-阶段 1 任务：纯观察（本阶段**不要**出现任何用户语义）
+Stage 1 task: pure observation (**no user semantic in this stage**)
 ==================================
 
-请**逐视角**检查 12 张图，把红色高亮**实际**覆盖到的部位/部件精简列出。
+**Check every view** in the {n_views}-panel image; list parts/regions **actually** covered by red highlight.
 
-**怎么观察（必须按顺序做）**
+**How to observe (mandatory order)**
 -----------------------------------
-Step 1. 从左到右、从上到下扫完 12 个视角；每个视角单独记下「这里有没有鲜艳红/橙」。
-Step 2. 把所有视角里出现红色的位置**合并**成一份部位清单（同一部位多视角只列一次）。
-Step 3. 对每个列出的部位，问自己：「我能在**某一张**图里指着红色说就在这里吗？」
-        - 不能指着说 → **删掉**该项。
-Step 4. 写 `dominant_region`：红色主要集中在模型哪里（一句话）。
+Step 1. Scan all {n_views} views left-to-right, top-to-bottom; note per view "is there bright red/orange here?"
+Step 2. **Merge** all red locations across views into one part list (each part once).
+Step 3. For each listed part, ask: "Can I point to red on **one specific** panel?" ? if not ? **remove** it.
+Step 4. Write `dominant_region`: where red concentrates on the model (one sentence).
 
-观察纪律（违反即视为错误）
+Observation discipline (violations are errors)
 -----------------------------------
-1. **真实分块的红色通常只在 1~3 个相邻部位**。列出 4 项以上时，先删掉不确定的。
-2. **只列鲜艳红/橙色**；淡灰、白、米色**不算**红色。
-3. 红色只擦过边缘、没有明显覆盖 → **不算**覆盖该部位。
-4. 颗粒度参考（按模型类型选用，勿生搬硬套）：
-   - 人形/动物：头/脸/颈/胸/背/腰/上臂/前臂/手/大腿/小腿/脚 …
-   - 道具/机械：枪管/握把/扳机/弹匣/轮/翼/底座 …（用你**在图上看到的**形状命名）
-5. 若**所有视角都没有**鲜艳红色 → `covered_parts` = []，在 notes 里说明。
+1. **Real blocks usually have red on only 1~3 adjacent parts**. If you list 4+, delete uncertain items first.
+2. **Only bright red/orange**; light gray, white, beige **do not count** as red.
+3. Red barely grazes an edge without clear coverage ? **does not count**.
+4. Granularity guide (adapt to model type):
+   - Humanoid/animal: head/face/neck/chest/back/waist/upper arm/forearm/hand/thigh/calf/foot ?
+   - Props/mechanical: barrel/grip/trigger/magazine/wheel/wing/base ? (name shapes **you see**)
+5. If **no view** has bright red ? `covered_parts` = [], explain in notes.
 
-输出格式（极简）
+Output format (minimal)
 -----------------------------------
 {{
-  "covered_parts": ["1~3 项；多于 3 项先自查删项"],
-  "dominant_region": "例如 '集中在枪管中段'、'分布于双腿前侧'、'只在腰部窄环'",
-  "notes": "可选：补充观察细节"
+  "covered_parts": ["1~3 items; if >3, self-check and delete"],
+  "dominant_region": "e.g. 'concentrated on mid-barrel', 'front of both legs', 'narrow ring at waist'",
+  "notes": "optional observation details"
 }}
 """
 
-
-OBSERVE_USER_PROMPT = """这是同一个 3D 物体的 12 个视角拼接渲染。
-图中每个视角里只有**一个**分块被涂成**鲜艳红/橙色**，其他几何全部是淡灰色。
+OBSERVE_USER_PROMPT = """This is a 12-view collage of the same 3D object.
+In each view only **one** block is **bright red/orange**; all other geometry is light gray.
 {context_block}
-请逐视角看一遍，把红色**实际**覆盖到的物体部件**精简地**列出来。
+Check every view and **concisely** list parts **actually** covered by red.
 
-观察纪律（违反即视为错误）
+Observation discipline (violations are errors)
 -----------------------------------
-1. **真实分块的红色通常只在 1~3 个相邻部件**。例如「外壳 + 顶盖」、「底座 + 支架」、「同一根细长杆的相邻两段」。
-   如果你列出了 4 个以上的部件，先停下来——**几乎一定**有部件你其实没看到红色，
-   只是被自己想象进去了。**回去删掉那些不确定的**。
-2. **只列你能在某张图里直接指出"这块红色在这里"的部件**。
-   - 淡灰、白色、米色都**不算**红色。
-   - 部件看起来是灰色但你"觉得它应该被涵盖" → **不能**列入。
-   - 红色"路过"某个部件的边缘但没明显覆盖 → 不算。
-3. 不知道用户在做什么任务，**不要**预先脑补"它应该是哪个部件"，
-   也不要为了让答案"显得严谨"而多写几个部件。
-4. 颗粒度参考（**禁止**用左/右/前/后/上/下等方位词）：用简洁名词描述部件
-   （如 底座 / 支架 / 面板 / 把手 / 轮子 / 刀刃 / 管道 / 外壳 / 顶盖 / 腿 / 座面 / 靠背 等；
-   若上面给了候选部件清单，优先从中选用）。成对对称部件只写一次统称（如「腿」不写「左腿」）。
-5. 如果整张图**完全没有**鲜艳红色，`covered_parts` 写 `[]`，并在 notes 里说明。
+1. **Real blocks usually cover only 1~3 adjacent parts**. E.g. "shell + top cover", "base + stand", "two adjacent segments of one rod".
+   If you list 4+ parts, pause ? you **almost certainly** imagined some. **Remove uncertain items**.
+2. **List only parts where you can point to red on a specific panel**.
+   - Light gray, white, beige **are not** red.
+   - Gray part you "think should be included" ? **cannot** list.
+   - Red passes edge of a part without clear coverage ? does not count.
+3. You do not know the user's task ? **do not** pre-guess which part it "should be",
+   or add extra parts to seem thorough.
+4. Granularity (**forbidden** left/right/front/back/up/down): use concise nouns
+   (base / stand / panel / handle / wheel / blade / pipe / shell / top cover / leg / seat / backrest, etc.;
+   prefer candidate list if provided). Symmetric pairs: one generic name (e.g. "leg" not "left leg").
+5. If **no bright red anywhere**, `covered_parts` = [] and explain in notes.
 
-输出格式（极简）
+Output format (minimal)
 -----------------------------------
 {
-  "covered_parts": ["1~3 项；多于 3 项一定是错的，自己先删"],
-  "dominant_region": "用一句话说明红色集中在物体哪个部位：例如 '集中在底座 + 支架'、'分布于整个外壳'、'只在一圈窄边'",
-  "notes": "可选：补充任何观察细节"
+  "covered_parts": ["1~3 items; >3 is wrong ? delete first"],
+  "dominant_region": "One sentence where red concentrates, e.g. 'base + stand', 'whole shell', 'narrow edge ring'",
+  "notes": "optional details"
 }
 """
 
-
-# 第 2 阶段「纯逻辑」——只用文字，不带图，决定 full / partial / none
 REASON_SYSTEM_PROMPT = (
-    "你是一个语义分类器。你不会看到任何图片。"
-    "用户会告诉你：(1) 视觉观察员之前列出的 covered_parts（红色覆盖的物体部件）；"
-    "(2) 用户要找的语义。你只需要按规则做集合比较并输出 JSON。"
+    "You are a semantic classifier. You will not see any image. "
+    "The user provides: (1) covered_parts from the visual observer (parts covered by red);"
+    "(2) the target semantic. Apply set-comparison rules and output JSON only."
 )
 
 REASON_USER_TEMPLATE_POINTCLOUD = """{judgment_overview}
 {force_terminate_note}
 {prop_semantic_note}
+{memory_block}
 ==================================
-阶段 2 任务：纯逻辑推理（**无图**，只看文字）
+Stage 2 task: pure logic (**no image**, text only)
 ==================================
 
-阶段 1 观察结果：
+Stage 1 observation:
   covered_parts = {covered_parts_json}
   dominant_region = {dominant_region_json}
 
-用户要找的语义：「{semantic}」
+Target semantic: ?{semantic}?
 
-**推理步骤（必须按顺序执行，并把中间结果写入 JSON 字段）**
+**Reasoning steps (mandatory order; write intermediate results to JSON fields)**
 -----------------------------------
-Step 1 → 填 `semantic_parts`：
-  想清楚「{semantic}」在这个模型上对应哪些部位（通常 1~3 项）。
-  - 人形例：语义=「头发」→ ["头顶发型"]；语义=「腰带」→ ["腰部一圈条带"]
-  - 道具例：语义=「水枪」→ ["枪身/枪管整体"] 或更细的 ["握把","枪管"]（按 covered_parts 粒度对齐）
-  - **包容性补全**：covered=["头部整体"]、语义=「头发」→ semantic_parts 仍应写出头发（视作头部整体里包含头发）
-  - covered 与语义区域**完全无关**时（如语义=「头发」，covered=["小腿"]）→ semantic_parts = []
+Step 0 ? Parse the target semantic into a boundary contract:
+  Before comparing with covered_parts, extract:
+  - `target_model`: what object/model category is implied (airplane, chair, guitar, etc.; "unknown" if absent).
+  - `target_location`: where on that model the requested region is located (front/rear/top/underside/left/right,
+    attachment area, around a joint, etc.; "unknown" if absent).
+  - `included_semantics`: structures at that location that are INCLUDED in ?{semantic}?.
+  - `excluded_neighbors`: nearby / attached / visually connected structures at the same location that are NOT included.
 
-Step 2 → 填 `extra_parts`（**只计真正越界的部位，子部件不算 extra**）：
-  extra_parts = covered_parts 里**落在语义范围之外**的部位。
-  
-  ⚠️ **语义包含 / 子部件规则（极重要，违反会导致无意义再切分）**：
-  - 用户语义往往是**粗粒度**总称；covered 里更细的子部位若常识上**属于**该语义，**必须并入语义，不能写进 extra**。
-  - 语义=「头部」：耳朵、面部、额头、颅顶、后脑、下巴、鼻子、眼睛、嘴巴、脸颊、头发、发型
-    **都是头部的一部分** → extra 必须为 []（即使观察员分开写了「头部」「耳朵」）
-  - 语义=「面部」：眼睛、鼻子、嘴巴、额头、脸颊、下巴 **属于面部** → 不算 extra
-  - 语义=「头发」：头顶尖发、后脑发束属于头发；**面部、耳朵、颈部不属于头发** → 可算 extra
-  - 语义=「水枪」：枪管、握把、扳机、弹匣 **都属于水枪** → 彼此不算 extra
-  - 语义=「腰带」：腰部条带是语义；腹部、后背、腿部 **越界** → 算 extra
-  
-  **只有** covered 里出现了语义**范围外**的独立大部件，才填 extra 并判 partial。
-  例：语义=「头部」，covered=["头部","耳朵"] → extra=[] → **full**（不是 partial）
-  例：语义=「头部」，covered=["头部","颈部","胸前"] → extra=["颈部","胸前"] → partial
-  例：语义=「头发」，covered=["头发","面部"] → extra=["面部"] → partial
+  **Location is not semantics**: if target says "engine at rear of airplane, excluding fuselage/tail",
+  then red on the rear fuselage or tail is **extra**, not semantic, even though it is at the same location.
+  Conversely, if target says "airplane body/fuselage", wings/engines/wheels attached to the body are usually extra.
 
-  笼统部位要拆开时：covered=["头部整体"]、语义=「头发」→ extra 写「头部除头发外区域」
+  **Use explicit include/exclude words in the semantic if present**:
+  - "including / include / belongs to / target" → included_semantics.
+  - "excluding / exclude / not / without / nearby" → excluded_neighbors.
+  These exclusions are hard constraints unless covered_parts clearly refer only to the included region.
 
-Step 3 → 填 `missing_overlap`：
-  covered 与语义区域完全无交集 → true；否则 false
-  
-  ⚠️ **手持 / 佩戴 / 独立道具类语义**（枪、剑、棍、瓶、包、帽、工具…）：
-  - 观察员只写了「躯干」「手臂」等肢体、**没写出道具名**，不代表一定无关！
-  - 道具常**嵌在**手臂/手掌/肩扛区域的红点里；只要 covered 含 **手/臂/掌/指/腕** 或
-    dominant_region 暗示「伸出、持握、肩扛、末端有物」→ **missing_overlap 必须为 false**，
-    semantic_parts 写「{semantic}（可能嵌在肢体覆盖区内，待切分）」→ label 倾向 **partial**
-  - 只有 covered **全是**与道具无关的远端肢体（如语义=「水枪」但红色只在「左脚/尾巴」）才可 true
-  例：语义=「水枪」，covered=["躯干","右臂"] → **不可判 none**；missing_overlap=false，partial
-  例：语义=「水枪」，covered=["手持长条物件","右臂"] → missing_overlap=false，partial 或 full
-  例：语义=「水枪」，covered=["左小腿"] → missing_overlap=true，none
+Step 1 ? `semantic_parts`:
+  Decide which parts on this model correspond to ?{semantic}? (usually 1~3 items).
+  - Humanoid: semantic="hair" ? ["scalp hairstyle"]; semantic="belt" ? ["waist band"]
+  - Prop: semantic="water gun" ? ["gun body/barrel"] or finer ["grip","barrel"] (match covered_parts granularity)
+  - **Inclusive completion**: covered=["head overall"], semantic="hair" ? semantic_parts still lists hair (hair within head)
+  - When covered is **unrelated** to semantic region (semantic="hair", covered=["calf"]) ? semantic_parts = []
 
-Step 4 → 估 `semantic_area_ratio`（0~1，红色里语义占多大比例）：
-  几乎全是语义 → ≥0.85；一半一半 → ≈0.5；绝大部分是 extra → ≤0.2
-  **诚实估**：脸大头发小，比例就要小
+Step 2 ? `extra_parts` (**only truly out-of-scope parts; sub-parts are NOT extra**):
+  extra_parts = items in covered_parts **outside** semantic scope.
 
-Step 5 → 填 `dominant_side`（由 ratio 推导）：
-  ratio ≥ 0.7 → "semantic"；ratio ≤ 0.3 → "extra"；中间 → "balanced"
+  **Semantic inclusion / sub-part rule (critical ? violations cause useless re-splits)**:
+  - User semantics are often **coarse**; finer sub-parts that **belong to** the semantic must merge in, **not** go to extra.
+  - semantic="head": ears, face, forehead, skull, chin, nose, eyes, mouth, cheeks, hair
+    **are part of head** ? extra must be [] (even if observer listed "head" and "ears" separately)
+  - semantic="face": eyes, nose, mouth, forehead, cheeks, chin **belong to face** ? not extra
+  - semantic="hair": scalp/back hair belongs; **face, ears, neck do not** ? may be extra
+  - semantic="water gun": barrel, grip, trigger, magazine **all belong to water gun** ? not extra to each other
+  - semantic="belt": waist band is semantic; abdomen, back, legs **overflow** ? extra
+  - semantic="airplane engine / engine nacelle": engine nacelle/intake/exhaust **belong**;
+    fuselage/body/tail/wing/wheel **do not** unless explicitly included
+  - semantic="airplane body / fuselage": fuselage/body **belong**;
+    engine/wheel/wing/tail stabilizer **do not** unless explicitly included
 
-Step 6 → 填 `label`（决定要不要继续切）：
-  ┌─ covered 为空 ────────────────────────────→ "none"
-  ├─ missing_overlap=true（确与语义完全无关）──→ "none"
-  ├─ extra_parts 非空（语义外大部件或肢体混道具）→ "partial"
-  └─ extra 为空 且 covered 与语义有交集 ──────→ "full"
+  **Only** when covered has **independent major parts outside** semantic scope, fill extra and assign partial.
+  Ex: semantic="head", covered=["head","ears"] ? extra=[] ? **full**
+  Ex: semantic="head", covered=["head","neck","chest"] ? extra=["neck","chest"] ? partial
+  Ex: semantic="hair", covered=["hair","face"] ? extra=["face"] ? partial
+  Ex: semantic="rear airplane engine excluding fuselage/tail", covered=["rear fuselage","tail"] ?
+      extra=["rear fuselage","tail"], missing_overlap=true or partial only if engine is also covered
+  Ex: semantic="airplane body/fuselage", covered=["body","engine nacelle"] ?
+      semantic_parts=["body/fuselage"], extra=["engine nacelle"], label="partial"
 
-  **不要**因为观察员把同一语义拆成多个子部位名（头+耳、枪管+握把）就判 partial——
-  子部位已全部落在语义范围内时，应直接 **full**，避免无意义再切分。
+  When coarse part must split: covered=["head overall"], semantic="hair" ? extra as "head region excluding hair"
 
-Step 7 → 填 `committed_if_forced`（**严**，强制收尾时最终承诺，仅 full/none）：
-  dominant_side="semantic" 且 ratio ≥ 0.7 → "full"
-  其它任何情况（extra / balanced / 不确定）→ "none"
-  **宁漏勿滥**：extra 主导的块绝不能承诺 full
+Step 3 ? `missing_overlap`:
+  covered and semantic regions have **no intersection** ? true; else false
 
-**核心原则：子部件归并 + 越界才切**
-- 语义范围内的子部位（耳朵之于头部、握把之于水枪）**不是** extra，应判 **full**
-- 只有红色明显越界到语义外的大部件时，才判 **partial** 触发几何再切
-- committed_if_forced（收尾用）仍偏严：语义占比 ≥0.7 且 extra 为空 → full
+  **Held / worn / independent prop semantics** (gun, sword, rod, bottle, bag, hat, tool?):
+  - Observer listed only "torso"/"arm" **without prop name** ? not necessarily unrelated!
+  - Props often **embed in** arm/palm/shoulder red clusters; if covered includes **hand/arm/palm/finger/wrist**
+    or dominant_region suggests "extended, gripping, shoulder-carry, object at end" ? **missing_overlap must be false**,
+    semantic_parts write ?{semantic} (possibly embedded in limb coverage, pending split)?? label tends **partial**
+  - Only if covered is **entirely** unrelated distal parts (semantic="water gun", covered=["left calf/tail"]) ? true
+  Ex: semantic="water gun", covered=["torso","right arm"] ? **not none**; missing_overlap=false, partial
+  Ex: semantic="water gun", covered=["held elongated object","right arm"] ? missing_overlap=false, partial or full
+  Ex: semantic="water gun", covered=["left calf"] ? missing_overlap=true, none
 
-只能输出如下 JSON（缺字段视为错误）：
+Step 4 ? `semantic_area_ratio` (0~1, share of red that is semantic):
+  Almost all semantic ? ?0.85; half-half ? ?0.5; mostly extra ? ?0.2
+  **Be honest**: large face, small hair ? low ratio
+
+Step 5 ? `dominant_side` (from ratio):
+  ratio ? 0.7 ? "semantic"; ratio ? 0.3 ? "extra"; middle ? "balanced"
+
+Step 6 ? `label` (whether to keep splitting):
+  ?? covered empty ????????????????????????????? "none"
+  ?? missing_overlap=true (truly unrelated)????? "none"
+  ?? extra_parts non-empty (overflow or limb+prop mix) ? "partial"
+  ?? extra empty and covered intersects semantic ?? "full"
+
+  **Do not** assign partial because observer split one semantic into sub-part names (head+ears, barrel+grip) ?
+  when all sub-parts lie in semantic scope, assign **full** to avoid useless re-split.
+
+Step 7 ? `committed_if_forced` (**strict** ? final promise when forced stop, full/none only):
+  dominant_side="semantic" and ratio ? 0.7 ? "full"
+  anything else (extra / balanced / uncertain) ? "none"
+  **Prefer miss over false accept**: extra-dominant blocks must not promise full
+
+**Core principle: merge sub-parts + split only on overflow**
+- Sub-parts within semantic (ears under head, grip under water gun) **are not** extra ? **full**
+- Only when red clearly overflows to major parts outside semantic ? **partial** for geometric re-split
+- committed_if_forced stays strict: ratio ?0.7, extra empty ? full
+
+Output **only** this JSON (missing fields = error):
 {{
+  "target_model": "...",
+  "target_location": "...",
+  "included_semantics": ["..."],
+  "excluded_neighbors": ["..."],
   "semantic_parts": ["..."],
   "extra_parts": ["..."],
   "missing_overlap": true | false,
@@ -347,65 +388,63 @@ Step 7 → 填 `committed_if_forced`（**严**，强制收尾时最终承诺，�
   "label": "full" | "partial" | "none",
   "committed_if_forced": "full" | "none",
   "confidence": 0.0~1.0,
-  "reason": "一句中文：红色覆盖了什么、语义占比多少、为何给这个 label/committed_if_forced"
+  "reason": "One English sentence: what red covered, semantic share, why this label/committed_if_forced"
 }}
 """
 
-
-REASON_USER_TEMPLATE = """前面的视觉观察员已经把"红色高亮覆盖的物体部件"列出来：
+REASON_USER_TEMPLATE = """The visual observer listed parts covered by red highlight:
 covered_parts = {covered_parts_json}
 {context_block}
-用户要找的语义：「{semantic}」
+Target semantic: ?{semantic}?
 
-请按顺序推理，并把结果填到 JSON。
+Reason in order and fill JSON.
 
-**核心规则：宽进 + 严判**
-- 分类阶段（label）**宽**：只要 covered_parts 中**含有或可能包含**语义所在区域，就允许判 partial，
-  让 pipeline 继续切，把语义切干净。
-- 占比 / 强制承诺阶段（dominant_side / committed_if_forced）**严**：
-  把握不到主导是语义就承诺 "none"，避免把"以底座为主、夹一点支架"的块在收尾时被错认为「支架」。
+**Core rule: lenient label + strict commitment**
+- Classification (label) **lenient**: if covered_parts **contains or may contain** the semantic region, allow partial
+  so the pipeline can keep splitting until clean.
+- Share / forced commitment (dominant_side / committed_if_forced) **strict**:
+  if unsure semantic dominates, promise "none" ? avoid accepting a base-heavy block with a sliver of stand as "stand" at forced stop.
 
 -----------------------------------
-1. **想清楚「{semantic}」在该物体上对应哪些部件**（通常 1~3 项），填 `semantic_parts`。
-   - 优先写**纯净的语义部件**：例如语义=「轮子」→ "轮子 / 轮胎 / 脚轮"；
-     语义=「把手」→ "把手 / 手柄"。
-   - **包容性补全**：如果 covered_parts 里只有**包含语义的笼统部件**而没有明确分出语义，
-     依然要把语义部件写进 semantic_parts（视作 covered_parts 隐含包括它）。例如：
-     语义=「轮子」，covered_parts = ["底盘整体"] → semantic_parts = ["轮子（包在底盘整体里）"]，
-     不要因为没单独写出"轮子"就把 semantic_parts 留空判 none。
-   - 但是：covered_parts 跟语义所在区域**完全无关**时（如语义=「轮子」，covered_parts=["顶盖","面板"]），
-     semantic_parts 必须留空。
+1. **Decide which parts correspond to ?{semantic}?** on this object (usually 1~3), fill `semantic_parts`.
+   - Prefer **pure semantic parts**: semantic="wheel" ? "wheel / tire / caster";
+     semantic="handle" ? "handle / grip".
+   - **Inclusive completion**: if covered_parts only has a **coarse part containing** the semantic without separating it,
+     still write semantic_parts (treat as implicit). E.g. semantic="wheel", covered=["chassis overall"]
+     ? semantic_parts = ["wheel (within chassis overall)"], do not leave empty and assign none.
+   - But: when covered_parts is **completely unrelated** (semantic="wheel", covered=["top cover","panel"]),
+     semantic_parts must be empty.
 
-2. **`extra_parts`**：covered_parts 减去 semantic_parts 之后剩下的部件。
-   - 把诸如 "外壳 / 底座 / 支架 / 面板 / 顶盖..." 这类**近邻但不属于语义**的部件老实写进去。
-   - 笼统部件（如"底盘整体"）拆开后，**语义以外的那部分**也要算 extra（写成"底盘除轮子外区域"等）。
+2. **`extra_parts`**: covered_parts minus semantic_parts.
+   - List neighboring non-semantic parts honestly (shell / base / stand / panel / top cover?).
+   - For coarse parts ("chassis overall"), the **non-semantic portion** counts as extra ("chassis excluding wheels", etc.).
 
-3. **`missing_overlap`**：covered_parts 跟语义所在区域是否**完全无关**。
-   - 完全无关 → true（→ label=none）
-   - 哪怕只是"covered_parts 笼统部位里包含语义" → false
+3. **`missing_overlap`**: are covered_parts **completely unrelated** to semantic region?
+   - Completely unrelated ? true (? label=none)
+   - Even "coarse part implicitly contains semantic" ? false
 
-4. **粗估"语义部分占整片红色面积"的占比**，填 `semantic_area_ratio`（0.0~1.0 浮点）。
-   - 红色基本全是语义部位（如只覆盖一团头发）          → ≥ 0.85
-   - 红色一半是语义、一半是非语义                       → ≈ 0.5
-   - 红色绝大部分是 extra（如整张脸+颈，仅头顶一点头发）→ ≤ 0.2
-   - **占比要诚实：脸大头发小，比例就要小**，不要因为"想留下这个块"而虚高。
+4. **Rough share of red that is semantic**, fill `semantic_area_ratio` (0.0~1.0 float).
+   - Red almost all semantic (e.g. only hair cluster)          ? ? 0.85
+   - Half semantic, half non-semantic                         ? ? 0.5
+   - Red mostly extra (full face+neck, tiny hair on top)      ? ? 0.2
+   - **Be honest on ratio** ? do not inflate to keep the block.
 
-5. **`dominant_side`**：
-   - semantic_area_ratio ≥ 0.7 → "semantic"
-   - semantic_area_ratio ≤ 0.3 → "extra"
-   - 介于其间                  → "balanced"
+5. **`dominant_side`**:
+   - semantic_area_ratio ? 0.7 ? "semantic"
+   - semantic_area_ratio ? 0.3 ? "extra"
+   - in between              ? "balanced"
 
-6. **`label`（用于 pipeline 继续迭代的判定，**宽**）**：
-   - covered_parts 为空 或 missing_overlap=true                   → "none"
-   - extra_parts 非空                                              → "partial"
-   - extra_parts 为空 且 semantic_parts 非空                       → "full"
+6. **`label` (pipeline iteration, **lenient**)**:
+   - covered_parts empty or missing_overlap=true                   ? "none"
+   - extra_parts non-empty                                          ? "partial"
+   - extra_parts empty and semantic_parts non-empty                 ? "full"
 
-7. **`committed_if_forced`（强制收尾时的最终承诺，**严**）**：
-   - dominant_side = "semantic" 且 semantic_area_ratio ≥ 0.7 → "full"
-   - 其它任何情况（extra / balanced / 不确定）              → "none"
-   - **宁愿漏掉一个 balanced 块，也绝不能让 extra-dominant 的块溜进最终掩码。**
+7. **`committed_if_forced` (forced final promise, **strict**)**:
+   - dominant_side = "semantic" and semantic_area_ratio ? 0.7 ? "full"
+   - any other case (extra / balanced / uncertain)              ? "none"
+   - **Prefer dropping a balanced block over letting extra-dominant into final mask.**
 
-只能输出如下 JSON（缺字段视为错误）：
+Output **only** this JSON (missing fields = error):
 {{
   "semantic_parts": ["..."],
   "extra_parts": ["..."],
@@ -415,253 +454,340 @@ covered_parts = {covered_parts_json}
   "label": "full" | "partial" | "none",
   "committed_if_forced": "full" | "none",
   "confidence": 0.0~1.0,
-  "reason": "用一句中文总结：覆盖到了什么、语义占比大概多少、为什么 label/committed_if_forced 给这个值。"
+  "reason": "One English sentence: coverage, semantic share, why label/committed_if_forced."
 }}
 """
 
-CLASSIFY_USER_TEMPLATE = """用户给定的语义区域：
-「{semantic}」
+CLASSIFY_USER_TEMPLATE = """User-specified semantic region:
+?{semantic}?
 
 ==================================
-任务：判断**红色高亮分块**相对于「{semantic}」是 full / partial / none。
+Task: classify the **red-highlighted block** vs ?{semantic}? as full / partial / none.
 ==================================
 
-⚠️ 重要观察纪律（必须严格遵守）
+Important observation discipline (**mandatory**)
 -----------------------------------
-1. 不要"扫一眼某个视角就下结论"。你必须**逐张图**检查红色覆盖区域。
-2. 如果不同视角下红色出现在身体的不同部位（比如一视角红在头顶 + 胸口，另一视角红在腰部），
-   这些**全部**都算高亮分块的一部分，**不能只挑一处**作答。
-3. 高亮往往会跨越多个解剖部位（例如同时覆盖「头发 + 面部 + 躯干」）——
-   这种情况几乎一定是 partial。
-4. 你天生有"确认偏差"倾向：看到红色就想说"是的就是用户问的语义"。**对抗这种倾向**：
-   先把红色覆盖到的部位**全部列出来**，再和「{semantic}」对照。
+1. Do not conclude from one glance ? **check every panel**.
+2. If red appears on different body regions in different views (e.g. crown + chest in one, waist in another),
+   **all** count as part of the highlighted block ? **do not pick one**.
+3. Highlight often spans multiple anatomical parts (hair + face + torso) ? usually **partial**.
+4. You have confirmation bias: seeing red makes you say "yes, that's the semantic". **Counter it**:
+   **list all parts red covers first**, then compare to ?{semantic}?.
 
-判定标准
+Criteria
 -----------------------------------
-- "full"：红色覆盖的每一处部位都属于「{semantic}」。允许只覆盖语义的一小段，
-  但**不能多出任何一寸**不属于语义的几何。
-  例：语义=「面部」，红色仅覆盖「眼睛」 → full。
-- "partial"：红色与「{semantic}」有交集，但**同时还覆盖了明显不属于语义的部位**
-  （不论是相邻部位还是远端零件——脸 / 颈 / 胸 / 背 / 腰 / 腹 / 臂 / 前臂 / 手 / 大腿 / 小腿 / 脚 等）。
-  例：语义=「头发」，红色覆盖「头发 + 面部 + 胸前条带」 → partial。
-  例：语义=「腰带」，红色覆盖「腰带 + 鞋子 + 腕带」 → partial。
-- "none"：红色与「{semantic}」完全没有交集。
-  例：语义=「面部」，红色覆盖「腿部」 → none。
+- "full": every part touched by red belongs to ?{semantic}?. May cover only a sub-region of the semantic,
+  but **no geometry outside** the semantic.
+  Ex: semantic="face", red only on "eyes" ? full.
+- "partial": red intersects ?{semantic}? but **also clearly covers non-semantic parts**
+  (adjacent or distant ? face/neck/chest/back/waist/abdomen/arm/forearm/hand/thigh/calf/foot, etc.).
+  Ex: semantic="hair", red on "hair + face + chest band" ? partial.
+  Ex: semantic="belt", red on "belt + shoes + wristband" ? partial.
+- "none": red has **no intersection** with ?{semantic}?.
+  Ex: semantic="face", red on "legs" ? none.
 
-输出格式（必须包含全部字段，按顺序填写）
+Output format (all fields required, in order)
 -----------------------------------
 {{
   "covered_parts": [
-    "用中文列出红色覆盖到的所有部位，每个部位单独一项；",
-    "颗粒度示例：'头顶尖发'、'整张脸'、'颈部'、'胸前竖条带'、'上臂'、'腰部一圈'、'双脚鞋面'（禁止方位词）。",
-    "若某视角下红色仅是上一项部位的同一区域换角度，不重复列。"
+    "List every part covered by red, one item each;",
+    "Granularity e.g. 'crown hair', 'full face', 'neck', 'chest vertical strip', 'upper arm', 'waist ring', 'both shoe tops' (no directional words).",
+    "Do not duplicate the same region seen from another angle."
   ],
   "semantic_parts": [
-    "用中文列出 '{semantic}' 在该角色身上对应的部位（通常 1~3 项）。",
-    "例：语义='头发' → ['头顶发型']；语义='腰带' → ['腰部一圈细条带']。"
+    "List parts on this character corresponding to '{semantic}' (usually 1~3).",
+    "Ex: semantic='hair' ? ['scalp hairstyle']; semantic='belt' ? ['waist narrow band']."
   ],
   "extra_parts": [
-    "covered_parts 减去 semantic_parts 之后剩下的部位，即'红色多出来不属于语义的部分'。",
-    "如果空，写 []；只要非空，label 必须是 partial 或 none。"
+    "covered_parts minus semantic_parts ? red outside semantic.",
+    "If empty, []; if non-empty, label must be partial or none."
   ],
-  "missing_overlap": "true / false 字符串：若 covered_parts 与 semantic_parts 完全无交集为 true，否则 false",
+  "missing_overlap": "true / false string: true if covered_parts and semantic_parts have no intersection",
   "label": "full | partial | none",
   "confidence": 0.0~1.0,
-  "reason": "用一句中文总结：具体红色覆盖到了什么，为什么得到这个 label。"
+  "reason": "One English sentence: what red covered and why this label."
 }}
 
-label 决策表（**严格按此推导，不要凭感觉**）
+Label decision table (**derive strictly, not by feel**)
 -----------------------------------
-- extra_parts 为空 且 missing_overlap=false → "full"
-- extra_parts 非空 且 missing_overlap=false → "partial"
-- missing_overlap=true                       → "none"
+- extra_parts empty and missing_overlap=false ? "full"
+- extra_parts non-empty and missing_overlap=false ? "partial"
+- missing_overlap=true                       ? "none"
 
-切记：宁可保守判 partial 触发再分裂，也不要乐观判 full。
+Prefer conservative partial to trigger re-split over optimistic full.
 """
 
-
 SEED_SYSTEM_PROMPT = (
-    "你是一个 3D 模型语义分析助手。"
-    "用户给你 12 个视角拼接的渲染图 + 上一轮分类得到的 covered_parts / extra_parts，"
-    "当前红色分块只『局部符合』用户语义，需要再切成若干子块继续判断。"
-    "你的 seed_count 与 strategy 必须保证切分后**不丢失任何已观察到的部位**（避免昂贵重选）。"
-    "请严格按 JSON 格式回答。"
+    "You are a 3D model semantic analysis assistant. "
+    "You receive a 12-view collage plus prior covered_parts / extra_parts from classification. " "The red block only **partially** matches the user semantic and must be split into sub-blocks. "
+    "Your seed_count and strategy must ensure **no observed part is lost after split** (avoid expensive re-selection). " "Reply in strict JSON only."
 )
 
-SEED_USER_TEMPLATE = """用户给定的语义区域：「{semantic}」
+SEED_USER_TEMPLATE = """User semantic region: ?{semantic}?
 
-上一轮分类已经得到的结构化信息（请优先采信，不要凭图片再臆测）：
-- covered_parts（红色覆盖的所有部位）= {covered_parts_json}
-- semantic_parts（其中真正属于「{semantic}」的部位）= {semantic_parts_json}
-- extra_parts（红色多出来不属于语义的部位）= {extra_parts_json}
-- 当前块面数 ≈ {block_faces}
+Structured info from prior classification (**trust this, do not re-guess from image**):
+- covered_parts (all parts red covers) = {covered_parts_json}
+- semantic_parts (subset belonging to ?{semantic}?) = {semantic_parts_json}
+- extra_parts (red outside semantic) = {extra_parts_json}
+- current block face count ? {block_faces}
 
-任务：估计要把它**切成几个子块**，才能让其中**至少一个子块只覆盖 semantic_parts**，
-其它子块只覆盖 extra_parts。
+Task: estimate **how many sub-blocks** to cut so **at least one sub-block covers only semantic_parts**
+and others cover extra_parts.
 
-开放语义纪律（必须遵守）
+Open-vocabulary discipline (**mandatory**)
 -----------------------------------
-- covered_parts / semantic_parts / extra_parts 是**上一阶段 VLM 开放观察**的结果，
-  可能包含任意中文短名（道具零件、动物部位、机械组件等），**不要**套固定人体模板。
-- seed_count 与 strategy 都应服务于「把这些**实际观察到**的部位拆开」，而不是凭常识臆测。
-- 若观察列了 N 个不同部位，seed_count 通常 ≥ N（可在 N~N+1 之间，上限 {max_seeds}）。
-  例：covered_parts=[椅背竖条, 椅面, 椅腿] → seed_count=3 或 4。
-- extra_parts 非空时，往往要多 1 刀把语义与多余区域分开。
+- covered_parts / semantic_parts / extra_parts come from **prior open observation** ?
+  may be any short names (prop parts, animal parts, mechanical components); **do not** force a human template.
+- seed_count and strategy serve **splitting observed parts**, not guessing from priors.
+- If N distinct parts were observed, seed_count usually ? N (between N and N+1, max {max_seeds}).
+  Ex: covered_parts=[chair back slats, seat, leg] ? seed_count=3 or 4.
+- When extra_parts non-empty, often need +1 cut to separate semantic from excess.
 
 {semantic_coverage_discipline}
 
-同时选择几何分块策略（strategy）与 params：
-- 根据**当前块的开放语义描述**与**面数规模 block_faces** 综合选策略，不是一律 geodesic_fps。
-- graph_cut：观察部位被细缝/折线/凹槽分开（凹陷明显时首选，lambda_concave≥0.8）；
-  spectral：多个远距离部位粘在同块（默认首选）；选 spectral 时须给出 geodesic_weight /
-  curvature_weight / concavity_weight（**默认就偏向凹度 concavity_weight=0.70；凹槽/接缝明显时再上调到 0.75~0.85**）；
-  skeleton：树状/肢类骨架结构，沿中轴分叉切分（大图自动池化）；
-  cvt：需均匀切同等碎片；sdf：描述里强调粗细/厚度差（大图自动减少 num_rays）；
-  geodesic_fps：语义不明或其它策略不适用时的兜底，不是面数大的默认选择。
-- block_faces 很大时：降低 lloyd_iter / num_rays，仍保持语义最匹配的策略。
+Also choose geometric partition strategy and params:
+- Pick strategy from **open semantic description** and **block_faces**, not always geodesic_fps.
+- graph_cut: parts separated by gaps/folds/grooves (preferred when concavity obvious, lambda_concave?0.8);
+  spectral: distant parts stuck together (default first choice); when spectral, provide geodesic_weight /
+  curvature_weight / concavity_weight (**default favors concavity concavity_weight=0.70; raise to 0.75~0.85 when grooves obvious**);
+  skeleton: tree/limb skeleton, split along axis branches (large meshes auto-pool);
+  cvt: equal fragments; sdf: thickness hierarchy in description (large meshes auto-reduce num_rays);
+  geodesic_fps: fallback when semantics unclear, not default for large face count.
+- Large block_faces: lower lloyd_iter / num_rays while keeping best semantic strategy.
 
-参数纪律：下面每个字段都给了默认值；**不确定就沿用默认（可整段省略 params）**，
-只在渲染图/语义明显需要时才覆盖某个参数。覆盖时也要在 reason 里说明依据。
+Parameter discipline: defaults below; **when unsure keep defaults (params may be omitted entirely)**,
+override only when render/semantics clearly require it, and explain in reason.
 
-只能返回如下 JSON：
+Return **only** this JSON:
 {{
-  "seed_count": <int, 最少 2，最多 {max_seeds}>,
+  "seed_count": <int, min 2, max {max_seeds}>,
   "strategy": "graph_cut" | "spectral" | "cvt" | "sdf" | "skeleton" | "geodesic_fps",
-  "reason": "中文简述：为什么这个 seed_count 和 strategy；逐项说明各 matched/covered 部位切分后如何落到不同子块",
+  "reason": "English brief: why this seed_count and strategy; map each matched/covered part to expected child",
   "params": {{
-    "lambda_smooth": <float, graph_cut, 0.1~3.0, 默认 1.0>,
-    "lambda_concave": <float, graph_cut, 0.0~2.0, 凹陷明显时≥0.8, 默认 0.85>,
-    "geodesic_weight": <float, spectral, 0.05~0.80, 默认 0.20>,
-    "curvature_weight": <float, spectral, 0.05~0.80, 默认 0.15>,
-    "concavity_weight": <float, spectral, 0.05~0.90, 默认 0.70, 凹陷明显时 0.75~0.85>,
-    "lloyd_iter": <int, cvt/geodesic_fps/skeleton, 2~12, 默认 cvt=4 / 其它=0>,
-    "contraction_iters": <int, skeleton, 2~12, 默认 5>,
-    "graph_vertex_budget": <int, spectral/skeleton/geodesic_fps, 4000~20000, 可选, 默认自动池化>,
-    "num_rays": <int, sdf, 4~24, 默认 8>,
-    "cone_angle_deg": <float, sdf, 15~120, 默认 60>
+    "lambda_smooth": <float, graph_cut, 0.1~3.0, default 1.0>,
+    "lambda_concave": <float, graph_cut, 0.0~2.0, obvious concavity ?0.8, default 0.85>,
+    "geodesic_weight": <float, spectral, 0.05~0.80, default 0.20>,
+    "curvature_weight": <float, spectral, 0.05~0.80, default 0.15>,
+    "concavity_weight": <float, spectral, 0.05~0.90, default 0.70, obvious grooves 0.75~0.85>,
+    "lloyd_iter": <int, cvt/geodesic_fps/skeleton, 2~12, default cvt=4 / others=0>,
+    "contraction_iters": <int, skeleton, 2~12, default 5>,
+    "graph_vertex_budget": <int, spectral/skeleton/geodesic_fps, 4000~20000, optional, default auto-pool>,
+    "num_rays": <int, sdf, 4~24, default 8>,
+    "cone_angle_deg": <float, sdf, 15~120, default 60>
   }}
 }}
-（params 只填所选策略相关字段；不确定就省略，系统会用上面的默认值。）
+(Omit params entirely when unsure; include only fields for chosen strategy.)
 """
 
-
 # ---------------------------------------------------------------------------
-# 分块策略选择：图割 / 谱聚类 / CVT / SDF
+# Split strategy selection: graph_cut / spectral / CVT / SDF / skeleton / geodesic_fps
 # ---------------------------------------------------------------------------
 
 SPLIT_STRATEGY_SYSTEM_PROMPT = (
-    "你是一个 3D 网格分块算法专家。"
-    "用户会给你当前分块的语义上下文、面数规模、matched_parts 与 seed_count，以及可选的渲染图；"
-    "你需要在**语义覆盖完整**（切分后每项语义都能落到独立子块）、**语义适配**与**运行耗时**之间权衡，"
-    "从六种分块策略中选最合适的一种，并给出参数。"
-    "严格按 JSON 格式回答，禁止 Markdown，禁止额外文字。"
+    "You are a 3D mesh partitioning algorithm expert. "
+    "You receive semantic context, face count, matched_parts, seed_count, and optional renders;"
+    "balance **full semantic coverage** (each item lands in its own child), **semantic fit**, and **runtime**. "
+    "Choose one of six strategies and parameters. " "Strict JSON only ? no Markdown, no extra text."
 )
 
-SPLIT_STRATEGY_USER_TEMPLATE = """当前分块需要继续几何细分。
+SPLIT_STRATEGY_USER_TEMPLATE = """This block needs further geometric subdivision.
 
-语义上下文
+Semantic context
 -----------------------------------
-- 任务语义 / 命中部位：{semantic_context}
-- covered_parts（红色覆盖）= {covered_parts_json}
-- semantic_parts（属于语义）= {semantic_parts_json}
-- extra_parts（多出来的部位）= {extra_parts_json}
-- matched_parts（多标签命中，全覆盖模式）= {matched_parts_json}
-- 计划切分块数 seed_count = {seed_count}
-- 当前块面数 ≈ {block_faces}
-- 细分阶段：{split_stage}
-- CLI 策略提示（仅供参考，你有最终裁量权）：{strategy_hint}
+- Task semantic / matched parts: {semantic_context}
+- covered_parts (red coverage) = {covered_parts_json}
+- semantic_parts (belonging to semantic) = {semantic_parts_json}
+- extra_parts (overflow parts) = {extra_parts_json}
+- matched_parts (multi-label hits, full-coverage mode) = {matched_parts_json}
+- Planned seed_count = {seed_count}
+- Current block face count ? {block_faces}
+- Subdivision stage: {split_stage}
+- CLI strategy hint (reference only; you decide): {strategy_hint}
 
-性能与规模（系统会自动优化，勿因面数大而一律选 geodesic_fps）
+Performance and scale (system auto-optimizes; do not default to geodesic_fps for large face count)
 -----------------------------------
-- 测地类策略（spectral / skeleton / geodesic_fps / cvt）在大块上会自动**池化顶点图**
-  （约 8k~12k 图节点），Dijkstra 复杂度可控；已给定 seed_count 时 spectral **不做特征分解**。
-- block_faces < 30_000：优先 **spectral**（语义远距分离质量好）。
-- block_faces 30_000~150_000：按语义选 spectral / skeleton / graph_cut / sdf；系统自动降 lloyd_iter / 射线数。
-- block_faces ≥ 150_000：仍可选 spectral / skeleton，但 params 中 lloyd_iter 建议 2~3；
-  **geodesic_fps 仅作语义不明或前述策略失败时的兜底**，不是默认首选。
-- graph_cut / sdf 射线开销随面数线性涨：超大块时减少 num_rays 或 lloyd_iter，而非换无语义策略。
+- Geodesic strategies (spectral / skeleton / geodesic_fps / cvt) **pool vertex graphs** on large blocks
+  (~8k~12k nodes); Dijkstra cost controlled; with fixed seed_count spectral **skips eigendecomposition**.
+- block_faces < 30_000: prefer **spectral** (good distant-part separation).
+- block_faces 30_000~150_000: pick spectral / skeleton / graph_cut / sdf by semantics; system lowers lloyd_iter / rays.
+- block_faces ? 150_000: spectral / skeleton still OK; lloyd_iter 2~3 in params;
+  **geodesic_fps only as fallback** when semantics unclear or prior strategies fail.
+- graph_cut / sdf ray cost grows linearly with faces: reduce num_rays or lloyd_iter on huge blocks, not swap to non-semantic strategy.
 
-可选分块策略（strategy 字段只能取以下之一）
+Available strategies (strategy field must be one of)
 -----------------------------------
-1. **graph_cut**（图割法）
-   - 适合：边界需沿凹槽/凹谷走、相邻语义被细缝/折线分开（如手指缝、装甲接缝、裙摆褶皱、腋窝、颈根）。
-   - **凹陷明显时首选 graph_cut**，边界会沿凹缝走，切分效果最好。
-   - 参数：lambda_smooth（边界平滑，0.3~2.0，默认 1.0）、
-     lambda_concave（凹缝吸引，0.5~2.0，**默认 0.85**；凹陷明显时 **0.9~1.2**）。
+1. **graph_cut**
+   - Good when boundaries should follow grooves/valleys; adjacent semantics separated by gaps/folds
+     (finger gaps, armor seams, skirt folds, armpit, neck base).
+   - **First choice when concavity is obvious** ? boundary follows concave seams.
+   - Params: lambda_smooth (boundary smoothness, 0.3~2.0, default 1.0),
+     lambda_concave (concavity pull, 0.5~2.0, **default 0.85**; obvious concavity **0.9~1.2**).
 
-2. **spectral**（谱聚类）
-   - 适合：整体拓扑/姿态变化大、需等距不变形切分（如四肢与躯干连接、弯曲肢体、对称重复结构）。
-   - 边权 = 三项能量加权和（系统会自动归一化）：
-     geodesic_weight（测地距离，远距部位分离）、
-     curvature_weight（二面角弯曲，沿一般折线/弯曲处走界）、
-     concavity_weight（凹度/凹槽，关节/接缝/沟槽处走界）。
-   - **默认就以凹度为主导**（concavity_weight=0.70）：沿凹槽/接缝/关节走界的切分质量最好，
-     **凹槽/接缝/沟槽明显**（附图可见凹线、指缝、腹股沟等）→ 再上调 concavity_weight 到 **0.75~0.85**；
-     平滑弯曲、少凹槽 → 提高 curvature_weight；
-     远距肢体粘连 → 提高 geodesic_weight。
-   - 默认：geodesic_weight=0.20, curvature_weight=0.15, concavity_weight=0.70（三项会自动归一化）。
+2. **spectral**
+   - Good for large pose/topology change, quasi-isometric splits (limb-torso joints, bent limbs, repeated symmetry).
+   - Edge weight = weighted sum (auto-normalized):
+     geodesic_weight (geodesic distance, separates distant parts),
+     curvature_weight (dihedral bend, general fold lines),
+     concavity_weight (concavity/grooves at joints/seams).
+   - **Default favors concavity** (concavity_weight=0.70): best along grooves/joints;
+     **obvious grooves/seams** (visible concave lines, finger gaps, groin) ? raise concavity_weight **0.75~0.85**;
+     smooth bends, few grooves ? raise curvature_weight;
+     distant limbs stuck together ? raise geodesic_weight.
+   - Default: geodesic_weight=0.20, curvature_weight=0.15, concavity_weight=0.70.
 
-3. **cvt**（变分质心 Voronoi）
-   - 适合：需要大小均匀、形状紧凑圆润的子块（如均匀切手指、把大块均分成可比碎片）。
-   - 参数：lloyd_iter（Lloyd 迭代次数，2~12，默认 4；系统按面数自动缩放）。
+3. **cvt** (centroidal Voronoi)
+   - Equal-size compact roundish pieces (even finger splits, comparable fragments).
+   - Params: lloyd_iter (2~12, default 4; auto-scaled by face count).
 
-4. **sdf**（形状直径函数）
-   - 适合：有机生物模型按"粗细/厚度"区分肢体（躯干厚、手臂细、手指更细；四足动物的腿 vs 躯干）。
-   - 参数：num_rays（射线数，4~24，默认 8；大块自动减少）、cone_angle_deg（锥角，15~120，默认 60）。
+4. **sdf** (shape diameter function)
+   - Organic models by thickness hierarchy (thick torso vs thin arm vs thinner fingers; quadruped leg vs torso).
+   - Params: num_rays (4~24, default 8; auto-reduced on large blocks), cone_angle_deg (15~120, default 60).
 
-5. **geodesic_fps**（测地 FPS + Voronoi）
-   - 适合：语义混杂难判断、或其它策略失败后的**兜底**；也适合需快速均匀切分的场景。
-   - 参数：lloyd_iter（0~12，默认 0；大块用 2~4 提升均匀度）、graph_vertex_budget（4000~20000，可选，默认自动）。
+5. **geodesic_fps** (geodesic FPS + Voronoi)
+   - Fallback when semantics mixed or other strategies fail; also fast uniform splits.
+   - Params: lloyd_iter (0~12, default 0; 2~4 on large for uniformity), graph_vertex_budget (4000~20000, optional).
 
-6. **skeleton**（Laplacian 收缩骨架 + 测地 Voronoi）
-   - 适合：树状/肢类骨架语义（人形、四足动物、多肢机械），沿中轴/分叉把肢体与躯干分开。
-   - **同样适合把一条细长肢体沿长轴切成多段**（如 大腿/小腿/脚、上臂/前臂/手、脖子/头），
-     即使分段之间**过渡平滑、没有明显凹缝或关节**——切口沿中轴等距、垂直于长轴，
-     比 spectral/graph_cut 在「找不到凹缝」时乱切要稳得多。
-   - **判据**：当前块明显细长（长轴远大于横截面）、且子语义是同一肢体上的纵向分段 → 选 skeleton。
-   - 参数：contraction_iters（2~12，默认 5）、lloyd_iter（0~12，默认 0）、
-     graph_vertex_budget（4000~20000，可选，默认自动）；大图自动池化图。
+6. **skeleton** (Laplacian contraction skeleton + geodesic Voronoi)
+   - Tree/limb skeleton semantics (humanoid, quadruped, multi-limb mech) ? separate limbs from torso along axis/branches.
+   - **Also splits one long limb along its axis into segments** (thigh/calf/foot, upper arm/forearm/hand, neck/head)
+     even when transitions are smooth with no obvious groove ? cuts equidistant along axis, perpendicular to length,
+     more stable than spectral/graph_cut when no concave seam exists.
+   - **Criterion**: block is clearly elongated (major axis >> cross-section) and child semantics are longitudinal segments on same limb ? skeleton.
+   - Params: contraction_iters (2~12, default 5), lloyd_iter (0~12, default 0),
+     graph_vertex_budget (4000~20000, optional); large meshes auto-pool.
 
-开放语义纪律
+Open-vocabulary discipline
 -----------------------------------
-- 输入的 covered_parts / semantic_parts / extra_parts / matched_parts 均为**开放词表**，
-  勿假设一定是人形；按文字描述的几何关系选策略。
-- 多个 matched_parts 名称差异大、像不同组件 → 小中块用 spectral 或 graph_cut；
-  **附图凹陷/接缝明显 → 优先 graph_cut（高 lambda_concave）或 spectral（concavity_weight 上调到 0.75~0.85）**。
-- 描述强调整体粗细/厚度层次 → 小块用 sdf。
-- 描述强调骨架/肢类/躯干-四肢链式结构 → skeleton（大图亦可用，系统自动池化）。
-- **细长肢体的纵向分段（无明显凹缝/关节）→ 必须选 skeleton**：例如把大腿从腿上分出来、
-  把小腿/脚分段，附图看不到凹线也不要退回 spectral/graph_cut 乱切；skeleton 会沿中轴等距切。
-- **语义优先于规模**：大块仍选最合语义的策略；系统会用池化/降迭代保证可完成。
-- geodesic_fps 是兜底而非默认：只有语义不明或凹谷/厚度/骨架策略都不合适时才选。
+- covered_parts / semantic_parts / extra_parts / matched_parts are **open vocabulary** ? not necessarily humanoid;
+  choose strategy from described geometry.
+- Multiple matched_parts with very different names ? spectral or graph_cut on small/medium blocks;
+  **obvious grooves/seams in image ? prefer graph_cut (high lambda_concave) or spectral (concavity_weight 0.75~0.85)**.
+- Description emphasizes thickness hierarchy ? sdf on smaller blocks.
+- Description emphasizes skeleton/limbs/torso-limb chain ? skeleton (large meshes OK, auto-pool).
+- **Longitudinal limb segments without obvious groove ? must use skeleton**: e.g. separate thigh from leg, calf/foot segments;
+  even if image shows no concave line, do not fall back to spectral/graph_cut random cuts; skeleton cuts equidistant along axis.
+- **Semantics over scale**: pick best semantic strategy on large blocks; system pools/reduces iterations.
+- geodesic_fps is fallback, not default: only when semantics unclear or groove/thickness/skeleton strategies unsuitable.
 
 {semantic_coverage_discipline}
 
-参数纪律
+Parameter discipline
 -----------------------------------
-- 下面每个参数都标注了**默认值与取值范围**；这些默认值已是大多数情况下的较优起点。
-- **不确定就沿用默认**：可以整段省略 params，或只填你确实想改的那几个字段，系统会对缺省项使用默认值。
-- 只在**渲染图/语义明显需要**时才覆盖默认值（例如凹陷特别深 → 上调 concavity_weight / lambda_concave），
-  并在 reason 里说明覆盖依据；不要无依据地乱改参数。
+- Each param shows **default and range**; defaults are good starting points.
+- **When unsure, keep defaults**: omit params entirely or only override fields you need; system fills defaults.
+- Override only when render/semantics clearly require (e.g. deep concavity ? raise concavity_weight / lambda_concave),
+  and explain in reason; do not change params without basis.
 
-只返回如下 JSON：
+Return **only** this JSON:
 {{
   "strategy": "graph_cut" | "spectral" | "cvt" | "sdf" | "skeleton" | "geodesic_fps",
-  "reason": "中文简述：为什么选这个策略；逐项说明 matched_parts 各项切分后预期落在哪个子块（避免小部位被吞并）；若覆盖了任何默认参数，说明依据",
+  "reason": "English brief: why this strategy; map each matched_parts item to expected child (avoid swallowing small parts); note any param overrides",
   "params": {{
-    "lambda_smooth": <float, graph_cut, 0.1~3.0, 默认 1.0>,
-    "lambda_concave": <float, graph_cut, 0.0~2.0, 默认 0.85, 凹陷明显时 0.9~1.2>,
-    "geodesic_weight": <float, spectral, 0.05~0.80, 默认 0.20>,
-    "curvature_weight": <float, spectral, 0.05~0.80, 默认 0.15>,
-    "concavity_weight": <float, spectral, 0.05~0.90, 默认 0.70, 凹陷明显时 0.75~0.85>,
-    "lloyd_iter": <int, cvt/geodesic_fps/skeleton, 0~12, 默认 cvt=4 / geodesic_fps=0 / skeleton=0>,
-    "contraction_iters": <int, skeleton, 2~12, 默认 5>,
-    "graph_vertex_budget": <int, spectral/skeleton/geodesic_fps, 4000~20000, 可选, 默认自动池化>,
-    "num_rays": <int, sdf, 4~24, 默认 8>,
-    "cone_angle_deg": <float, sdf, 15~120, 默认 60>
+    "lambda_smooth": <float, graph_cut, 0.1~3.0, default 1.0>,
+    "lambda_concave": <float, graph_cut, 0.0~2.0, default 0.85, obvious concavity 0.9~1.2>,
+    "geodesic_weight": <float, spectral, 0.05~0.80, default 0.20>,
+    "curvature_weight": <float, spectral, 0.05~0.80, default 0.15>,
+    "concavity_weight": <float, spectral, 0.05~0.90, default 0.70, obvious grooves 0.75~0.85>,
+    "lloyd_iter": <int, cvt/geodesic_fps/skeleton, 0~12, default cvt=4 / geodesic_fps=0 / skeleton=0>,
+    "contraction_iters": <int, skeleton, 2~12, default 5>,
+    "graph_vertex_budget": <int, spectral/skeleton/geodesic_fps, 4000~20000, optional, auto-pool>,
+    "num_rays": <int, sdf, 4~24, default 8>,
+    "cone_angle_deg": <float, sdf, 15~120, default 60>
   }}
 }}
-（params 里只填所选策略相关的、且你想偏离默认的字段；其余一律省略，系统用默认值。）
+(Omit params fields you do not override; system uses defaults.)
+"""
+
+SPLIT_STRATEGY_SYSTEM_PROMPT_POINTCLOUD = (
+    "You are a 3D point-cloud partitioning algorithm expert. "
+    "You receive semantic context, point count, matched_parts, seed_count, and optional renders;"
+    "balance **full semantic coverage**, **semantic fit**, and **runtime**. "
+    "Choose one of six point-cloud strategies and parameters. " "Geometry comes from kNN graph, normals, curvature, and concavity ? no mesh faces/triangles. "
+    "Strict JSON only ? no Markdown, no extra text."
+)
+
+SPLIT_STRATEGY_USER_TEMPLATE_POINTCLOUD = """This point-cloud block needs further geometric subdivision.
+
+Semantic context
+------------------------------------
+- Task semantic / matched parts: {semantic_context}
+- covered_parts (red coverage) = {covered_parts_json}
+- semantic_parts (belonging to semantic) = {semantic_parts_json}
+- extra_parts (overflow parts) = {extra_parts_json}
+- matched_parts (multi-label hits, full-coverage mode) = {matched_parts_json}
+- Planned seed_count = {seed_count}
+- Current block point count ? {block_faces}
+- Subdivision stage: {split_stage}
+- CLI strategy hint (reference only; you decide): {strategy_hint}
+
+Point-cloud traits and performance (system auto-optimizes; do not default to geodesic_fps for large point count)
+------------------------------------
+- All geometry on kNN graph: edge weights from geodesic distance, normal angle (curvature), and concavity ? no triangles.
+- Geodesic strategies auto **downsample/pool point graphs** on large blocks (~8k~12k nodes);
+  with fixed seed_count spectral **skips eigendecomposition**.
+- block_points < 30_000: prefer **spectral**.
+- block_points 30_000~150_000: spectral / skeleton / graph_cut / sdf by semantics; system lowers iterations/rays.
+- block_points ? 150_000: spectral / skeleton OK; small iteration counts (2~3);
+  **geodesic_fps fallback only**.
+
+Available point-cloud strategies (strategy field must be one of)
+------------------------------------
+1. **graph_cut** (kNN graph cut)
+   - Boundaries along grooves/valleys; adjacent semantics separated by gaps (finger gaps, armor seams, armpit, neck base).
+   - **First choice when concavity obvious**.
+   - Params: lambda_smooth (0.1~3.0, default 1.0), lambda_concave (0.0~2.0, **default 0.85**; obvious **0.9~1.2**).
+
+2. **spectral** (point-cloud spectral)
+   - Large pose/topology change, quasi-isometric splits (limb-torso, bent limbs, symmetry).
+   - kNN edge weights (auto-normalized):
+     curvature_weight (normal angle/curvature, fold lines),
+     concavity_weight (grooves at joints/seams),
+     normal_weight (normal consistency ? higher keeps smooth surface patches together).
+   - **Obvious grooves/seams** ? raise concavity_weight (e.g. 0.5~1.0);
+     smooth bends ? raise curvature_weight; noisy normals ? moderate normal_weight.
+   - Default: curvature_weight?1.0, concavity_weight=0.0, normal_weight=1.0 (deviate as needed).
+
+3. **cvt** ? equal compact pieces; lloyd_iter (2~12, default 4).
+
+4. **sdf** (point-cloud SDF) ? thickness hierarchy; num_rays (4~24, default 8), cone_angle_deg (15~120, default 60).
+
+5. **geodesic_fps** ? fallback / fast uniform; lloyd_iter (0~12, default 0).
+
+6. **skeleton** ? tree/limb along axis/branches; longitudinal limb segments even without grooves;
+   contraction_iters (2~12, default 5), lloyd_iter (0~12, default 0).
+
+Open-vocabulary discipline
+------------------------------------
+- Inputs are open vocabulary ? choose from geometry described in text.
+- Diverse matched_parts ? spectral or graph_cut; obvious grooves ? graph_cut (high lambda_concave) or spectral (raise concavity_weight).
+- Thickness hierarchy ? sdf; skeleton/limb chain ? skeleton.
+- Longitudinal limb segments without groove ? **must use skeleton**.
+- Semantics over scale; geodesic_fps fallback only.
+
+{semantic_coverage_discipline}
+
+Parameter discipline
+------------------------------------
+- Defaults are good starting points; omit params or override only what you need.
+- Explain overrides in reason.
+
+Return **only** this JSON:
+{{
+  "strategy": "graph_cut" | "spectral" | "cvt" | "sdf" | "skeleton" | "geodesic_fps",
+  "reason": "English brief: why this strategy; map matched_parts to expected children; note param overrides",
+  "params": {{
+    "lambda_smooth": <float, graph_cut, 0.1~3.0, default 1.0>,
+    "lambda_concave": <float, graph_cut, 0.0~2.0, default 0.85, obvious concavity 0.9~1.2>,
+    "curvature_weight": <float, spectral, 0.0~2.0, default 1.0>,
+    "concavity_weight": <float, spectral, 0.0~2.0, default 0.0, obvious grooves 0.5~1.0>,
+    "normal_weight": <float, spectral, 0.0~2.0, default 1.0>,
+    "lloyd_iter": <int, cvt/geodesic_fps/skeleton, 0~12, default cvt=4 / geodesic_fps=0 / skeleton=0>,
+    "contraction_iters": <int, skeleton, 2~12, default 5>,
+    "num_rays": <int, sdf, 4~24, default 8>,
+    "cone_angle_deg": <float, sdf, 15~120, default 60>
+  }}
+}}
+(Omit params fields you do not override.)
 """
 
 
@@ -691,12 +817,12 @@ class ObjectContext:
         if self.is_empty():
             return ""
         if self.candidate_parts:
-            parts = "、".join(str(p).strip() for p in self.candidate_parts if str(p).strip())
-            parts_line = f"它通常由这些部件构成（候选清单）：{parts}。"
+            parts = ", ".join(str(p).strip() for p in self.candidate_parts if str(p).strip())
+            parts_line = f"It is typically composed of these parts (candidate list): {parts}."
         else:
             parts_line = ""
         return "\n" + OBSERVE_CONTEXT_HINT.format(
-            category=self.category.strip() or "未知物体", parts_line=parts_line
+            category=self.category.strip() or "unknown object", parts_line=parts_line
         )
 
     def reason_block(self) -> str:
@@ -704,27 +830,29 @@ class ObjectContext:
             return ""
         bits = []
         if self.category.strip():
-            bits.append(f"物体类别：{self.category.strip()}")
+            bits.append(f"Object category: {self.category.strip()}")
         if self.candidate_parts:
-            parts = "、".join(str(p).strip() for p in self.candidate_parts if str(p).strip())
-            bits.append(f"该物体的候选部件清单：{parts}")
-        return "\n（物体上下文：" + "；".join(bits) + "）"
+            parts = ", ".join(str(p).strip() for p in self.candidate_parts if str(p).strip())
+            bits.append(f"Candidate part list for this object: {parts}")
+        return "\n(Object context: " + "; ".join(bits) + ")"
 
 
 def _media_defaults(media_type: str) -> Dict[str, Any]:
     if media_type == "pointcloud":
         return {
-            "size_unit": "点",
+            "size_unit": "points",
             "large_threshold": 3000,
         }
     return {
-        "size_unit": "面",
+        "size_unit": "faces",
         "large_threshold": 3000,
     }
 
 
-def build_classify_prompt(semantic: str, *, media_type: MediaType = "mesh") -> ClassifyPrompt:
-    guide = RENDER_GUIDE.get(media_type, RENDER_GUIDE["mesh"])
+def build_classify_prompt(
+    semantic: str, *, media_type: MediaType = "mesh", n_views: int = DEFAULT_N_VIEWS
+) -> ClassifyPrompt:
+    guide = _render_guide(media_type, n_views)
     overview = JUDGMENT_OVERVIEW_TEMPLATE.format(semantic=semantic.strip())
     return ClassifyPrompt(
         system=CLASSIFY_SYSTEM_PROMPT,
@@ -737,26 +865,26 @@ def build_classify_prompt(semantic: str, *, media_type: MediaType = "mesh") -> C
 
 
 def _looks_like_portable_prop_semantic(semantic: str) -> bool:
-    """用户语义是否像手持/佩戴/独立道具（而非人体部位）。"""
+    """Whether user semantic looks like a held/worn/independent prop (not a body part)."""
     s = semantic.strip()
     if not s:
         return False
     prop_hints = (
-        "枪", "剑", "刀", "棍", "杖", "瓶", "杯", "壶", "包", "袋", "帽", "盔", "盾",
-        "弓", "箭", "锤", "斧", "铲", "锄", "筒", "炮", "机", "械", "具", "器", "棒",
-        "铲", "鞭", "链", "铃", "笛", "琴", "伞", "扇", "镜", "灯", "钥", "币", "牌",
-        "箱", "盒", "罐", "碗", "盘", "勺", "叉", "筷", "笔", "刷", "锯", "钳", "锤",
+        "?", "?", "?", "?", "?", "?", "?", "?", "?", "?", "?", "?", "?",
+        "?", "?", "?", "?", "?", "?", "?", "?", "?", "?", "?", "?", "?",
+        "?", "?", "?", "?", "?", "?", "?", "?", "?", "?", "?", "?", "?",
+        "?", "?", "?", "?", "?", "?", "?", "?", "?", "?", "?", "?", "?",
     )
     body_hints = (
-        "头", "脸", "面", "发", "颈", "胸", "背", "腰", "腹", "臀", "腿", "脚", "趾",
-        "手", "指", "臂", "肘", "膝", "眼", "鼻", "嘴", "耳", "牙", "爪", "尾", "翼",
+        "?", "?", "?", "?", "?", "?", "?", "?", "?", "?", "?", "?", "?",
+        "?", "?", "?", "?", "?", "?", "?", "?", "?", "?", "?", "?", "?",
     )
     if any(h in s for h in prop_hints):
-        # 「机枪手」这类含人体词但核心是枪的，仍当道具
-        if s.endswith("手") and len(s) <= 4:
+        # e.g. "machine gunner" ends with ? but core is gun ? still treat as prop
+        if s.endswith("?") and len(s) <= 4:
             return False
         return True
-    # 纯造词/英文名等：无人体部位特征时保守不注入
+    # coined/English names: conservative ? no body-part chars ? do not inject
     return not any(h in s for h in body_hints)
 
 
@@ -773,11 +901,12 @@ def build_observe_prompt(
     context: Optional["ObjectContext"] = None,
     *,
     media_type: MediaType = "mesh",
+    n_views: int = DEFAULT_N_VIEWS,
 ) -> ClassifyPrompt:
-    """阶段 1：纯观察，不出现 semantic（避免确认偏差）。"""
+    """Stage 1: pure observation ? no semantic (avoid confirmation bias)."""
     if media_type == "pointcloud":
-        sem_placeholder = "（阶段 2 才会告知，本阶段禁止猜测）"
-        guide = RENDER_GUIDE.get(media_type, RENDER_GUIDE["mesh"])
+        sem_placeholder = "(Disclosed only in stage 2 ? do not guess in this stage)"
+        guide = _render_guide(media_type, n_views)
         overview = JUDGMENT_OVERVIEW_TEMPLATE.format(semantic=sem_placeholder)
         return ClassifyPrompt(
             system=OBSERVE_SYSTEM_PROMPT,
@@ -785,6 +914,7 @@ def build_observe_prompt(
                 render_guide=guide,
                 attached_props_block=OBSERVE_ATTACHED_PROPS_BLOCK,
                 judgment_overview=overview,
+                n_views=max(1, int(n_views)),
             ),
         )
     context_block = context.observe_block() if context is not None else ""
@@ -802,11 +932,21 @@ def build_reason_prompt(
     media_type: MediaType = "mesh",
     force_terminate: bool = False,
     dominant_region: str = "",
+    memory_block: str = "",
 ) -> ClassifyPrompt:
-    """阶段 2：拿阶段 1 的 covered_parts 与语义做纯文本逻辑判定。"""
+    """Stage 2: pure-text logic comparing stage-1 covered_parts to semantic.
+
+    `memory_block`: optional pre-formatted text digest of earlier-iteration verdicts on
+    the same model; injected so the VLM keeps cross-iteration memory for consistency.
+    """
     import json as _json
 
     sem = semantic.strip()
+    mem_note = ""
+    if memory_block and memory_block.strip():
+        mem_note = MEMORY_BLOCK_TEMPLATE.format(
+            semantic=sem, memory_entries=memory_block.strip()
+        )
     if media_type == "pointcloud":
         force_note = (
             FORCE_TERMINATE_NOTE.format(semantic=sem)
@@ -818,13 +958,14 @@ def build_reason_prompt(
             if _looks_like_portable_prop_semantic(sem)
             else ""
         )
-        dom = (dominant_region or "").strip() or "（未提供）"
+        dom = (dominant_region or "").strip() or "(not provided)"
         return ClassifyPrompt(
             system=REASON_SYSTEM_PROMPT,
             user=REASON_USER_TEMPLATE_POINTCLOUD.format(
                 judgment_overview=JUDGMENT_OVERVIEW_TEMPLATE.format(semantic=sem),
                 force_terminate_note=force_note,
                 prop_semantic_note=prop_note,
+                memory_block=mem_note,
                 semantic=sem,
                 covered_parts_json=_json.dumps(covered_parts, ensure_ascii=False),
                 dominant_region_json=_json.dumps(dom, ensure_ascii=False),
@@ -842,71 +983,151 @@ def build_reason_prompt(
     )
 
 
+# ---------------------------------------------------------------------------
+# Revive pick: when the whole model ended with ZERO full blocks, force the VLM
+# to choose the single most-likely leaf block and revive it as full (best effort).
+# ---------------------------------------------------------------------------
+
+REVIVE_SYSTEM_PROMPT = (
+    "You are the final arbiter for 3D semantic segmentation. "
+    "The whole model was searched block by block and **no** block was accepted as the target ?{semantic}?. "
+    "We refuse to return an empty result, so you must pick the **single** candidate leaf block that is "
+    "**most likely** to be (or to contain the bulk of) ?{semantic}?, even if imperfect. "
+    "Be decisive ? you must choose exactly one. Strict JSON only, no Markdown."
+)
+
+REVIVE_USER_TEMPLATE = """Target semantic: ?{semantic}?
+
+Situation
+-----------------------------------
+Every block was judged `none` during iteration ? the final mask would be **empty**. To avoid returning nothing,
+relax the earlier strict rules and pick the one block that best represents ?{semantic}? (closest match wins).
+
+Candidate leaf blocks (each may also be attached as a multi-view highlight image; the block id is printed in the
+image title). Earlier observations are listed below as the authoritative legend:
+{candidates_block}
+
+How to choose
+-----------------------------------
+1. Prefer a block whose covered parts / dominant region **overlap the target's location**, even partially.
+2. Among overlapping ones, prefer the one with the **largest share** of the target and least unrelated overflow.
+3. If none clearly overlaps, pick the **least-unrelated** one (closest in location/shape to the target).
+4. You **must** return one of the listed block_ids exactly.
+
+Return **only** this JSON:
+{{
+  "chosen_block_id": "<one of the listed block ids, copied exactly>",
+  "confidence": 0.0~1.0,
+  "reason": "One English sentence: why this block is the closest match to the target."
+}}
+"""
+
+
+def build_revive_prompt(
+    semantic: str,
+    candidates: Sequence[Dict[str, Any]],
+) -> ClassifyPrompt:
+    """Prompt to pick the single most-likely leaf block to revive as full.
+
+    `candidates`: list of dicts with keys block_id, points, covered_parts,
+    dominant_region, extra_parts, semantic_area_ratio, prior_reason.
+    """
+    import json as _json
+
+    sem = semantic.strip()
+    lines: List[str] = []
+    for c in candidates:
+        bid = str(c.get("block_id"))
+        pts = c.get("points")
+        covered = c.get("covered_parts") or []
+        dom = str(c.get("dominant_region") or "").strip()
+        extra = c.get("extra_parts") or []
+        ratio = c.get("semantic_area_ratio")
+        reason = str(c.get("prior_reason") or "").strip()
+        if len(reason) > 200:
+            reason = reason[:200] + "?"
+        bits = [f"block_id={bid}"]
+        if pts is not None:
+            bits.append(f"points={pts}")
+        bits.append(f"covered={_json.dumps(covered, ensure_ascii=False)}")
+        if dom:
+            bits.append(f"dominant_region={_json.dumps(dom, ensure_ascii=False)}")
+        if extra:
+            bits.append(f"extra={_json.dumps(extra, ensure_ascii=False)}")
+        if ratio is not None:
+            bits.append(f"semantic_area_ratio={ratio}")
+        if reason:
+            bits.append(f"prior_reason={reason}")
+        lines.append("- " + "; ".join(bits))
+    candidates_block = "\n".join(lines) if lines else "(none)"
+    return ClassifyPrompt(
+        system=REVIVE_SYSTEM_PROMPT.format(semantic=sem),
+        user=REVIVE_USER_TEMPLATE.format(
+            semantic=sem,
+            candidates_block=candidates_block,
+        ),
+    )
+
+
 
 # ---------------------------------------------------------------------------
-# 全局自评：每轮迭代后让 VLM 看「整模型当前进度图」，自己决定要不要继续 / 修正
+# Global self-review: after each iteration VLM views whole-model progress image
 # ---------------------------------------------------------------------------
 
 REVIEW_SYSTEM_PROMPT = (
-    "你是一个 3D 模型语义分析的总督导。"
-    "用户在多轮迭代里把模型切成若干分块，每块判定为 full（属于语义） / partial（局部符合，待再切） / none（不属于）。"
-    "现在你拿到的图是**当前全局状态**：所有 face 都按当前最新判定染色——"
-    "**鲜红 = 已确认属于「{semantic}」**；**亮黄 = 待继续切分的 partial**；"
-    "**浅灰 = 已确认不属于**；**中灰 = 已被舍弃 / 触顶**。"
-    "你的任务是：对照「{semantic}」语义，**整体审视红色覆盖区域是否准确**，"
-    "并决定**是否还需要继续迭代**（继续切黄色块），还是当前的红色已经足够好可以收工。"
-    "严格按 JSON 格式回答，禁止 Markdown，禁止额外文字。"
+    "You are the lead supervisor for 3D model semantic analysis. "
+    "Across iterations the model was split into blocks labeled full (in semantic) / partial (split more) / none (discard). " "The image shows **current global state**: all faces colored by latest judgment ? "
+    "**bright red = confirmed ?{semantic}?**; **bright yellow = partial, pending split**; " "**light gray = confirmed not semantic**; **medium gray = abandoned / depth cap**. "
+    "Assess whether **red coverage matches ?{semantic}?** overall and **whether to keep iterating** (split yellow) or stop. " "Strict JSON only ? no Markdown, no extra text."
 )
 
-REVIEW_USER_TEMPLATE = """目标语义：「{semantic}」
+REVIEW_USER_TEMPLATE = """Target semantic: ?{semantic}?
 
-迭代上下文（这些是**事实数据**，不是估计，必须当作硬约束）
+Iteration context (**factual data ? hard constraints**)
 -----------------------------------
-- 当前已迭代 {iter_done} 轮，硬上限 {max_depth} 轮
-- 当前红色面数：{full_faces} / {total_faces}（{full_ratio:.1%}）  ← 这是你能看到的红色总量
-- 待分裂的黄色面数：{pending_faces} / {total_faces}（{pending_ratio:.1%}）
-- 已舍弃的中灰面数：{abandoned_faces}
+- Completed {iter_done} iterations, hard cap {max_depth}
+- Current red face count: {full_faces} / {total_faces} ({full_ratio:.1%})  ? total red you should see
+- Pending yellow face count: {pending_faces} / {total_faces} ({pending_ratio:.1%})
+- Abandoned medium-gray face count: {abandoned_faces}
 
-**铁律 — 防止 VLM 凭"语感"瞎终止**
+**Iron rules ? prevent VLM from stopping on "feel"**
 -----------------------------------
-1. **如实描述**：在 `red_covered_parts` 里**只**列你**真的能在某张图上看到红色**的部位。
-   - 如果红色比例 < 3%（例如本轮 full_ratio={full_ratio:.1%}），意味着图上几乎看不见红色——
-     这种情况下 `red_assessment` **不允许** = "matches"（因为没什么红色可"匹配"），
-     必须 = "incomplete"。
-   - 不要因为"我觉得已经差不多了"就编造"红色覆盖了头顶尖发"——你必须在图上**真的看到红色**。
-2. **黄色块还多就别终止**：
-   - 如果 pending_ratio ≥ 10% 且语义还没基本覆盖，`should_terminate` **必须** = false；
-   - 当 pending_ratio < 5% 且红色看起来确实在语义所在区域 → 才允许 should_terminate=true。
-3. **终止前再问自己**：如果终止，最终掩码就是当前**红色**部分。它能让人一眼认出「{semantic}」吗？
-   - 不能 → 不要终止。
+1. **Describe honestly**: in `red_covered_parts` list **only** parts where you **actually see red on a panel**.
+   - If red ratio < 3% (e.g. full_ratio={full_ratio:.1%}), almost no red visible ?
+     `red_assessment` **cannot** be "matches", must be "incomplete".
+   - Do not invent "red on crown hair" without seeing red ? must be visible on image.
+2. **Do not terminate while much yellow remains**:
+   - If pending_ratio ? 10% and semantic not basically covered, `should_terminate` **must** be false;
+   - When pending_ratio < 5% and red looks in semantic region ? may allow should_terminate=true.
+3. **Before stopping ask**: if we stop, final mask is current **red**. Would ?{semantic}? be recognizable at a glance?
+   - If not ? do not terminate.
 
-请按以下顺序思考并填入 JSON
+Think in order and fill JSON
 -----------------------------------
-1. **观察红色覆盖**：先把眼睛聚焦到红色像素本身。它在角色身上的哪里？写进 `red_covered_parts`。
-   - 红色比例 {full_ratio:.1%}：如果 <3%，这一项几乎一定写 [] 或像 "零星几片，未形成区域"。
-2. **判断红色质量**：
-   - matches    ：红色基本就在「{semantic}」位置且占比合理；
-   - incomplete ：红色明显不够（典型：full_ratio < 该语义合理范围）；
-   - over_claimed：红色多出非语义部位；
-   - partial    ：既缺又多。
-3. **判断黄色块的去留**：黄色还有没有继续切的必要？
-   - 黄色覆盖了仍可能含「{semantic}」的部位（如头部内还有发/帽待分） → keep_splitting；
-   - 黄色全是肯定不属于语义的部位（手脚） → likely_not_semantic；
-   - 黄色都是边角碎片 → mostly_done。
-4. **终止决定 should_terminate**：
-   - 综合上面两项 + pending_ratio + 上面的「铁律」给出 true / false；
-   - 当前 pending_ratio={pending_ratio:.1%}，full_ratio={full_ratio:.1%}：如果 full_ratio 极小且 pending 还很多，**绝不**终止。
+1. **Observe red coverage**: focus on red pixels. Where on the character? ? `red_covered_parts`.
+   - Red ratio {full_ratio:.1%}: if <3%, likely [] or "scattered specks, no region".
+2. **Red quality**:
+   - matches    : red mostly on ?{semantic}? with reasonable share;
+   - incomplete : red clearly insufficient (typical: full_ratio below reasonable range);
+   - over_claimed: red includes non-semantic parts;
+   - partial    : both missing and extra.
+3. **Yellow blocks**: still worth splitting?
+   - Yellow may still contain ?{semantic}? (e.g. hair/hat inside head) ? keep_splitting;
+   - Yellow surely non-semantic (hands/feet) ? likely_not_semantic;
+   - Yellow mostly edge fragments ? mostly_done.
+4. **should_terminate**:
+   - Combine above + pending_ratio + iron rules; if full_ratio tiny and pending high, **never** terminate.
 
-只能返回如下 JSON：
+Return **only** this JSON:
 {{
   "red_assessment": "matches | over_claimed | incomplete | partial",
-  "red_covered_parts": ["red 当前覆盖到的部位（如实写，看不到红就写空 []）"],
-  "missing_regions": "如果 red 缺漏，描述应该被红色覆盖但目前不是红色的部位；否则空字符串",
-  "extra_regions": "如果 red 过度，描述被涂红但其实不属于语义的部位；否则空字符串",
+  "red_covered_parts": ["parts red currently covers ? honest; [] if no red visible"],
+  "missing_regions": "if red is missing expected regions, describe; else empty string",
+  "extra_regions": "if red over-claims, describe non-semantic red regions; else empty string",
   "yellow_assessment": "should_keep_splitting | likely_not_semantic | mostly_done",
   "should_terminate": true | false,
   "confidence": 0.0~1.0,
-  "reason": "用一句中文说明：根据 full_ratio={full_ratio:.1%} / pending_ratio={pending_ratio:.1%} 与红色实际覆盖，为什么得到这个 should_terminate。"
+  "reason": "One English sentence: from full_ratio={full_ratio:.1%} / pending_ratio={pending_ratio:.1%} and actual red coverage, why should_terminate."
 }}
 """
 
@@ -921,7 +1142,7 @@ def build_review_prompt(
     abandoned_faces: int,
     total_faces: int,
 ) -> ClassifyPrompt:
-    """全局进度自评提示。"""
+    """Global progress self-review prompt."""
     full_ratio = (full_faces / total_faces) if total_faces else 0.0
     pending_ratio = (pending_faces / total_faces) if total_faces else 0.0
     return ClassifyPrompt(
@@ -941,62 +1162,58 @@ def build_review_prompt(
 
 
 # ---------------------------------------------------------------------------
-# 一次性分组：把过分割的 N 个候选区一次性分成 K 组，每组带 label
-# 这是「VLM 选源点」的最直接形式 —— VLM 通过点选候选编号来定义最终切分
+# One-shot grouping: over-segmented N candidates ? K groups with labels
 # ---------------------------------------------------------------------------
 
 GROUP_SYSTEM_PROMPT = (
-    "你是一个 3D 模型语义分析助手。"
-    "用户已经把当前 partial 分块**过分割**成 N 个小候选区，"
-    "每个候选区在 12 视角拼图里用一个**独立的鲜艳颜色**绘制，"
-    "并在它的几何中心**画了一个圆角矩形数字标签**（1, 2, 3, ...）。"
-    "上下文里其它面是**淡灰色**，仅用于定位，**不要**把它们划入任何组。"
-    "你的任务：把这些候选编号**一次性合并**成 K 组（2≤K≤候选数），"
-    "每组要么属于「{semantic}」要么不属于（或仍不确定）。"
-    "严格按 JSON 格式回答，禁止 Markdown，禁止额外文字。"
+    "You are a 3D model semantic analysis assistant. "
+    "The user **over-segmented** the current partial block into N small candidate regions;"
+    "each candidate uses a **distinct bright color** in the 12-view collage, "
+    "with a **rounded-rect numeric label** (1, 2, 3, ...) at its centroid. " "Other faces are **light gray** for context ? **do not** assign them to any group. "
+    "Merge candidate IDs into K groups (2?K?candidate count);"
+    "each group is either in ?{semantic}?, not, or still uncertain. "
+    "Strict JSON only ? no Markdown, no extra text."
 )
 
-GROUP_USER_TEMPLATE = """目标语义：「{semantic}」
+GROUP_USER_TEMPLATE = """Target semantic: ?{semantic}?
 
-候选区列表（共 {n_candidates} 个，每个候选区在 12 视角拼图里有独立颜色 + 圆角矩形数字标签）：
+Candidate list ({n_candidates} total; each has unique color + rounded numeric label in 12-view collage):
 {candidate_table}
 
-任务
+Task
 -----------------------------------
-请把上面 {n_candidates} 个候选编号**一次性**合并成 2~{max_groups} 个组，每组打 label：
-  - **full** ：该组的候选**全部**只覆盖「{semantic}」对应的纯净几何，**没有任何**面部/颈部/躯干等近邻部位。
-  - **none** ：该组的候选**全部**与「{semantic}」无关（如四肢、躯干、脚等）。
-  - **partial**：该组里至少有一个候选**仍混着**语义和非语义（无法干净切开），需要再切。
+Merge the {n_candidates} candidate IDs into 2~{max_groups} groups; label each group:
+  - **full** : all candidates in group cover **only** pure geometry of ?{semantic}?, **no** face/neck/torso neighbors.
+  - **none** : all candidates unrelated to ?{semantic}? (e.g. limbs, torso, feet).
+  - **partial**: at least one candidate still mixes semantic and non-semantic ? needs more split.
 
-⚠️ Full 标签的**严格门槛**（违反就该用 partial）
+Full label **strict threshold** (violation ? use partial)
 -----------------------------------
-- 「{semantic}」=「头发」时，full 组的所有候选必须**只**覆盖头顶尖发 / 发束 / 头发本体，
-  **不能包括**：整张脸、面部、额头、颈部、下巴、耳朵、头部除发型外的部分。
-- 「{semantic}」=「腰带」时，full 组的所有候选必须**只**覆盖腰部一圈条带，
-  **不能包括**：腹部、背部、臀部、胸前。
-- 总原则：**只要一个候选里看得到任何非语义部位，这一组就该是 partial 而不是 full**。
-- **宁可把整片都丢进 partial 让 pipeline 再切一遍，也不要把"差不多"的候选放进 full 组。**
-  full 组一旦确定，pipeline 不会再验证它，会直接进最终掩码——错就一直错。
+- semantic=?hair?: full group candidates must cover **only** crown hair / hair mass / hair body,
+  **not**: full face, forehead, neck, chin, ears, non-hair head regions.
+- semantic=?belt?: full group must cover **only** waist band,
+  **not**: abdomen, back, hips, chest.
+- Rule: **if any candidate shows non-semantic geometry, group is partial not full**.
+- **Prefer putting borderline candidates in partial for another pipeline pass over optimistic full**.
+  Full groups enter final mask without re-check ? errors persist.
 
-合并规则
+Merge rules
 -----------------------------------
-1. **先逐候选独立判断**：候选 i 单独看：纯语义 / 纯非语义 / 混着？
-   - 纯语义     → 候选标记 yes
-   - 纯非语义   → 候选标记 no
-   - 混着 / 不确定 → 候选标记 mixed
-2. **合组**：
-   - 所有 yes 候选 → full 组（拓扑上分散也无所谓）
-   - 所有 no  候选 → none 组
-   - 所有 mixed 候选 → 一个或多个 partial 组（按网格邻接关系拆，便于后续分裂）
-3. **覆盖率铁律**：所有 1..{n_candidates} 编号必须被分配且仅分配到**一组**。
-4. K（组数）通常 2~{max_groups}。
+1. **Judge each candidate alone**: pure semantic / pure non-semantic / mixed?
+   - pure semantic ? yes; pure non-semantic ? no; mixed/uncertain ? mixed
+2. **Group**:
+   - all yes ? full group (topology may be scattered)
+   - all no  ? none group
+   - all mixed ? one or more partial groups (split by mesh adjacency for later split)
+3. **Coverage rule**: every ID 1..{n_candidates} assigned to **exactly one** group.
+4. K usually 2~{max_groups}.
 
-请按上面的**严格门槛**给出 JSON：
+Return JSON per strict threshold:
 {{
   "candidates_assessment": [
-    {{"id": 1, "verdict": "yes|no|mixed", "note": "一句话说明这个候选实际覆盖到哪里"}},
+    {{"id": 1, "verdict": "yes|no|mixed", "note": "One sentence: what this candidate actually covers"}},
     {{"id": 2, "verdict": "...", "note": "..."}},
-    ... (所有 {n_candidates} 个候选都列出)
+    ... (all {n_candidates} candidates)
   ],
   "groups": [
     {{
@@ -1004,11 +1221,11 @@ GROUP_USER_TEMPLATE = """目标语义：「{semantic}」
       "candidate_ids": [<int>, ...],
       "label": "full" | "partial" | "none",
       "confidence": 0.0~1.0,
-      "description": "中文描述这组的候选覆盖了哪些部位"
+      "description": "English: which parts these candidates cover"
     }},
     ...
   ],
-  "reason": "中文一句：怎么得到上面的分组——尤其是 full 组凭什么不夹带任何非语义部位。"
+  "reason": "One English sentence: how groups were formed ? especially why full groups have no non-semantic bleed."
 }}
 """
 
@@ -1020,8 +1237,8 @@ def build_group_prompt(
     candidate_table: str,
     max_groups: int = 4,
 ) -> ClassifyPrompt:
-    """生成一次性分组提示。`candidate_table` 是 VLM 友好的候选清单，
-    形如 '- 1=红 (228,26,28)\\n- 2=蓝 (55,126,184)\\n...'。"""
+    """One-shot grouping prompt. `candidate_table` is VLM-friendly list,
+    e.g. '- 1=red (228,26,28)\\n- 2=blue (55,126,184)\\n...'."""
     return ClassifyPrompt(
         system=GROUP_SYSTEM_PROMPT.format(semantic=semantic.strip()),
         user=GROUP_USER_TEMPLATE.format(
@@ -1034,398 +1251,360 @@ def build_group_prompt(
 
 
 # ---------------------------------------------------------------------------
-# 全覆盖（Full-coverage）模式
-#
-# 思路：先枚举**短名、粗粒度、全覆盖**部位清单（初稿，后续可细化；对称实例合并命名）。
-# 再把清单作为封闭候选集，逐块 multi-label：每个分块必须从候选中至少选 1 项，
-#   - 1 个 → 该块直接归到该部位
-#   - ≥2 个 → 分裂成 len(matched) 个种子继续切（套用 CC → segmat → FPS 级联）
-# 直到每个叶分块只命中 1 个语义为止（不允许 background / 未归类面）。
+# Full-coverage mode
 # ---------------------------------------------------------------------------
 
-
 ENUMERATE_SYSTEM_PROMPT = (
-    "你是 3D 模型粗粒度语义分区员。"
-    "看 12 视角整模型拼图（无高亮），输出**短名、全覆盖、互不重叠**的部位清单；"
-    "对称重复部件合并为一项（写「手臂」不写「左臂/右臂」）。"
-    "同类外附肢用**一个统称**（如节肢动物写「附肢」不写「步足」「触肢」并列）。"
-    "名称宜简（2~6 字），不拆手指/花纹级细节。"
-    "必须给出完整、可审计的**拓扑约束**（连通块数量 count、骨架连接 attach_to）。"
-    "禁止在名称或说明中使用左/右/前/后/上/下等方位词。只输出 JSON。"
+    "You are a 3D model coarse semantic partitioner. "
+    "View 12-panel whole-model collage (no highlight); output **short, full-coverage, non-overlapping** part list;"
+    "merge symmetric repeats (write \"arm\" not \"left arm/right arm\"). "
+    "Same-class appendages use **one generic name** (e.g. arthropod \"appendage\" not \"leg\" + \"pedipalp\" separately). "
+    "Names 2~6 chars; no finger/pattern-level detail. " "Must give complete auditable **topology_constraints** (count, attach_to). "
+    "No directional words (left/right/front/back/up/down) in names. JSON only."
 )
 
+ENUMERATE_USER_TEMPLATE = """12-view whole-model collage (muted, no highlight).
 
-ENUMERATE_USER_TEMPLATE = """12 视角整模型拼图（淡色、无高亮）。
+Task: coarse **full-coverage** partition ? items together cover whole subject, non-overlapping, non-redundant.
+Initial draft, may refine later; **short accurate names** (e.g. head, torso, arm), not long descriptions.
 
-任务：粗粒度**全覆盖**分区——各项叠起来包住整个主体，彼此不重叠、不重复。
-这是初稿，后续会细化；名称**短而准**（如「头」「躯干」「手臂」），勿写长描述。
-
-命名与颗粒度
+Naming and granularity
 -----------------------------------
-- 每项 2~6 字，不用括号、不用「含/及/+」合并多项。
-- **禁止**用左/右/前/后/上/下等方位词区分对称实例：写「手臂」「前臂」「大腿」「小腿」「肢」等统称。
-- 人形常见 6~8 项：头、颈、躯干、上臂、前臂、大腿、小腿（手/脚可并入前臂/小腿）。
-- 四足：头、颈、躯干、尾、肢（或拆成两组对称肢，各 count=2）。
-- **节肢动物**（虾/蟹/蜘蛛/蝎/多足类）：典型 3 项——头胸、腹部、**附肢**。
-  所有外附肢（步足、触肢、螯、须等）**必须合并为一项「附肢」**；禁止同时列出「步足」「触肢」「螯」等细分名。
-  附肢 count = 模型上外附肢实例总数（如蟹 10、蜘蛛 8）；附肢 attach_to = ["头胸"] 或 ["腹部"]（依模型骨架，须与主体邻接）。
-  反例（禁止）：["头胸","腹部","步足","触肢"]；正例：["头胸","腹部","附肢"]。
-- 简单道具/机械：2~4 项（椅面、椅背、椅腿 …）。
-- 不拆手指/脚趾/发丝；不要把整条腿与躯干合成一项。
+- Each item 2~6 chars; no parentheses; no \"includes/and/+\" merging multiple items in one name.
+- **Forbidden** directional words for symmetric instances: use \"arm\", \"forearm\", \"thigh\", \"calf\", \"limb\", etc.
+- Humanoid typical 6~8: head, neck, torso, upper arm, forearm, thigh, calf (hand/foot may merge into forearm/calf).
+- Quadruped: head, neck, torso, tail, limb (or two symmetric limb groups, count=2 each).
+- **Arthropods** (shrimp/crab/spider/scorpion/myriapod): typical 3 ? cephalothorax, abdomen, **appendage**.
+  All external appendages (legs, pedipalps, claws, antennae?) **must merge as \"appendage\"**;
+  forbid listing \"leg\", \"pedipalp\", \"claw\" separately.
+  appendage count = total external appendage instances (crab 10, spider 8); attach_to = [\"cephalothorax\"] or [\"abdomen\"] per skeleton.
+  Bad: [\"cephalothorax\",\"abdomen\",\"leg\",\"pedipalp\"]; Good: [\"cephalothorax\",\"abdomen\",\"appendage\"].
+- Simple props/mechanical: 2~4 items (seat, backrest, leg ?).
+- Do not split fingers/toes/hair strands; do not merge whole leg with torso.
 {hint_block}
 
-约束
+Constraints
 -----------------------------------
-1. 全覆盖：主体几何都要能归入某一项；难归类则并入最近大块。
-2. 互不重叠：不要同时列「躯干」与「上身」这类同义重复；也不要把同一类外附肢拆成多个近义项（如「步足」+「触肢」）。
-3. 数量 2~12 项；**不得**出现 background / 其它 / 未分类 等兜底项。
-4. **强约束**：最终每项至少 1 个 face；模型上不存在或无法切出的部位不要列入（收尾阶段会 delete 或 split 补救）。
+1. Full coverage: all subject geometry maps to some item; hard cases merge into nearest major part.
+2. Non-overlapping: no synonyms (torso + upper body); no splitting same appendage class into near-duplicates.
+3. Count 2~12 items; **no** background / other / unclassified catch-alls.
+4. **Strong constraint**: each final item has ?1 face; do not list parts absent or uncuttable on model.
 
-拓扑约束（topology_constraints）——**核心，必须自洽**
+Topology constraints (topology_constraints) ? **core, must be consistent**
 -----------------------------------
-为每个 semantic_parts 项给出**期望的连通块数量**与**骨架连接关系**（后续分割会按此审计修复）。
-拓扑从**语义骨架**推断，不靠视角方位。
+For each semantic_parts item give **expected connected component count** and **skeleton attachment** (audited later).
+Infer topology from **semantic skeleton**, not view direction.
 
-**count（互不相连几何块数）**
-- 对称重复部件：count = 该语义在完整模型上的**实例数**。
-  - 人形「上臂」「前臂」「大腿」「小腿」各 count=2（对称实例各一，但名称不写实例方位）。
-  - 若清单含「四肢」或等价统称 → count=4。
-  - 四足两组对称肢各 count=2；若只列一项「肢」→ count=4。
-- 中心/唯一部件（躯干、头、颈、尾、椅面等）：通常 count=1。
+**count (number of disconnected geometric pieces)**
+- Symmetric repeats: count = **instance count** on full model.
+  - Humanoid upper arm, forearm, thigh, calf each count=2.
+  - If list has \"limbs\" equivalent ? count=4.
+  - Quadruped two symmetric limb groups count=2 each; single \"limb\" item ? count=4.
+- Central/unique parts (torso, head, neck, tail, seat?): usually count=1.
 
-**attach_to（必须邻接连接的上级部位，用 semantic_parts 原文）**
-- 主体/根节点（躯干、椅面等）：attach_to = []。
-- **所有肢类必须 attach_to 主体**：上臂/前臂/大腿/小腿/肢/附肢/尾 等 → attach_to = ["躯干"]（或对应主体名，节肢动物附肢→头胸或腹部）。
-- **链式骨架**：子段连直接上级，例如 前臂→上臂→躯干；小腿→大腿→躯干；椅背/椅腿→椅面。
-- **一致性铁律**：
-  - 若拆出上臂+前臂+大腿+小腿（或等价四肢语义），四条肢链的**根**都必须 attach_to 躯干；
-    合计应有 4 条独立肢链（或 count 之和 = 4 个肢实例）全部与躯干邻接。
-  - attach_to 中的名称必须在 semantic_parts 中存在；不得指向未列出的部位。
-  - 若某部位 count>0，其每个连通块都应至少与 attach_to 中某一上级共享网格边界。
+**attach_to (must-adjacent parent parts, exact semantic_parts strings)**
+- Body/root (torso, seat?): attach_to = [].
+- **All limb classes must attach_to body**: upper arm/forearm/thigh/calf/limb/appendage/tail ? attach_to = [\"torso\"] (or body name; arthropod appendage ? cephalothorax or abdomen).
+- **Chain skeleton**: child attaches to direct parent, e.g. forearm?upper arm?torso; calf?thigh?torso; backrest/legs?seat.
+- **Consistency rules**:
+  - If upper arm+forearm+thigh+calf listed, all four chains root to torso; total 4 limb instances adjacent to torso.
+  - attach_to names must exist in semantic_parts; no dangling references.
+  - If count>0, each component should share mesh boundary with at least one attach_to parent.
 
-- 名称必须与 semantic_parts **完全一致**；每项恰好 1 条 topology_constraints。
+- Names must **exactly match** semantic_parts; one topology_constraints row per item.
 
-只返回 JSON：
+Return JSON only:
 {{
-  "object_kind": "≤12 字，模型类型（如「类人角色」「四足动物」「椅子」）",
-  "semantic_parts": ["短名1", "短名2", "..."],
+  "object_kind": "?12 chars model type (e.g. humanoid character, quadruped, chair)",
+  "semantic_parts": ["short1", "short2", "..."],
   "topology_constraints": [
-    {{"part": "躯干", "count": 1, "attach_to": []}},
-    {{"part": "上臂", "count": 2, "attach_to": ["躯干"]}},
-    {{"part": "前臂", "count": 2, "attach_to": ["上臂"]}},
-    {{"part": "大腿", "count": 2, "attach_to": ["躯干"]}},
-    {{"part": "小腿", "count": 2, "attach_to": ["大腿"]}},
-    {{"part": "头", "count": 1, "attach_to": ["躯干"]}}
+    {{"part": "torso", "count": 1, "attach_to": []}},
+    {{"part": "upper arm", "count": 2, "attach_to": ["torso"]}},
+    {{"part": "forearm", "count": 2, "attach_to": ["upper arm"]}},
+    {{"part": "thigh", "count": 2, "attach_to": ["torso"]}},
+    {{"part": "calf", "count": 2, "attach_to": ["thigh"]}},
+    {{"part": "head", "count": 1, "attach_to": ["torso"]}}
   ],
-  "reason": "≤20 字，可选，说明分区与拓扑依据"
+  "reason": "?20 chars optional: partition and topology rationale"
 }}
 """
 
-
 MULTI_LABEL_SYSTEM_PROMPT = (
-    "你是 3D 分块多标签判别员。"
-    "12 视角拼图里仅一块为鲜艳红/橙高亮，其余淡灰。"
-    "候选集是枚举阶段给出的**开放语义短名**（可能是人形、动物、道具、机械等任意部件名）。"
-    "只能从候选集中勾选红色**实际覆盖**的部位；**至少选 1 项**，禁止 background。"
-    "若给出父块 parent_matched，子块**原则上只从 parent_matched 中选**；"
-    "父块未列出的语义仅在你非常确定（confidences≥0.85）时才可勾选。"
-    "若提示已达 max_depth，**matched_parts 只能 1 项**，必须给出最终确切归属，禁止多项。"
-    "小部位（头、手、指等）若高亮区确有该几何也必须勾选，漏标会导致昂贵覆盖重选。"
-    "只输出 JSON。"
+    "You are a 3D block multi-label classifier. "
+    "12-view collage: one block bright red/orange, rest light gray. " "Candidates are **open semantic short names** from enumeration (humanoid, animal, prop, mechanical, etc.). "
+    "Select only candidates **actually covered** by red; **at least 1**, no background. " "If parent_matched given, child **should only pick from parent_matched**; "
+    "parts not on parent list only if very sure (confidences?0.85). " "At max_depth, **matched_parts must be exactly 1** ? final definitive assignment. "
+    "Small parts (head, hand, finger?) must be labeled if red covers them ? missing labels trigger expensive re-selection. " "JSON only."
 )
 
-
-MULTI_LABEL_USER_TEMPLATE = """从候选集中标出红色高亮块覆盖了哪些部位。
+MULTI_LABEL_USER_TEMPLATE = """From the candidate set, label which parts the red-highlighted block covers.
 {parent_context_block}
-候选（封闭集，只能从中选，须**原样拼写**）：
+Candidates (closed set ? exact spelling only):
 {candidate_table}
 
-规则
+Rules
 -----------------------------------
-1. 只认鲜艳红/橙；灰/白/米色不算红。
-2. **matched_parts 至少 1 项**；看不清时选占比最大或几何最相关的候选，禁止留空。
-3. 通常 1~3 个相邻候选；≥4 项先删减不确定项。
-4. 候选未列出的几何 → 归入**网格邻接上最近**的候选，勿自造新词（保持封闭候选集与开放枚举词表一致）。
-5. 若候选仅有「附肢」，即使高亮区像步足或螯，也只标「附肢」，勿写「步足」「触肢」等候选外名称。
+1. Only bright red/orange counts; gray/white/beige is not red.
+2. **matched_parts at least 1**; if unclear pick largest or most relevant candidate ? never empty.
+3. Usually 1~3 adjacent candidates; if ?4, delete uncertain items first.
+4. Geometry not listed ? assign to **mesh-adjacent nearest** candidate; do not invent new words.
+5. If only \"appendage\" in list, label \"appendage\" even if it looks like leg or claw ? no out-of-list names.
 
 {multi_label_coverage_discipline}
 {parent_inheritance_block}
 {max_depth_block}
 
-只返回 JSON：
+Return JSON only:
 {{
-  "matched_parts": ["候选原文", "..."],
-  "dominant": "matched 中占比最大的一项（必填，且须在 matched_parts 内）",
-  "confidences": {{"候选原文": 0.0~1.0, "...": "每项 matched 的把握度，可选但建议填写"}}
+  "matched_parts": ["exact candidate text", "..."],
+  "dominant": "largest share among matched (required, must be in matched_parts)",
+  "confidences": {{"exact candidate": 0.0~1.0, "...": "per matched item, optional but recommended"}}
 }}
 
-说明：共 {n_candidates} 个候选；matched_parts 每项须与候选完全一致。
+Note: {n_candidates} candidates; each matched_parts entry must match candidate text exactly.
 """
-
 
 SPLIT_COVERAGE_REPAIR_SYSTEM_PROMPT = (
-    "你是 3D 分块多标签判别员。"
-    "父块几何分裂后，各子块标注的并集须覆盖父块分裂前的全部语义。"
-    "若某些父级语义在兄弟子块并集中缺失，请结合附图**重新判断本块**红色高亮区域实际覆盖的部位。"
-    "只能从候选集中勾选；至少选 1 项。只输出 JSON。"
+    "You are a 3D block multi-label classifier. "
+    "After parent geometric split, union of child labels must cover all parent semantics. " "If parent semantics missing from sibling union, re-judge **this block's** red coverage from the image. "
+    "Select only from candidate set; at least 1. JSON only."
 )
 
+SPLIT_COVERAGE_REPAIR_USER_TEMPLATE = """Parent block ?{parent_id}? labels before split: {parent_matched}
 
-SPLIT_COVERAGE_REPAIR_USER_TEMPLATE = """父块「{parent_id}」分裂前标注：{parent_matched}
-
-各兄弟子块当前标注（仅供参考；以你看到的**本块**几何为准）：
+Sibling block labels (reference only; judge **this block** geometry from image):
 {siblings_table}
 
-**并集中缺失、须由某个子块认领的语义**：{missing_parts}
-（每项应恰好落入一个子块；仅当本图红色高亮区**确实覆盖**该部位时才加入 matched_parts）
+**Missing from union ? must be claimed by some child**: {missing_parts}
+(Each item should land in exactly one child; add to matched_parts only if **this** red highlight actually covers it)
 
-本图高亮块：**{block_id}**
+Highlighted block on this image: **{block_id}**
 
-候选（封闭集，只能从中选，须原样拼写）：
+Candidates (closed set ? exact spelling):
 {candidate_table}
 
-规则
+Rules
 -----------------------------------
-1. 只判断**本块**（鲜艳红/橙高亮）实际几何，勿照搬兄弟标注。
-2. matched_parts 至少 1 项；若本块含缺失列表中的部位，**必须**纳入 matched_parts。
-3. 本块不含的缺失项不要勾选。
-4. 通常 1~3 个相邻候选；≥4 项先删减不确定项。
-5. 小部位（头、手、指等）若本块高亮区确有该几何，**必须**纳入 matched_parts，禁止漏标。
+1. Judge **only this block** (bright red/orange); do not copy sibling labels.
+2. matched_parts at least 1; if this block contains missing items, **must** include them.
+3. Do not check missing items this block does not contain.
+4. Usually 1~3 adjacent candidates; if ?4, delete uncertain items.
+5. Small parts (head, hand, finger?) must be included if this block's red covers them.
 
-只返回 JSON：
+Return JSON only:
 {{
-  "matched_parts": ["候选原文", "..."],
-  "dominant": "matched 中占比最大的一项（必填，且须在 matched_parts 内）"
+  "matched_parts": ["exact candidate text", "..."],
+  "dominant": "largest among matched (required, in matched_parts)"
 }}
 """
 
-
 EMPTY_SEMANTIC_REPAIR_SYSTEM_PROMPT = (
-    "你是 3D 全覆盖语义审计员。"
-    "枚举清单中每一项最终都必须至少占 1 个 mesh face，不允许 0 face 的空语义。"
-    "对 0 face 的项，你只能二选一："
-    "split=从已有块中分裂 carve 出该部位；delete=从清单删除该项。"
-    "只输出 JSON。"
+    "You are a 3D full-coverage semantic auditor. "
+    "Every enumeration item must occupy at least 1 mesh face ? zero-face semantics forbidden. " "For zero-face items choose exactly one: "
+    "split=carve from existing block; delete=remove from list. "
+    "JSON only."
 )
 
+EMPTY_SEMANTIC_REPAIR_USER_TEMPLATE = """Current segmentation (12-view semantic color map) in attached image.
 
-EMPTY_SEMANTIC_REPAIR_USER_TEMPLATE = """当前分割结果（12 视角按语义上色图）见附图。
-
-语义清单与各部位 face 数（**0 表示空语义，必须处理**）：
+Semantic list and face counts (**0 = empty, must fix**):
 {counts_table}
 
-0 face 的语义（必须逐项给出 repair）：
+Zero-face semantics (one repair each):
 {empty_list}
 
-可供 split 时选取的 donor 块（只能从下表 block_id 里选；须足够大以便分裂）：
+Donor blocks for split (block_id from table below; must be large enough to split):
 {donor_table}
 
-任务
+Task
 -----------------------------------
-对每个 0 face 语义给出 **唯一** repair：
-- **split**：从 donor 块里 carve 出该语义的几何。
-  必须填 `donor_block_id`（上表之一），优先选几何上最可能包含该部位的块。
-- **delete**：模型上不存在或已被其它语义覆盖，从清单移除该项。
-  不要填 `donor_block_id`。
+For each zero-face semantic give **one** repair:
+- **split**: carve geometry from a donor block.
+  Must set `donor_block_id` (from table); prefer block most likely containing that part.
+- **delete**: part absent or covered by other semantics ? remove from list.
+  Omit `donor_block_id`.
 
-只能返回 JSON：
+Return JSON only:
 {{
   "repairs": [
     {{
-      "empty_semantic": "须与上面 0 face 列表完全一致",
+      "empty_semantic": "must match zero-face list exactly",
       "action": "split | delete",
-      "donor_block_id": "split 时必填 block_id；delete 时省略或空字符串",
-      "reason": "≤30 字"
+      "donor_block_id": "required for split; omit or empty for delete",
+      "reason": "?30 chars English"
     }}
   ]
 }}
 
-要求：repairs 必须覆盖全部 0 face 语义，每项恰好 1 条；不得遗漏。
+Requirement: repairs cover all zero-face semantics, exactly one row each; none missing.
 """
 
-
 # ---------------------------------------------------------------------------
-# 拓扑约束推断（用户已给定 semantic_parts、跳过枚举时补拓扑）
+# Topology constraint inference (when user supplied semantic_parts, skip enumerate)
 # ---------------------------------------------------------------------------
 
 TOPOLOGY_INFER_SYSTEM_PROMPT = (
-    "你是 3D 模型骨架拓扑分析员。"
-    "根据整模型渲染图和给定的语义部位清单，推断各部位的连通块数量与骨架连接关系。"
-    "对称重复部件在清单中已合并为一项时，count 写其实例总数。"
-    "必须从语义骨架推断 attach_to 链，确保所有肢类最终连接主体。"
-    "禁止在输出中使用左/右/前/后/上/下等方位词。只输出 JSON。"
+    "You are a 3D model skeleton topology analyst. "
+    "From whole-model render and given semantic part list, infer connected component counts and skeleton attachments. " "When symmetric parts merged in list, count = total instances. "
+    "Infer attach_to chains from semantic skeleton; all limbs must connect to body. " "No directional words in output. JSON only."
 )
 
-TOPOLOGY_INFER_USER_TEMPLATE = """12 视角整模型拼图（淡色、无高亮）。
+TOPOLOGY_INFER_USER_TEMPLATE = """12-view whole-model collage (muted, no highlight).
 
-已给定的语义部位清单（封闭集，不得增删改名）：
+Given semantic part list (closed set ? do not add/rename):
 {parts_table}
 
-任务：为每项给出 topology_constraints（从**语义骨架**推断，不靠视角方位）。
+Task: topology_constraints for each item (from **semantic skeleton**, not view direction).
 
 **count**
-- 对称重复部件：写完整模型上的**实例数**（如「上臂」=2，「肢」=4）。
-- 唯一/中心部件（躯干、头、颈、尾、椅面等）：通常 =1。
-- 若清单同时含上臂+前臂+大腿+小腿（或等价四肢语义），四肢实例合计应为 4。
+- Symmetric repeats: **instance count** on full model (e.g. upper arm=2, limb=4).
+- Unique/central parts (torso, head, neck, tail, seat?): usually =1.
+- If list has upper arm+forearm+thigh+calf, total limb instances should be 4.
 
-**attach_to**（必须邻接连接的上级，用清单原文；主体/根写 []）
-- 所有肢类必须 attach_to 主体（躯干/椅面等）。
-- 链式骨架：子段连直接上级（前臂→上臂→躯干，小腿→大腿→躯干，椅背→椅面）。
-- **铁律**：每条肢链的根都必须与主体邻接；attach_to 只能引用清单中已有部位。
+**attach_to** (must-adjacent parent, list exact names; body/root = [])
+- All limb classes attach_to body (torso/seat?).
+- Chain: forearm?upper arm?torso, calf?thigh?torso, backrest?seat.
+- **Rules**: each limb chain root adjacent to body; attach_to references only listed parts.
 
-只返回 JSON：
+Return JSON only:
 {{
   "topology_constraints": [
-    {{"part": "清单原文", "count": 1, "attach_to": []}},
+    {{"part": "exact list name", "count": 1, "attach_to": []}},
     ...
   ]
 }}
 
-要求：topology_constraints 必须覆盖清单中的**每一项**，且 part 与清单完全一致；count 与 attach_to 须互相自洽。
+Requirement: cover **every** list item; part names exact; count and attach_to consistent.
 """
 
-
 # ---------------------------------------------------------------------------
-# 拓扑违规修复（分割完成后审计 count / attach_to）
+# Topology violation repair (audit count / attach_to after segmentation)
 # ---------------------------------------------------------------------------
 
 TOPOLOGY_REPAIR_SYSTEM_PROMPT = (
-    "你是 3D 全覆盖语义拓扑审计员。"
-    "根据渲染图、期望拓扑约束与实际连通块统计，找出违规并给出修复方案。"
-    "核心原则：块数多了→relabel 到正确语义；块数少了→几何分裂 donor 块，"
-    "由你决定切成几块、每块归哪个语义（不必全归同一语义）。"
-    "修复须满足语义骨架：对称部件实例数正确、所有肢链根节点与主体邻接。"
-    "修复动作："
-    "reassign_component=改标已有连通块；"
-    "geometric_split=几何切分 donor 块为 seed_count 块并按 child_assignments 归语义。"
-    "禁止在说明中使用左/右/前/后/上/下等方位词。只输出 JSON。"
+    "You are a 3D full-coverage semantic topology auditor. "
+    "From render, expected topology, and actual component stats, find violations and propose fixes. " "Too many blocks ? relabel; too few ? geometric_split donor with your seed_count and per-child semantics. "
+    "Maintain skeleton: correct symmetric instance counts, limb chains rooted at body. " "Actions: reassign_component, geometric_split, cut_adjacency, cut_bridge, boundary_refine. "
+    "No directional words. JSON only."
 )
 
-TOPOLOGY_REPAIR_USER_TEMPLATE = """当前分割结果（12 视角按语义上色图）见附图。
+TOPOLOGY_REPAIR_USER_TEMPLATE = """Current segmentation (12-view semantic color map) in attached image.
 
-期望拓扑约束：
+Expected topology constraints:
 {constraints_table}
 
-实际各部位连通块数（几何上互不相连的块数）：
+Actual connected component counts:
 {component_table}
 
-邻接关系（实际哪些部位共享边界）：
+Adjacency (parts sharing boundary):
 {adjacency_table}
 
-检测到的拓扑违规（须逐项修复）：
+Detected topology violations (fix each):
 {violations_table}
 
-可供 carve / subdivide 时选取的 donor 块（block_id / 当前语义 / 面数）：
+Donor blocks for carve/subdivide (block_id / current semantic / face count):
 {donor_table}
 
-修复决策（按违规类型）
+Repair decisions (by violation type)
 -----------------------------------
-**count_high（块数过多 / 冗余）**：
-  多出来的连通块**实际**是哪个部位？看图判断，不要简单删掉。
-  → 优先 **reassign_component**：把多余块从 from_semantic 改标到它真正对应的 to_semantic。
-    例：躯干 2 块，其中一块其实是头 → from=躯干, to=头, component_index=2。
-    这可能同时修复另一个 count_low 的部位。
+**count_high (too many / redundant)**:
+  Which part are extra components really? Judge from image.
+  ? Prefer **reassign_component**: relabel from from_semantic to to_semantic, component_index=N.
+    May also fix a count_low elsewhere.
 
-**count_low（块数不足）**：
-  缺失的块去哪了？先判断是「合并了」还是「标错了」还是「嵌在别的块里」。
-  情形 A — 同语义内多块合并（如两臂合成一块）：
-    → **geometric_split**：切开 donor，child_assignments 可多个归同一语义。
-  情形 B — 缺失块被标到别的语义：
-    → **reassign_component**：from_semantic=错标处, to_semantic=缺块处。
-  情形 C — 一块里混了多个语义、需拆开：
-    → **geometric_split**：你决定 seed_count（2~{max_split}），
-      child_assignments 列出切分后每块（按拼图数字标签 1..K 顺序）应归哪个语义；
-      **不必全归同一语义**，例：躯干块里嵌着两条手臂 → 切成 3 块 [手臂,手臂,躯干]。
-  情形 D — 四肢实例不足且应全部连接躯干：
-    → 优先 geometric_split 从 donor 切出缺失肢实例，并确保切出块 attach_to 链正确。
+**count_low (too few)**:
+  Missing blocks merged, mislabeled, or embedded?
+  Case A ? same semantic merged (two arms in one block):
+    ? **geometric_split**: child_assignments may repeat same semantic.
+  Case B ? block mislabeled elsewhere:
+    ? **reassign_component**.
+  Case C ? multiple semantics in one block:
+    ? **geometric_split**: you choose seed_count (2~{max_split}),
+      child_assignments for each piece (labels 1..K in collage order); not all same semantic.
+      Ex: torso block with two arms ? 3 pieces [arm, arm, torso].
+  Case D ? limb instances short, should all attach to torso:
+    ? geometric_split from donor; ensure attach_to chain correct.
 
-**geometric_split 说明**：
-  - seed_count：几何切分块数（≥2，按实际需要，可 >2）。
-  - child_assignments：长度须等于 seed_count；index 从 1 起，与拼图上数字标签一一对应；
-    按**语义拓扑**预分配（同类对称实例可重复同一语义名）；管线切分后会再让 VLM 看图确认编号对应。
-  - donor_block_id：被切的叶块（block_id）。
+**geometric_split notes**:
+  - seed_count: pieces to cut (?2).
+  - child_assignments: length = seed_count; index 1..K matches collage numeric labels;
+    pre-assign by topology (symmetric instances may repeat semantic name); pipeline re-confirms visually.
+  - donor_block_id: leaf block to cut.
 
-**missing_attachment**：
-  某部位应有 attach_to 上级但实际无共享边界 → 优先 reassign 到正确语义，或 geometric_split 把嵌套块剥离并改标，
-  使每条肢链根节点与主体（躯干/椅面等）恢复邻接。
+**missing_attachment**:
+  Part should attach_to parent but no shared boundary ? reassign or geometric_split to restore limb-root adjacency to body.
 
-**illegal_adjacency（非法邻接，如头↔手臂）**：
-  → **cut_adjacency**：from_semantic=部位A, to_semantic=部位B。
-  管线将用拉普拉斯谱分解 + 凹缝测地切割，强制在几何上断开伪连接。
+**illegal_adjacency (e.g. head?arm)**:
+  ? **cut_adjacency**: from_semantic=A, to_semantic=B; pipeline uses spectral + concave geodesic cut.
 
-**pseudo_bridge / handle_loop（伪桥梁，如两腿粘连）**：
-  → **cut_bridge**：from_semantic=部位A, to_semantic=部位B。
-  管线将定位 handle loop 并切开桥梁，再按各自核心区域重标。
+**pseudo_bridge / handle_loop (e.g. legs fused)**:
+  ? **cut_bridge**: from_semantic=A, to_semantic=B; pipeline cuts handle loop and relabels cores.
 
-**boundary_refine（手术后边界锯齿）**：
-  → **boundary_refine**：from_semantic/to_semantic 为需平滑的相邻部位对。
-  管线将用凹角感知图割能量最小化精修边界。
+**boundary_refine (jagged post-surgery boundary)**:
+  ? **boundary_refine**: adjacent pair to smooth via concavity-aware graph cut.
 
-禁止：不要随便 merge 进邻近语义；不要 delete_part。
+Forbidden: casual merge into neighbor semantic; no delete_part.
 
-若附图与统计一致、你认为**无实质违规**，返回空 repairs 列表。
+If image matches stats and no real violation, return empty repairs.
 
-只返回 JSON：
+Return JSON only:
 {{
   "topology_ok": true | false,
   "repairs": [
     {{
-      "violation": "简述违规",
+      "violation": "brief violation",
       "action": "reassign_component | geometric_split | cut_adjacency | cut_bridge | boundary_refine",
-      "from_semantic": "reassign 时：错标语义",
-      "to_semantic": "reassign 时：正确语义",
+      "from_semantic": "wrong label for reassign",
+      "to_semantic": "correct label for reassign",
       "component_index": 1,
-      "donor_block_id": "geometric_split 时必填",
+      "donor_block_id": "required for geometric_split",
       "seed_count": 2,
       "child_assignments": [
-        {{"index": 1, "semantic": "手臂"}},
-        {{"index": 2, "semantic": "手臂"}}
+        {{"index": 1, "semantic": "arm"}},
+        {{"index": 2, "semantic": "arm"}}
       ],
-      "reason": "≤30 字"
+      "reason": "?30 chars English"
     }}
   ]
 }}
 """
 
-
 GEOMETRIC_SPLIT_ASSIGN_SYSTEM_PROMPT = (
-    "你是 3D 分块语义指派员。"
-    "12 视角拼图里 donor 块已被几何切成若干编号子块（1..K，不同颜色+数字标签），"
-    "其余几何为淡灰参考。请为每个编号指定应归的语义（只能从候选集中选）。"
-    "只输出 JSON。"
+    "You are a 3D block semantic assigner. "
+    "Donor block was geometrically split into numbered sub-blocks (1..K, colors + numeric labels); rest is light gray. " "Assign each number a semantic from the candidate set. JSON only."
 )
 
-GEOMETRIC_SPLIT_ASSIGN_USER_TEMPLATE = """donor 块 {donor_block_id} 当前语义：「{donor_semantic}」
-几何切分后共 {child_count} 块，拼图上以数字 1..{child_count} 标出。
+GEOMETRIC_SPLIT_ASSIGN_USER_TEMPLATE = """Donor block {donor_block_id} current semantic: ?{donor_semantic}?
+After geometric split: {child_count} pieces labeled 1..{child_count} on collage.
 
-候选语义（封闭集，必须原样拼写）：
+Candidate semantics (closed set ? exact spelling):
 {candidate_table}
 
-拓扑修复阶段建议的预分配（仅供参考，以你看到的几何为准）：
+Topology repair pre-assignment (reference ? trust geometry you see):
 {planned_table}
 
-任务
+Task
 -----------------------------------
-为每个编号 1..{child_count} 指定 semantic（候选原文）。
-不同编号可以归同一语义，也可以归不同语义。
+For each index 1..{child_count} assign semantic (exact candidate text).
+Different indices may share or differ in semantic.
 
-只返回 JSON：
+Return JSON only:
 {{
   "assignments": [
-    {{"index": 1, "semantic": "候选原文"}},
-    ... 必须覆盖 1..{child_count} 每个编号
+    {{"index": 1, "semantic": "exact candidate"}},
+    ... must cover every index 1..{child_count}
   ]
 }}
 """
 
 
 def build_enumerate_prompt(*, hint: str = "") -> ClassifyPrompt:
-    """构建「枚举全覆盖语义部位」提示。`hint` 注入额外约束
-    （例如「四足猫，按动物骨架短名分区」）。"""
+    """Build full-coverage semantic enumeration prompt. `hint` injects extra constraints
+    (e.g. \"quadruped cat, short animal skeleton names\")."""
     hint_block = (
-        f"- 用户补充：{hint.strip()}"
+        f"- User note: {hint.strip()}"
         if hint and hint.strip()
-        else "- 无额外说明：按上图形态自选合适模板，保持短名全覆盖。"
+        else "- No extra note: pick appropriate template from image, short full-coverage names."
     )
     return ClassifyPrompt(
         system=ENUMERATE_SYSTEM_PROMPT,
@@ -1443,19 +1622,19 @@ def build_multi_label_prompt(
     current_depth: int = 0,
     max_depth: int = 0,
 ) -> ClassifyPrompt:
-    """构建「多标签 — 命中候选集中的哪些部位」提示。"""
+    """Build multi-label prompt ? which candidate parts the block hits."""
     parts = [str(x).strip() for x in candidate_parts if str(x).strip()]
     if not parts:
-        raise ValueError("candidate_parts 不能为空")
+        raise ValueError("candidate_parts must not be empty")
     candidate_table = "\n".join(f"- {i+1}. {p}" for i, p in enumerate(parts))
 
     parent_list = [str(x).strip() for x in (parent_matched or []) if str(x).strip()]
     if parent_list:
         parent_context_block = (
-            f"\n父块语义约束（上一轮分裂前父块标注）\n"
+            f"\nParent semantic constraint (labels before parent split)\n"
             f"-----------------------------------\n"
-            f"本块 **{block_id or '?'}** 由父块 **{parent_id or '?'}** 几何分裂而来。\n"
-            f"父块 parent_matched（子块原则上只能从中选）：{parent_list}\n"
+            f"Block **{block_id or '?'}** split from parent **{parent_id or '?'}**.\n"
+            f"Parent parent_matched (child should pick only from these): {parent_list}\n"
         )
         parent_inheritance_block = MULTI_LABEL_PARENT_INHERITANCE_DISCIPLINE
     else:
@@ -1492,15 +1671,15 @@ def build_split_coverage_repair_prompt(
     missing_parts: Sequence[str],
     candidate_parts: Sequence[str],
 ) -> ClassifyPrompt:
-    """分裂后语义覆盖缺失：提醒 VLM 结合上下文重新勾选本块 matched_parts。"""
+    """After split, missing semantic coverage ? re-prompt VLM to re-check matched_parts."""
     parts = [str(x).strip() for x in candidate_parts if str(x).strip()]
     if not parts:
-        raise ValueError("candidate_parts 不能为空")
+        raise ValueError("candidate_parts must not be empty")
     candidate_table = "\n".join(f"- {i+1}. {p}" for i, p in enumerate(parts))
     siblings_table = "\n".join(
         f"- {bid}: {list(matched)}"
         for bid, matched in sorted(sibling_matched.items())
-    ) or "（无）"
+    ) or "(none)"
     return ClassifyPrompt(
         system=SPLIT_COVERAGE_REPAIR_SYSTEM_PROMPT,
         user=SPLIT_COVERAGE_REPAIR_USER_TEMPLATE.format(
@@ -1517,7 +1696,7 @@ def build_split_coverage_repair_prompt(
 def build_topology_infer_prompt(
     semantic_parts: Sequence[str],
 ) -> ClassifyPrompt:
-    """用户已给定 semantic_parts 时，补推断拓扑约束。"""
+    """When user already supplied semantic_parts, infer topology constraints."""
     parts = [str(x).strip() for x in semantic_parts if str(x).strip()]
     parts_table = "\n".join(f"- {i+1}. {p}" for i, p in enumerate(parts))
     return ClassifyPrompt(
@@ -1536,29 +1715,29 @@ def build_topology_repair_prompt(
     donor_blocks: Sequence[Dict[str, Any]],
     max_split: int = 8,
 ) -> ClassifyPrompt:
-    """拓扑违规修复：VLM 决定 reassign / geometric_split。"""
+    """Topology violation repair: VLM chooses reassign / geometric_split."""
     constraints_table = "\n".join(
         f"- {c.get('part', '?')}: count={c.get('count', '?')}, "
         f"attach_to={c.get('attach_to', [])}"
         for c in topology_constraints
-    ) or "（无约束）"
+    ) or "(no constraints)"
     component_table = "\n".join(
-        f"- {p}: {int(component_counts.get(p, 0))} 块"
+        f"- {p}: {int(component_counts.get(p, 0))} components"
         for p in sorted(component_counts.keys())
     )
     detail_lines: List[str] = []
     for d in component_details:
         detail_lines.append(
             f"  - {d.get('semantic', '?')} #{d.get('index', '?')}: "
-            f"{int(d.get('faces', 0))} face"
+            f"{int(d.get('faces', 0))} faces"
         )
     component_table += (
-        "\n各块明细：\n" + "\n".join(detail_lines) if detail_lines else ""
+        "\nPer-component detail:\n" + "\n".join(detail_lines) if detail_lines else ""
     )
     adjacency_table = (
-        "\n".join(f"- {a} ↔ {b}" for a, b in adjacency_pairs)
+        "\n".join(f"- {a} ? {b}" for a, b in adjacency_pairs)
         if adjacency_pairs
-        else "（无邻接）"
+        else "(no adjacency)"
     )
     violations_table = (
         "\n".join(
@@ -1566,15 +1745,15 @@ def build_topology_repair_prompt(
             for v in violations
         )
         if violations
-        else "（无自动检测违规，请结合附图自行判断）"
+        else "(no auto-detected violations ? judge from attached image)"
     )
     if donor_blocks:
         donor_table = "\n".join(
-            f"- {b['block_id']}: {b['semantic']}, {int(b['faces'])} face"
+            f"- {b['block_id']}: {b['semantic']}, {int(b['faces'])} faces"
             for b in donor_blocks
         )
     else:
-        donor_table = "（无可用 donor 块）"
+        donor_table = "(no available donor blocks)"
     return ClassifyPrompt(
         system=TOPOLOGY_REPAIR_SYSTEM_PROMPT,
         user=TOPOLOGY_REPAIR_USER_TEMPLATE.format(
@@ -1596,7 +1775,7 @@ def build_geometric_split_assign_prompt(
     candidate_semantics: Sequence[str],
     planned_assignments: Sequence[Dict[str, Any]],
 ) -> ClassifyPrompt:
-    """几何切分后：VLM 为每个编号子块指定语义。"""
+    """After geometric split: VLM assigns semantic to each numbered child."""
     candidates = [str(x).strip() for x in candidate_semantics if str(x).strip()]
     candidate_table = "\n".join(f"- {i+1}. {p}" for i, p in enumerate(candidates))
     if planned_assignments:
@@ -1605,12 +1784,12 @@ def build_geometric_split_assign_prompt(
             for a in planned_assignments
         )
     else:
-        planned_table = "（无预分配）"
+        planned_table = "(no pre-assignment)"
     return ClassifyPrompt(
         system=GEOMETRIC_SPLIT_ASSIGN_SYSTEM_PROMPT,
         user=GEOMETRIC_SPLIT_ASSIGN_USER_TEMPLATE.format(
             donor_block_id=str(donor_block_id).strip(),
-            donor_semantic=str(donor_semantic).strip() or "（未知）",
+            donor_semantic=str(donor_semantic).strip() or "(unknown)",
             child_count=max(1, int(child_count)),
             candidate_table=candidate_table,
             planned_table=planned_table,
@@ -1625,19 +1804,19 @@ def build_empty_semantic_repair_prompt(
     empty_parts: Sequence[str],
     donor_blocks: Sequence[Dict[str, Any]],
 ) -> ClassifyPrompt:
-    """0 face 语义补救：VLM 决定 split（从 donor 块 carve）或 delete。"""
+    """Zero-face semantic repair: VLM chooses split (from donor) or delete."""
     counts_table = "\n".join(
-        f"- {p}: {int(face_counts.get(p, 0))} face"
+        f"- {p}: {int(face_counts.get(p, 0))} faces"
         for p in semantic_parts
     )
     empty_list = "\n".join(f"- {p}" for p in empty_parts)
     if donor_blocks:
         donor_table = "\n".join(
-            f"- {b['block_id']}: {b['semantic']}, {int(b['faces'])} face"
+            f"- {b['block_id']}: {b['semantic']}, {int(b['faces'])} faces"
             for b in donor_blocks
         )
     else:
-        donor_table = "（无可用 donor 块 → 只能 delete）"
+        donor_table = "(no available donor blocks ? delete only)"
     return ClassifyPrompt(
         system=EMPTY_SEMANTIC_REPAIR_SYSTEM_PROMPT,
         user=EMPTY_SEMANTIC_REPAIR_USER_TEMPLATE.format(
@@ -1649,42 +1828,40 @@ def build_empty_semantic_repair_prompt(
 
 
 # ---------------------------------------------------------------------------
-# 同部位不连通块细分命名：一个「肢」断成 4 块 → 让 VLM 决定是否拆成
-# 多个实例名（如 肢-1/肢-2），依据拓扑角色而非视角方位。
+# Disconnected components of same part: e.g. one \"limb\" ? 4 blocks ? instance names
 # ---------------------------------------------------------------------------
 
 COMPONENT_NAME_SYSTEM_PROMPT = (
-    "你是 3D 模型部位命名助手。"
-    "某个语义部位在几何上断成了多个互不相连的块；"
-    "12 视角拼图里每个块用**不同颜色 + 数字标签 (1..N)** 标出，其余几何为淡灰仅作参考。"
-    "请结合各块与主体的**邻接/骨架角色**，决定是否给每个块一个更具体的名字"
-    "（如 肢-1 / 肢-2、翼-1 / 翼-2）；"
-    "若它们本就是同一部位的碎片、或无法可靠区分实例，则沿用原名。"
-    "禁止在 label 中使用左/右/前/后/上/下等方位词。只输出 JSON。"
+    "You are a 3D part naming assistant. "
+    "One semantic part broke into multiple disconnected components;"
+    "12-view collage colors each with numeric label (1..N), rest light gray. "
+    "From **adjacency/skeleton role** vs body, decide per-block labels"
+    "(e.g. limb-1 / limb-2, wing-1 / wing-2) or keep original name if fragments/indistinguishable. "
+    "No directional words in labels. JSON only."
 )
 
-COMPONENT_NAME_USER_TEMPLATE = """原语义部位：「{part}」。它在几何上断成了 {n} 个互不相连的块。
-拼图里这些块按数字标签 1..{n} 标出（每块一个独立颜色 + 重心数字标签）。
+COMPONENT_NAME_USER_TEMPLATE = """Original semantic part: ?{part}?. Geometrically split into {n} disconnected components.
+Collage labels them 1..{n} (unique color + centroid numeric label).
 
-各块拓扑参考（与主体的连接关系、相对尺度，已按数字标签编号）：
+Per-component topology reference (body connection, relative scale, by numeric label):
 {component_table}
 
-任务
+Task
 -----------------------------------
-1. 逐个数字块看清它在主体骨架中的角色（结合 12 视角 + 上表邻接信息）。
-2. 给每个编号一个 `label`：
-   - 若这些块其实是**对称 / 重复的同类部件**（四条肢、一对翅膀、多个轮…），
-     用**实例后缀**区分：「{part}-1」「{part}-2」… 或语义子类名（仍禁止方位词）。
-   - 若它们应当是**同一个部位的碎片**、或实例无法可靠区分 → label 直接写原名「{part}」。
-3. label 要短（≤8 字）；不要给毫无依据的实例名（拿不准就沿用原名）。
-   同一原部位下，**真正不同的块**才用不同名字。
+1. Inspect each numbered block in 12 views + adjacency table.
+2. Assign each `label`:
+   - If **symmetric/repeated same-class parts** (four limbs, wing pair, wheels?),
+     use **instance suffix**: \"{part}-1\", \"{part}-2\"? or semantic subtype (no directional words).
+   - If **fragments of one part** or instances indistinguishable ? label = original ?{part}?.
+3. Labels short (?8 chars); no unjustified instance names ? when unsure keep original.
+   **Different blocks** get different names only when truly distinct.
 
-只返回 JSON：
+Return JSON only:
 {{
   "split": true | false,
   "components": [
-    {{"id": 1, "label": "肢-1", "reason": "独立连通块，与躯干邻接"}},
-    ... 必须为 1..{n} 每个编号各一条
+    {{"id": 1, "label": "limb-1", "reason": "independent component adjacent to torso"}},
+    ... one row per index 1..{n}
   ]
 }}
 """
@@ -1695,7 +1872,7 @@ def build_component_name_prompt(
     n: int,
     component_table: str,
 ) -> ClassifyPrompt:
-    """构建「同部位不连通块细分命名」提示。"""
+    """Build prompt for naming disconnected components of the same semantic part."""
     return ClassifyPrompt(
         system=COMPONENT_NAME_SYSTEM_PROMPT,
         user=COMPONENT_NAME_USER_TEMPLATE.format(
@@ -1717,20 +1894,28 @@ def build_split_strategy_prompt(
     block_faces: int = 0,
     split_stage: str = "main",
     strategy_hint: str = "",
+    media_type: MediaType = "mesh",
 ) -> ClassifyPrompt:
-    """生成 VLM 分块策略选择提示。"""
+    """Build VLM split-strategy selection prompt."""
     import json as _json
 
     hint = str(strategy_hint or "").strip()
     if not hint or hint == "auto":
-        hint_text = "无（由你根据语义与 block_faces 全权决定）"
+        hint_text = "none (you decide from semantics and block_faces)"
     else:
-        hint_text = f"用户倾向 {hint}，但若与 block_faces 规模冲突，以规模约束为准"
+        hint_text = f"user prefers {hint}, but if it conflicts with block_faces scale, scale wins"
+
+    if media_type == "pointcloud":
+        _system = SPLIT_STRATEGY_SYSTEM_PROMPT_POINTCLOUD
+        _user_template = SPLIT_STRATEGY_USER_TEMPLATE_POINTCLOUD
+    else:
+        _system = SPLIT_STRATEGY_SYSTEM_PROMPT
+        _user_template = SPLIT_STRATEGY_USER_TEMPLATE
 
     return ClassifyPrompt(
-        system=SPLIT_STRATEGY_SYSTEM_PROMPT,
-        user=SPLIT_STRATEGY_USER_TEMPLATE.format(
-            semantic_context=str(semantic_context or "").strip() or "（未指定）",
+        system=_system,
+        user=_user_template.format(
+            semantic_context=str(semantic_context or "").strip() or "(unspecified)",
             seed_count=max(2, int(seed_count)),
             covered_parts_json=_json.dumps(
                 covered_parts or [], ensure_ascii=False
@@ -1752,35 +1937,35 @@ def build_split_strategy_prompt(
 
 SEED_USER_TEMPLATE_POINTCLOUD = """{render_guide}
 
-用户给定的语义区域：「{semantic}」
+User semantic region: ?{semantic}?
 
-上一轮分类的结构化结果（**先验事实**，优先采信，不要凭图片推翻）：
-- covered_parts（红色覆盖的所有部位）= {covered_parts_json}
-- semantic_parts（其中属于「{semantic}」的部位）= {semantic_parts_json}
-- extra_parts（红色多出来、不属于语义的部位）= {extra_parts_json}
-- 当前块规模 ≈ {block_size} {size_unit}
+Structured results from prior classification (**prior facts** ? trust, do not overturn from image):
+- covered_parts (all red-covered parts) = {covered_parts_json}
+- semantic_parts (subset belonging to ?{semantic}?) = {semantic_parts_json}
+- extra_parts (red outside semantic) = {extra_parts_json}
+- current block size ? {block_size} {size_unit}
 
 ==================================
-任务：估计 seed_count（切成几个子块）
+Task: estimate seed_count (how many sub-blocks to cut)
 ==================================
 
-**目标**：切完后，**至少有一个子块只覆盖 semantic_parts**，其它子块落在 extra_parts 上。
+**Goal**: after cut, **at least one sub-block covers only semantic_parts**, others on extra_parts.
 
-**怎么估 seed_count（按顺序想）**
+**How to estimate seed_count (think in order)**
 -----------------------------------
-Step 1. 数 covered_parts 里有几个**不同部位** → 基准 = max(2, 部位数 + 1)
-Step 2. 若 extra_parts 含大块躯干/头部/整段肢体 → 至少给 4（几何上难一刀切开）
-Step 3. 块越大（>{large_threshold} {size_unit}）越倾向多切，复杂时给 4~5
-Step 4. 仅当 covered_parts 只有 1 个小区域 → 才允许 seed_count=2
-Step 5. 上限 {max_seeds}
+Step 1. Count **distinct parts** in covered_parts ? baseline = max(2, part_count + 1)
+Step 2. If extra_parts includes large torso/head/whole limb ? at least 4 (hard to cut in one)
+Step 3. Larger block (>{large_threshold} {size_unit}) ? prefer more pieces; complex ? 4~5
+Step 4. Only when covered_parts is one small region ? seed_count=2 allowed
+Step 5. Cap {max_seeds}
 
-例：covered=[头顶尖发, 整张脸, 颈部] → 3 部位 → 建议 4（留边界余量）
-例：covered=[枪管, 握把]、semantic=[枪管] → 建议 3~4，把握把剥出去
+Ex: covered=[crown hair, full face, neck] ? 3 parts ? suggest 4 (margin)
+Ex: covered=[barrel, grip], semantic=[barrel] ? suggest 3~4 to peel grip off
 
-只能返回如下 JSON：
+Return JSON only:
 {{
-  "seed_count": <int, 通常 3 或 4，复杂时 5；最少 2，最多 {max_seeds}>,
-  "reason": "中文：列了几个部位、为何需要这个 seed_count"
+  "seed_count": <int, usually 3 or 4, complex 5; min 2, max {max_seeds}>,
+  "reason": "English: part count and why this seed_count"
 }}
 """
 
@@ -1795,14 +1980,15 @@ def build_seed_prompt(
     block_faces: int = 0,
     block_points: int | None = None,
     media_type: MediaType = "mesh",
+    n_views: int = DEFAULT_N_VIEWS,
 ) -> ClassifyPrompt:
-    """生成 seed_count 询问提示。"""
+    """Build seed_count estimation prompt."""
     import json as _json
 
     if media_type == "pointcloud":
         defaults = _media_defaults(media_type)
         block_size = int(block_points if block_points is not None else block_faces)
-        guide = RENDER_GUIDE.get(media_type, RENDER_GUIDE["mesh"])
+        guide = _render_guide(media_type, n_views)
         return ClassifyPrompt(
             system=SEED_SYSTEM_PROMPT,
             user=SEED_USER_TEMPLATE_POINTCLOUD.format(
@@ -1832,66 +2018,63 @@ def build_seed_prompt(
     )
 
 
-
 # ---------------------------------------------------------------------------
-# 语义树：VLM 根据整模型渲染图生成层级分区树
+# Semantic tree: VLM builds hierarchical partition tree from whole-model render
 # ---------------------------------------------------------------------------
 
 SEMANTIC_TREE_SYSTEM_PROMPT = (
-    "你是 3D 模型层级语义分区员。"
-    "看 12 视角整模型拼图（无高亮），输出一棵**由粗到细**的语义树："
-    "根节点代表整体，每一层把父部位拆成互不重叠、合并后全覆盖的子部位。"
-    "对称重复部件在**同一层**合并为一项（写「手臂」不写「左臂/右臂」）。"
-    "名称宜简（2~6 字）；深层可拆手指/装饰，但勿过度细碎。"
-    "禁止在名称中使用左/右/前/后/上/下等方位词。只输出 JSON。"
+    "You are a 3D hierarchical semantic partitioner. "
+    "View 12-panel whole-model collage (no highlight); output a **coarse-to-fine semantic tree**:"
+    "root is whole object; each level splits parent into non-overlapping children covering parent fully. "
+    "Merge symmetric repeats at same level (\"arm\" not \"left arm/right arm\"). "
+    "Names 2~6 chars; deeper levels may split fingers/ornament but not over-fragment. " "No directional words in names. JSON only."
 )
 
+SEMANTIC_TREE_USER_TEMPLATE = """12-view whole-model collage (muted, no highlight).
 
-SEMANTIC_TREE_USER_TEMPLATE = """12 视角整模型拼图（淡色、无高亮）。
+Task: **hierarchical semantic tree** ? from root \"whole\", each level splits parent into child parts.
+Pipeline will geometrically split level by level; you only provide **reasonable hierarchy**.
 
-任务：生成**层级语义树**——从根「整体」开始，每一层把父节点拆成若干子部位。
-后续 pipeline 会从根逐层做几何切分；你只需给出**合理的层级结构**。
+Example (humanoid ? structure only, do not copy names blindly):
+  whole ? upper body / lower body
+  upper body ? head / torso / arm
+  arm ? upper arm / forearm / hand
+  hand ? palm / wrist / fingers
+  lower body ? thigh / calf / foot
 
-示例（类人，仅示意层级，勿照搬名称）：
-  整体 → 上半身 / 下半身
-  上半身 → 头 / 躯干 / 手臂
-  手臂 → 大臂 / 小臂 / 手
-  手 → 手掌 / 手腕 / 手指
-  下半身 → 大腿 / 小腿 / 脚
-
-命名与颗粒度
+Naming and granularity
 -----------------------------------
-- 每项 2~6 字，不用括号、不用「含/及/+」合并多项。
-- **禁止**用左/右/前/后/上/下等方位词。
-- 第 1 层（根的子节点）宜粗：2~4 项（如上半身/下半身，或头/躯干/四肢）。
--  deeper 层逐步细化；叶子可以是手指、鞋面等细节。
-- 子节点合并后应**完整覆盖**父节点几何，彼此不重叠。
-- 树深度建议 2~{max_depth} 层（含根）；不要为凑深度而拆无意义项。
+- Each item 2~6 chars; no parentheses; no \"includes/and/+\" in one name.
+- **No** directional words.
+- Level 1 (root children) coarse: 2~4 items (upper/lower body, or head/torso/limbs).
+- Deeper levels refine; leaves may be fingers, shoe top, etc.
+- Children must **fully cover** parent geometry, non-overlapping.
+- Suggested tree depth 2~{max_depth} levels (including root); do not pad depth with meaningless splits.
 {hint_block}
 
-约束
+Constraints
 -----------------------------------
-1. 根节点 name 固定为「整体」；children 非空。
-2. 每个非叶节点的 children 至少 2 项、至多 8 项。
-3. 叶节点 children = []。
-4. 同一语义名不要在树的不同分支重复出现。
-5. 不要出现 background / 其它 / 未分类 等兜底项。
+1. Root name fixed \"whole\"; children non-empty.
+2. Each non-leaf has 2~8 children.
+3. Leaves have children = [].
+4. Same semantic name must not appear on different branches.
+5. No background / other / unclassified catch-alls.
 
-只返回 JSON：
+Return JSON only:
 {{
-  "object_kind": "≤12 字，模型类型（如「类人角色」「四足动物」「椅子」）",
+  "object_kind": "?12 chars model type (e.g. humanoid character, quadruped, chair)",
   "tree": {{
-    "name": "整体",
+    "name": "whole",
     "children": [
       {{
-        "name": "子部位1",
+        "name": "child1",
         "children": [
-          {{"name": "更细项", "children": []}}
+          {{"name": "finer", "children": []}}
         ]
       }}
     ]
   }},
-  "reason": "≤30 字，说明层级划分依据"
+  "reason": "?30 chars English: hierarchy rationale"
 }}
 """
 
@@ -1901,16 +2084,252 @@ def build_semantic_tree_prompt(
     hint: str = "",
     max_depth: int = 5,
 ) -> ClassifyPrompt:
-    """构建「生成层级语义树」提示。"""
+    """Build hierarchical semantic tree prompt."""
     hint_block = (
-        f"- 用户补充：{hint.strip()}"
+        f"- User note: {hint.strip()}"
         if hint and hint.strip()
-        else "- 无额外说明：按上图形态自选合适层级模板。"
+        else "- No extra note: pick appropriate hierarchy template from image."
     )
     return ClassifyPrompt(
         system=SEMANTIC_TREE_SYSTEM_PROMPT,
         user=SEMANTIC_TREE_USER_TEMPLATE.format(
             hint_block=hint_block,
             max_depth=max(2, int(max_depth)),
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Post-processing: geometric cleanup of the FINAL semantic mask
+# ---------------------------------------------------------------------------
+
+POSTPROCESS_SYSTEM_PROMPT = (
+    "You are a 3D segmentation post-processing expert. The pipeline has produced a FINAL "
+    "selection (a region labelled as the user semantic). You are given (a) geometric quality "
+    "metrics of that selection and (b) a multi-view render with the selection highlighted in "
+    "bright red. Decide which geometric cleanup operations (if any) improve the selection so it "
+    "matches the semantic region more cleanly. Operate ONLY on geometry/topology of the existing "
+    "selection: you may drop islands/outliers, smooth jagged boundaries, fill enclosed holes, or "
+    "keep the largest connected piece. You must NOT invent new regions or change semantics. "
+    "If the selection is already clean and faithful, return an empty operations list. "
+    "Strict JSON only, no Markdown, no extra text."
+)
+
+POSTPROCESS_USER_TEMPLATE = """{render_guide}
+
+User semantic region: ?{semantic}?
+The bright-red points/faces are the pipeline's FINAL answer for this semantic. Judge whether its
+geometry needs cleanup.
+
+Geometric quality metrics of the current selection (computed on the {unit} graph)
+------------------------------------
+{metrics_json}
+
+Metric meaning (read before deciding)
+------------------------------------
+- selected_fraction: selection size / whole model.
+- num_components / largest_component_fraction: connectivity. Many components or a small
+  largest fraction => the selection is fragmented (scattered islands).
+- num_small_islands / island_point_fraction: count and mass of tiny disconnected blobs
+  (likely spillover or noise far from the main region).
+- boundary_ratio: fraction of selected elements on the boundary. High => thin / jagged / shredded.
+- boundary_roughness: jaggedness of the boundary (variance of local selected-ratio). High => ragged edge.
+- edge_smoothness: 0~1 composite, higher = smoother cleaner edge.
+- hole_fraction: unselected elements fully enclosed by the selection (interior holes to fill).
+- outlier_fraction: isolated selected elements far from their nearest selected neighbour.
+- solidity: selection size / elements inside its convex hull. Low (<~0.5) => the convex hull
+  bridges over OTHER parts (selection is hollow or wraps a different component). High (~1) = compact, solid.
+- mean_curvature / boundary_mean_curvature: surface variation; a clean part boundary usually
+  sits in a concave seam (boundary curvature notably higher than interior).
+
+Available cleanup operations (operations[].name must be one of)
+------------------------------------
+1. "keep_largest_component" ? drop everything except the single largest connected piece.
+   Use ONLY when small islands are clearly spurious AND the true region is one connected piece.
+2. "remove_small_components" ? drop connected pieces smaller than min_fraction x largest.
+   Use when there are a few scattered islands but the main mass is correct. params: {{ "min_fraction": 0.01~0.5 (default 0.1) }}
+3. "remove_outliers" ? drop isolated far-away selected elements. params: {{ "std_ratio": 1.5~6 (default 3.0) }}
+4. "smooth_boundary" ? morphological smoothing of a jagged/ragged edge.
+   params: {{ "mode": "open"|"close"|"both" (open=trim spikes, close=fill nicks, both=overall smooth; default "both"),
+             "iters": 1~3 (default 1) }}
+5. "fill_holes" ? add interior unselected elements enclosed by the selection.
+   params: {{ "iters": 1~4 (default 2), "threshold": 0.5~0.95 (default 0.7) }}
+
+Decision discipline
+------------------------------------
+- Be conservative. Only choose an operation when a metric AND the render agree it helps.
+- Prefer removing obvious noise (small islands / outliers) before aggressive boundary smoothing.
+- Do NOT smooth_boundary just because boundary_ratio is high on a genuinely thin part (e.g. a strap, antenna).
+- If metrics look clean (few components, high edge_smoothness, high solidity, low outlier/island/hole), return [].
+- Order matters: list operations in the order they should run (e.g. remove islands -> remove outliers -> smooth).
+
+Return ONLY this JSON:
+{{
+  "operations": [
+    {{ "name": "<op name>", "params": {{ ... only overrides ... }} }}
+  ],
+  "reason": "English brief: which metrics + visual evidence drove each op, or why no cleanup needed"
+}}
+"""
+
+
+def build_postprocess_prompt(
+    semantic: str,
+    *,
+    metrics: Dict[str, Any],
+    media_type: MediaType = "pointcloud",
+    n_views: int = DEFAULT_N_VIEWS,
+) -> ClassifyPrompt:
+    """Build the final-mask geometric post-processing decision prompt."""
+    import json as _json
+
+    unit = "point" if media_type == "pointcloud" else "face"
+    return ClassifyPrompt(
+        system=POSTPROCESS_SYSTEM_PROMPT,
+        user=POSTPROCESS_USER_TEMPLATE.format(
+            render_guide=_render_guide(media_type, n_views),
+            semantic=semantic.strip(),
+            unit=unit,
+            metrics_json=_json.dumps(metrics, ensure_ascii=False, indent=2),
+        ),
+    )
+
+
+COMPONENT_SPLIT_SYSTEM_PROMPT = (
+    "You are a 3D segmentation post-processing expert. The pipeline's FINAL selection for a user "
+    "semantic has broken into several LARGE disconnected pieces (connected components). "
+    "IMPORTANT: these components are already proven **geometrically separate** on the 3D "
+    "point/face adjacency graph — they share NO continuous path. Your job is NOT to decide "
+    "whether they are connected; they are not. Your job is to decide which disconnected "
+    "pieces truly belong to the user semantic and which are spillover into a different part. "
+    "Each large component is drawn in a distinct solid color in a multi-view collage of the "
+    "SAME 3D object from different camera angles; non-selected points/faces are dim grey. "
+    "Because each panel is a 2D projection, two physically separate 3D components can LOOK "
+    "fused or touching in some views (especially side/oblique views where depth stacks) while "
+    "being clearly apart in others (front/back/top). You MUST reason across ALL views and must "
+    "NOT treat 'looks connected in one view' as proof they are the same part. "
+    "Keep ALL components when they are merely disjoint pieces of the SAME semantic (e.g. left/right "
+    "symmetric parts, a part split by a sampling gap). Keep only a SUBSET when one large piece "
+    "clearly sits on a DIFFERENT adjacent part than the semantic. "
+    "Do NOT invent regions or change semantics. Strict JSON only, no Markdown, no extra text."
+)
+
+COMPONENT_SPLIT_USER_TEMPLATE = """{render_guide}
+
+[Color scheme for THIS task — overrides the red-highlight description above]
+Each **large disconnected component** has its own solid color ({color_legend}).
+These are NOT "one red block" — compare **color vs color** and **color vs grey context**
+across views. Dim grey = unselected model context.
+
+User semantic region: «{semantic}»
+The pipeline's FINAL selection for this semantic split into {n_components} large connected components.
+Each is shown in a distinct color: {color_legend}. All non-selected {unit}s are dim grey.
+
+Per-component sizes (fraction = component {unit}s / whole selection)
+------------------------------------
+{components_json}
+
+Other geometric metrics of the whole selection
+------------------------------------
+{metrics_json}
+
+Critical: same 3D object, many 2D views (read before deciding)
+------------------------------------
+The image is a {n_views}-view collage of the **same** 3D model from different cameras
+(elev/az labels on each panel). This is NOT {n_views} different objects.
+
+**Geometric fact (already computed):** C0, C1, … are **topologically disconnected**
+connected components — there is no continuous adjacency path between them in 3D.
+Do NOT reverse this because one panel makes two colors look merged.
+
+**Projection trap (very common):** In side / oblique views, two separate 3D parts often
+**overlap in the image** and look like one blob (depth stacking). In front / back / top
+views the **same two colors** are often clearly separated by background grey or a visible gap.
+→ A side view that looks "connected" does **NOT** mean the pieces belong together.
+→ If **any** view shows clear color separation AND one color sits on a different body part,
+  that is strong evidence to DROP that component even when another view looks fused.
+
+Multi-view decision procedure (**mandatory**)
+------------------------------------
+Step 1 — Scan **every** panel (all {n_views} views). For each component color, note:
+  - In which views is it visible?
+  - In which views is it **clearly separated** from the other colored component(s)?
+  - In which views does it **only look** fused because of projection / depth overlap?
+
+Step 2 — Pick the **best-separation view(s)** per component pair: views where two colors
+  are most obviously distinct (largest gap, least overlap, different body regions visible).
+  Prefer front/back/top over pure side views when they disagree.
+
+Step 3 — In those best-separation views, for **each** component ask:
+  "Does this colored region lie on «{semantic}» (or a sub-part of it), or on a clearly
+   DIFFERENT adjacent part (spillover across a seam)?"
+
+Step 4 — Aggregate across views:
+  - DROP a component if in its clearest-separation views it consistently sits on a part
+    **outside** «{semantic}», even if some oblique view makes it look attached to another color.
+  - KEEP a component if in clearest-separation views it lies on «{semantic}», even if some
+    side view makes it look merged with another color.
+  - KEEP **both/all** when every large component, judged in clearest-separation views,
+    is part of «{semantic}» (e.g. left+right symmetric pieces, two blobs of the same wing).
+
+Typical cases
+------------------------------------
+- **DROP spillover:** C0 (red) = main «{semantic}» mass; C1 (blue) = neighbour part that
+  touches in a side view but is clearly separate in front view → keep [0], drop C1.
+- **KEEP symmetric / same part:** C0 + C1 = left and right pieces of «{semantic}»; separated
+  in front view but both clearly on the semantic → keep [0, 1].
+- **KEEP sampling gap:** two blobs of the same part with a thin missing bridge; both colors
+  map to «{semantic}» in best views → keep both.
+
+Decision discipline
+------------------------------------
+- Trust **geometric disconnection** + **best-separation views** over a single fused-looking panel.
+- Use color identity consistently: C0=first/largest component, C1=second largest, etc.
+- Fractions only tell you each piece is large (not a tiny island); they do not tell you semantics.
+- When genuinely ambiguous in ALL views, prefer to KEEP (conservative; do not over-prune).
+- In ``reason``, cite **which view(s)** showed separation vs fusion and why each component
+  belongs to «{semantic}» or a neighbour.
+
+Return ONLY this JSON:
+{{
+  "keep_components": [<component ids to KEEP, e.g. 0, 1>],
+  "reason": "English brief: per component, keep/drop with view evidence (e.g. 'front view: C0 on wing, C1 on fuselage; side view overlap ignored')"
+}}
+If every large component belongs to the semantic, return all ids (no split).
+"""
+
+
+def build_component_split_prompt(
+    semantic: str,
+    *,
+    components: List[Dict[str, Any]],
+    metrics: Dict[str, Any],
+    media_type: MediaType = "pointcloud",
+    n_views: int = DEFAULT_N_VIEWS,
+) -> ClassifyPrompt:
+    """Build the prompt asking the VLM whether a multi-large-component selection should be split.
+
+    ``components`` is a list of ``{"id", "fraction", "size"}`` ordered by size (id 0 = largest);
+    each id maps to a fixed render color via the color legend.
+    """
+    import json as _json
+
+    unit = "point" if media_type == "pointcloud" else "face"
+    n_components = len(components)
+    color_names = ("red", "blue", "green", "orange", "purple", "cyan")
+    color_legend = ", ".join(
+        f"C{i}={color_names[i % len(color_names)]}" for i in range(n_components)
+    )
+    return ClassifyPrompt(
+        system=COMPONENT_SPLIT_SYSTEM_PROMPT,
+        user=COMPONENT_SPLIT_USER_TEMPLATE.format(
+            render_guide=_render_guide(media_type, n_views),
+            semantic=semantic.strip(),
+            unit=unit,
+            n_views=max(1, int(n_views)),
+            n_components=n_components,
+            color_legend=color_legend,
+            components_json=_json.dumps(components, ensure_ascii=False, indent=2),
+            metrics_json=_json.dumps(metrics, ensure_ascii=False, indent=2),
         ),
     )

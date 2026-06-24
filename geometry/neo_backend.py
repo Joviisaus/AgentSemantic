@@ -29,6 +29,9 @@ import numpy as np
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_NEO_PYTHON = _REPO_ROOT / ".conda-neo" / "bin" / "python"
 _NEO_INFER_SCRIPT = _REPO_ROOT / "tools" / "neo_infer.py"
+# 权重默认目录（与 .gitignore 的 `weights/` 约定一致）。未显式指定 / 无 NEO_CKPT
+# 环境变量时，自动在此目录里发现唯一的 .ckpt 作为默认权重。
+_DEFAULT_NEO_WEIGHTS_DIR = _REPO_ROOT / "weights"
 
 
 class NEOBackendError(RuntimeError):
@@ -47,11 +50,31 @@ def resolve_neo_python(explicit: Optional[str] = None) -> Path:
     return p
 
 
+def _discover_default_ckpt() -> Optional[Path]:
+    """在默认 weights/ 目录里寻找唯一的 .ckpt 作为默认权重。
+
+    - 恰好 1 个 → 返回它；
+    - 0 个或多个 → 返回 None（交给上层报错提示用户显式指定）。
+    """
+    if not _DEFAULT_NEO_WEIGHTS_DIR.is_dir():
+        return None
+    ckpts = sorted(_DEFAULT_NEO_WEIGHTS_DIR.glob("*.ckpt"))
+    if len(ckpts) == 1:
+        return ckpts[0]
+    return None
+
+
 def resolve_neo_ckpt(explicit: Optional[str] = None) -> Path:
     cand = explicit or os.environ.get("NEO_CKPT")
     if not cand:
+        discovered = _discover_default_ckpt()
+        if discovered is not None:
+            return discovered
         raise NEOBackendError(
-            "未指定 NEO 预训练权重。请用 --neo-ckpt 或环境变量 NEO_CKPT 指定 .ckpt 路径。\n"
+            "未指定 NEO 预训练权重，且默认目录 "
+            f"{_DEFAULT_NEO_WEIGHTS_DIR} 下未找到唯一 .ckpt。\n"
+            "请用 --neo-ckpt 或环境变量 NEO_CKPT 指定 .ckpt 路径，"
+            f"或把权重放到 {_DEFAULT_NEO_WEIGHTS_DIR}/ 下（仅放一个 .ckpt）。\n"
             "权重下载（作者 Google Drive）："
             "https://drive.google.com/drive/folders/12026qTECiGywESPz6WSbpgD8BPMd41Ha"
         )

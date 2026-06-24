@@ -59,7 +59,7 @@ providers:
     models:
       - qwen3.7-plus
       - qwen3.6-flash
-    default_model: qwen3.6-flash
+    default_model: qwen3.7-plus
 
   zhipu:
     enabled: false
@@ -87,11 +87,6 @@ providers:
     default_model: deepseek-vl2
 
   doubao:
-    # 字节跳动火山方舟 ARK，兼容 OpenAI Chat Completions
-    # 文档: https://www.volcengine.com/docs/82379
-    # ⚠ Ark 的 model 必须是「带日期后缀」的完整 ID，"短名"（如 doubao-1-5-vision-pro-32k）
-    #   会被返回 InvalidEndpointOrModel.NotFound。如下都需要先在 Ark 控制台
-    #   「开通管理」中开通对应模型，否则同样 404。
     enabled: true
     api_key: ${ARK_API_KEY}
     base_url: https://ark.cn-beijing.volces.com/api/v3
@@ -121,6 +116,16 @@ providers:
       - llama3.2-vision
       - minicpm-v
     default_model: llava
+
+  hy3:
+    # 腾讯 MaaS TokenHub，兼容 OpenAI Chat Completions
+    # 控制台: https://tokenhub.tencentmaas.com
+    enabled: true
+    api_key: ${TENCENT_MAAS_API_KEY}
+    base_url: https://tokenhub.tencentmaas.com/v1
+    models:
+      - hy3-preview
+    default_model: hy3-preview
 
   custom:
     enabled: false

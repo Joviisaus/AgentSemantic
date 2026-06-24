@@ -84,6 +84,11 @@ benchmark/results/
 benchmark/data/gt/
 benchmark/data/manifest.json
 
+# ShapeNet-Part benchmark：同样只保留 subset 清单，忽略数据与结果
+benchmark/results_shapenetpart/
+benchmark/data_shapenetpart/gt/
+benchmark/data_shapenetpart/manifest.json
+
 # ============================================================
 # Third-party 下载的可执行 / 源码压缩包与解压产物
 #   说明：SEG-MAT 作为 submodule 由 git 跟踪，这里只忽略外部下载件

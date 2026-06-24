@@ -44,6 +44,12 @@ from geometry.spectral_cluster import (
     spectral_cluster_vertices,
     vertex_labels_to_face_labels,
 )
+from pipeline.geometry_postprocess import (
+    apply_ops as _postprocess_apply_ops,
+    ask_postprocess_ops,
+    build_neighbor_index,
+    compute_selection_metrics,
+)
 from rendering.render_component import (
     ACCEPTED_RGB,
     DIM_RGB,
@@ -154,6 +160,13 @@ class SemanticRefinementConfig:
     # 为空时 prompt 退化为开放词表（与旧行为一致）。
     object_category: str = ""
     candidate_parts: Optional[List[str]] = None
+    # ---- 几何后处理（最终掩码清洗）----
+    # 主循环结束后，对最终 full 选区（面级）算几何指标（凸包/solidity、边缘平滑度、曲率、
+    # 碎片、空洞、离群），喂给 VLM 让它挑形态学清洗算子（去小岛/去离群/平滑边界/填洞/
+    # 保留最大块），在面质心 kNN 图上执行后得到更干净的最终分块。失败安全回退原始 mask。
+    postprocess: bool = True
+    postprocess_max_rounds: int = 2
+    postprocess_model: Optional[str] = None
 
 
 class SemanticRefinementPipeline:
@@ -684,23 +697,6 @@ class SemanticRefinementPipeline:
             LOGGER.warning("live report 写文件失败: %s", exc)
 
     # ---------- 并行 classify ----------
-    @staticmethod
-    def _make_forced_partial_classification():
-        """force_split=True 时的占位分类，等价于"伪造一个 partial"让分裂路径接管。"""
-        from vlm.classifier import ComponentClassification
-
-        return ComponentClassification(
-            label=LABEL_PARTIAL,
-            confidence=0.0,
-            reason="force_split_by_review",
-            covered_parts=[],
-            dominant_region="",
-            semantic_parts=[],
-            extra_parts=[],
-            missing_overlap="",
-            overridden_from="full",
-        )
-
     def _batch_classify(
         self,
         tasks: Sequence[tuple[str, Path]],
@@ -929,9 +925,6 @@ class SemanticRefinementPipeline:
                 initial_blocks.append(cc_block)
 
         # 重新编号成连续 C0/C1/... 让后续 child id (Cx.y) 不冲突。
-        # 初始块一律 force_split=True：跳过首轮 classify，直接走级联
-        # （CC → segmat → VLM-K spectral）。VLM 在整 mesh 一片红/全模型上做
-        # 三分类高度不可靠（容易判 full 或 none 提前结束），先切再判更稳。
         renumbered: List[SemanticBlock] = []
         for new_idx, b in enumerate(initial_blocks):
             renumbered.append(
@@ -941,8 +934,7 @@ class SemanticRefinementPipeline:
                     depth=0,
                     parent_id=None,
                     status=BlockStatus.PENDING,
-                    notes=(b.notes + " | initial_force_split").strip(" |"),
-                    force_split=True,
+                    notes=b.notes,
                 )
             )
         initial_blocks = renumbered
@@ -1042,12 +1034,8 @@ class SemanticRefinementPipeline:
                     block.status = BlockStatus.ABANDONED
                     block.notes = f"render_failed: {exc}"
 
-            # ===== Pre-pass B（可并行）：classify 非 force_split 的块 =====
-            classify_tasks: List[tuple[str, Path]] = []
-            for block_id, panel_path in iter_panel.items():
-                if self.blocks[block_id].force_split:
-                    continue
-                classify_tasks.append((block_id, panel_path))
+            # ===== Pre-pass B（可并行）：classify =====
+            classify_tasks: List[tuple[str, Path]] = list(iter_panel.items())
             iter_cls_cache = self._batch_classify(classify_tasks)
 
             # ===== 决策主循环（串行；只读 cache） =====
@@ -1060,24 +1048,17 @@ class SemanticRefinementPipeline:
                     # 已在 pre-pass A 被 too_small / render_failed 处理
                     continue
 
-                # Step 1：三分类（force_split 时跳过，伪造一个 partial 让分裂路径接管）
-                if block.force_split:
-                    LOGGER.info(
-                        "block %s force_split=True (review 降级)，跳过 classify 直接分裂",
-                        block_id,
+                # Step 1：三分类
+                cls = iter_cls_cache.get(block_id)
+                if cls is None:
+                    # 并行 batch 失败兜底：串行重试一次
+                    cls = classify_component(
+                        self.client,
+                        panel_path,
+                        self.config.semantic,
+                        model=self.config.classification_model,
+                        context=self._object_context,
                     )
-                    cls = self._make_forced_partial_classification()
-                else:
-                    cls = iter_cls_cache.get(block_id)
-                    if cls is None:
-                        # 并行 batch 失败兜底：串行重试一次
-                        cls = classify_component(
-                            self.client,
-                            panel_path,
-                            self.config.semantic,
-                            model=self.config.classification_model,
-                            context=self._object_context,
-                        )
                 block.classification = {
                     "label": cls.label,
                     "confidence": cls.confidence,
@@ -1740,38 +1721,6 @@ class SemanticRefinementPipeline:
                             "reason": review.reason if review else "",
                         },
                     )
-                # over_claimed：review 觉得「红色覆盖明显超出语义」，把最大的几个
-                # FULL 块降级回 PENDING + force_split，让下一轮跳过 classify 直接分裂。
-                if (
-                    review is not None
-                    and not review.should_terminate
-                    and (review.red_assessment or "").lower() == "over_claimed"
-                ):
-                    full_blocks = [
-                        b for b in self.blocks.values()
-                        if b.status == BlockStatus.FULL
-                        and b.depth < self.config.max_depth
-                        and b.size >= max(self.config.min_block_size, 1)
-                    ]
-                    full_blocks.sort(key=lambda b: -b.size)
-                    demoted = 0
-                    for b in full_blocks:
-                        b.status = BlockStatus.PENDING
-                        b.force_split = True
-                        b.classification = None
-                        b.notes = (
-                            b.notes + f" | demoted_by_review(over_claimed,iter={iteration})"
-                        ).strip(" |")
-                        next_queue.append(b.block_id)
-                        demoted += 1
-                        if demoted >= 3:  # 一次最多降级 3 个，防止抖动
-                            break
-                    if demoted:
-                        LOGGER.info(
-                            "review over_claimed: demoted %d FULL blocks → force_split",
-                            demoted,
-                        )
-
                 if review is not None and review.should_terminate and next_queue:
                     self._drain_pending_to_terminate(
                         next_queue, reason=review.red_assessment or "vlm_review"
@@ -1815,6 +1764,13 @@ class SemanticRefinementPipeline:
         result.full_face_ids = status_groups["full_face_ids"]
         result.none_face_ids = status_groups["none_face_ids"]
         result.pending_face_ids = status_groups["pending_face_ids"]
+
+        # ====== 几何后处理：对最终 full 选区算指标 + VLM 清洗（凸包/边缘/曲率）======
+        if self.config.postprocess:
+            try:
+                self._postprocess_final_mask(out_dir, vertices, faces, result)
+            except Exception as exc:  # noqa: BLE001 — 后处理失败不影响主结果
+                LOGGER.warning("几何后处理失败，沿用原始最终掩码: %s", exc)
 
         # 导出 mask + tree
         mask_path = out_dir / "semantic_mask.json"
@@ -1951,6 +1907,119 @@ class SemanticRefinementPipeline:
         )
         return result
 
+    # ---------- 几何后处理 ----------
+    def _postprocess_final_mask(
+        self,
+        out_dir: Path,
+        vertices: np.ndarray,
+        faces: np.ndarray,
+        result: "SemanticRefinementResult",
+    ) -> None:
+        """对最终 full 面集做「几何指标体检 + VLM 决策 + 形态学清洗」。
+
+        元素 = face_id，质心 = 面三顶点均值；指标 / 算子复用 ``geometry_postprocess``。
+        """
+        faces_arr = np.asarray(faces, dtype=np.int64)
+        n_faces = len(faces_arr)
+        original_full = sorted(set(result.full_face_ids))
+        if n_faces == 0 or len(original_full) < 8:
+            return
+
+        centroids = np.asarray(vertices, dtype=np.float64)[faces_arr].mean(axis=1)
+        pp_dir = out_dir / "postprocess"
+        pp_dir.mkdir(parents=True, exist_ok=True)
+
+        from geometry.pointcloud_cluster import compute_point_normals_and_curvature
+
+        nbr_idx = build_neighbor_index(centroids, n_neighbors=16)
+        _normals, curvature = compute_point_normals_and_curvature(centroids, n_neighbors=16)
+        mask = np.zeros(n_faces, dtype=bool)
+        mask[np.asarray(original_full, dtype=np.int64)] = True
+
+        def _metrics(m: np.ndarray) -> Dict[str, Any]:
+            return compute_selection_metrics(
+                centroids, m, n_neighbors=16, nbr_idx=nbr_idx, curvature=curvature
+            ).to_dict()
+
+        rounds: List[Dict[str, Any]] = []
+        max_rounds = max(1, int(self.config.postprocess_max_rounds))
+        metrics_before = _metrics(mask)
+
+        for r in range(1, max_rounds + 1):
+            metrics = _metrics(mask)
+            panel_path: Optional[Path] = pp_dir / f"round_{r:02d}.png"
+            try:
+                render_highlighted_component_panel(
+                    vertices, faces, np.flatnonzero(mask).tolist(), panel_path,
+                    title=f"[postprocess r{r}] full={int(mask.sum())}",
+                    image_size=self.config.image_size, cols=self.config.panel_cols,
+                )
+            except (OSError, ImportError, ValueError) as exc:
+                LOGGER.warning("postprocess 渲染失败: %s", exc)
+                panel_path = None
+
+            decision = ask_postprocess_ops(
+                self.client, panel_path, self.config.semantic, metrics,
+                media_type="mesh", n_views=12,
+                model=self.config.postprocess_model or self.config.classification_model,
+            )
+            round_rec: Dict[str, Any] = {
+                "round": r, "metrics": metrics, "ops_requested": decision.ops,
+                "reason": decision.reason, "error": decision.error,
+            }
+            if not decision.ops:
+                rounds.append(round_rec)
+                LOGGER.info("postprocess round %d: VLM 判定无需清洗，停止", r)
+                break
+            new_mask, op_log = _postprocess_apply_ops(
+                centroids, mask, decision.ops, n_neighbors=16, nbr_idx=nbr_idx,
+            )
+            round_rec["ops_applied"] = op_log
+            rounds.append(round_rec)
+            if int(new_mask.sum()) == 0 or np.array_equal(new_mask, mask):
+                break
+            mask = new_mask
+
+        new_full = set(int(i) for i in np.flatnonzero(mask).tolist())
+        old_full = set(original_full)
+        removed = old_full - new_full
+        added = new_full - old_full
+        none_set = (set(result.none_face_ids) | removed) - added
+        pending_set = set(result.pending_face_ids) - added
+        result.full_face_ids = sorted(new_full)
+        result.none_face_ids = sorted(none_set)
+        result.pending_face_ids = sorted(pending_set)
+
+        summary = {
+            "semantic": self.config.semantic,
+            "num_faces": n_faces,
+            "num_full_before": len(old_full),
+            "num_full_after": len(new_full),
+            "num_removed": len(removed),
+            "num_added": len(added),
+            "metrics_before": metrics_before,
+            "metrics_after": _metrics(mask),
+            "rounds": rounds,
+        }
+        try:
+            (out_dir / "postprocess.json").write_text(
+                json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except OSError as exc:
+            LOGGER.warning("写 postprocess.json 失败: %s", exc)
+        result.extra["postprocess"] = {
+            "num_full_before": len(old_full),
+            "num_full_after": len(new_full),
+            "num_removed": len(removed),
+            "num_added": len(added),
+            "rounds": len(rounds),
+            "json": str(out_dir / "postprocess.json"),
+        }
+        LOGGER.info(
+            "几何后处理完成(mesh): full %d -> %d (removed=%d, added=%d, rounds=%d)",
+            len(old_full), len(new_full), len(removed), len(added), len(rounds),
+        )
+
     # ---------- IO ----------
     def _dump_response(
         self, responses_dir: Path, name: str, payload: Dict[str, Any]
@@ -2003,6 +2072,9 @@ def run_semantic_refinement(
     single_view_image_size: int = 720,
     object_category: str = "",
     candidate_parts: Optional[List[str]] = None,
+    postprocess: bool = True,
+    postprocess_max_rounds: int = 2,
+    postprocess_model: Optional[str] = None,
     progress_cb: Optional[Callable[[str, Dict[str, Any]], None]] = None,
 ) -> SemanticRefinementResult:
     """函数式封装。"""
@@ -2033,6 +2105,9 @@ def run_semantic_refinement(
         single_view_image_size=single_view_image_size,
         object_category=object_category,
         candidate_parts=candidate_parts,
+        postprocess=postprocess,
+        postprocess_max_rounds=postprocess_max_rounds,
+        postprocess_model=postprocess_model,
     )
     pipeline = SemanticRefinementPipeline(client, cfg)
     return pipeline.run(

@@ -16,11 +16,11 @@ from typing import Dict, List
 
 import numpy as np
 
-from benchmark import compat200 as C
 from benchmark import metrics as M
+from benchmark.dataset_registry import get_dataset
 
 
-def _eval_method(method: str, keys: List[str]) -> Dict:
+def _eval_method(method: str, keys: List[str], C) -> Dict:
     pred_dir = C.RESULTS_DIR / method
     samples: List[M.SampleScore] = []
     missing = 0
@@ -60,9 +60,14 @@ def _eval_method(method: str, keys: List[str]) -> Dict:
     }
 
 
-def _render_md(subset: str, results: List[Dict]) -> str:
+def _render_md(dataset: str, subset: str, results: List[Dict]) -> str:
+    title = (
+        "ShapeNet-Part — semantic part segmentation"
+        if dataset.lower().replace("-", "_") in {"shapenetpart", "shapenet_part"}
+        else "CoMPaT-200 coarse — semantic part segmentation"
+    )
     lines = [
-        f"# CoMPaT-200 coarse — semantic part segmentation (subset: `{subset}`)",
+        f"# {title} (subset: `{subset}`)",
         "",
         "Per-point mIoU. `miou_skip` = CoSMo3D convention (empty-union parts skipped); "
         "`category_miou` = macro mean over object categories (CoSMo3D headline metric).",
@@ -82,17 +87,32 @@ def _render_md(subset: str, results: List[Dict]) -> str:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Evaluate method predictions (mIoU)")
+    ap.add_argument("--dataset", default="compat200",
+                    help="dataset name: compat200 (default, CoSMo3D comparison) or shapenetpart")
     ap.add_argument("--subset", default="tiny")
-    ap.add_argument("--methods", nargs="+",
-                    default=["ours", "cosmo3d", "pointclip", "unim", "pointcept"])
+    ap.add_argument("--methods", nargs="+", default=None)
     args = ap.parse_args(argv)
+
+    try:
+        C = get_dataset(args.dataset)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    dataset_key = args.dataset.lower().replace("-", "_")
+    methods = args.methods
+    if methods is None:
+        methods = (
+            ["ours_pointcloud"]
+            if dataset_key in {"shapenetpart", "shapenet_part"}
+            else ["ours", "cosmo3d", "pointclip", "unim", "pointcept"]
+        )
 
     keys = C.load_subset(args.subset)
     results = []
-    for method in args.methods:
+    for method in methods:
         if not (C.RESULTS_DIR / method).is_dir():
             continue
-        r = _eval_method(method, keys)
+        r = _eval_method(method, keys, C)
         if r["n_evaluated"] == 0:
             print(f"[skip] {method}: no predictions found")
             continue
@@ -105,13 +125,13 @@ def main(argv=None) -> int:
 
     C.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     out_json = C.RESULTS_DIR / f"summary_{args.subset}.json"
-    out_json.write_text(json.dumps({"subset": args.subset, "results": results},
+    out_json.write_text(json.dumps({"dataset": args.dataset, "subset": args.subset, "results": results},
                                    ensure_ascii=False, indent=2), encoding="utf-8")
     out_md = C.RESULTS_DIR / f"summary_{args.subset}.md"
-    out_md.write_text(_render_md(args.subset, results), encoding="utf-8")
+    out_md.write_text(_render_md(args.dataset, args.subset, results), encoding="utf-8")
     print(f"\n[report] {out_json}\n[report] {out_md}")
     if results:
-        print("\n" + _render_md(args.subset, results))
+        print("\n" + _render_md(args.dataset, args.subset, results))
     return 0
 
 

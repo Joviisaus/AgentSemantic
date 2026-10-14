@@ -86,7 +86,7 @@ FORCE_TERMINATE_NOTE: Final = """
 This block **cannot be split further** (too few points or max split depth reached).
 You must still assign label per rules; `committed_if_forced` means:
 "If the pipeline must stop now, does this block finally count as the semantic?" ? **only full or none**.
-Choose full only if you are very sure the red bulk is ?{semantic}?; any non-semantic parts mixed in ? none.
+**This is the LAST chance to keep this region ? bias STRONGLY toward full**: commit **full** if the red is mostly or even partly ?{semantic}? (semantic-dominant or balanced); commit **none** only when the red is clearly dominated by non-?{semantic}? parts or is entirely unrelated.
 """
 
 MEMORY_BLOCK_TEMPLATE: Final = """
@@ -117,11 +117,12 @@ After geometric split into seed_count children, the **union** of child matched s
 When choosing seed_count / strategy:
 1. **One semantic per piece**: N items in matched_parts ? seed_count must be **? N** (when seed_count is fixed, strategy must yield **? seed_count geometrically distinct** sub-regions).
 2. **Protect small parts**: head, hand, finger, ear, horn, ornament ? small area, easily merged ? **do not** default to **cvt** or uniform **geodesic_fps** on multi-semantic composite blocks.
-   Prefer **graph_cut** (grooves/seams, high lambda_concave), **skeleton** (limb branching),
-   **spectral** (distant/joint separation, high concavity_weight).
+   Prefer **spectral** (distant/joint separation + concavity, best preserves part shape),
+   **skeleton** (limb branching / axis segments).
    When **concavities are obvious** (armpit, groin, finger gaps, neck base, armor seams, skirt folds):
-   prefer graph_cut or spectral; spectral default concavity_weight=0.70 is already high;
-   raise further to **0.75~0.85** (or graph_cut lambda_concave?0.9).
+   use **spectral**; its default concavity_weight=0.70 is already high;
+   raise further to **0.75~0.85** for pronounced grooves.
+   (**graph_cut is disabled** ? it smooths boundaries but does not preserve shape; use spectral instead.)
 3. **Strategy cautions**:
    - **cvt**: only when matched items are similar and you need equal area; **not** for head+torso+limbs composites.
    - **sdf**: coarse-to-fine by thickness; **cannot** guarantee one block per semantic item.
@@ -364,15 +365,15 @@ Step 6 ? `label` (whether to keep splitting):
   **Do not** assign partial because observer split one semantic into sub-part names (head+ears, barrel+grip) ?
   when all sub-parts lie in semantic scope, assign **full** to avoid useless re-split.
 
-Step 7 ? `committed_if_forced` (**strict** ? final promise when forced stop, full/none only):
-  dominant_side="semantic" and ratio ? 0.7 ? "full"
-  anything else (extra / balanced / uncertain) ? "none"
-  **Prefer miss over false accept**: extra-dominant blocks must not promise full
+Step 7 ? `committed_if_forced` (final promise when forced stop, full/none only):
+  **Bias STRONGLY toward full** ? forced stop is the LAST chance to keep this region, prefer keeping it.
+  dominant_side="semantic" or "balanced", OR ratio ? 0.4, OR (extra empty and any semantic present) ? "full"
+  ? "none" only when red is clearly non-semantic-dominant (dominant_side="extra" and ratio ? 0.3) or missing_overlap=true
 
 **Core principle: merge sub-parts + split only on overflow**
 - Sub-parts within semantic (ears under head, grip under water gun) **are not** extra ? **full**
 - Only when red clearly overflows to major parts outside semantic ? **partial** for geometric re-split
-- committed_if_forced stays strict: ratio ?0.7, extra empty ? full
+- committed_if_forced biases toward full at forced stop: keep the region unless red is clearly non-semantic-dominant
 
 Output **only** this JSON (missing fields = error):
 {{
@@ -402,8 +403,8 @@ Reason in order and fill JSON.
 **Core rule: lenient label + strict commitment**
 - Classification (label) **lenient**: if covered_parts **contains or may contain** the semantic region, allow partial
   so the pipeline can keep splitting until clean.
-- Share / forced commitment (dominant_side / committed_if_forced) **strict**:
-  if unsure semantic dominates, promise "none" ? avoid accepting a base-heavy block with a sliver of stand as "stand" at forced stop.
+- Share / forced commitment (dominant_side / committed_if_forced): honest ratio, but at **forced stop bias toward full** ?
+  keep the region unless red is clearly dominated by non-semantic parts (extra-dominant, ratio ? 0.3).
 
 -----------------------------------
 1. **Decide which parts correspond to ?{semantic}?** on this object (usually 1~3), fill `semantic_parts`.
@@ -439,10 +440,10 @@ Reason in order and fill JSON.
    - extra_parts non-empty                                          ? "partial"
    - extra_parts empty and semantic_parts non-empty                 ? "full"
 
-7. **`committed_if_forced` (forced final promise, **strict**)**:
-   - dominant_side = "semantic" and semantic_area_ratio ? 0.7 ? "full"
-   - any other case (extra / balanced / uncertain)              ? "none"
-   - **Prefer dropping a balanced block over letting extra-dominant into final mask.**
+7. **`committed_if_forced` (forced final promise ? bias STRONGLY toward full)**:
+   - forced stop is the LAST chance to keep this region ? prefer **full**
+   - dominant_side = "semantic" or "balanced", OR semantic_area_ratio ? 0.4, OR (extra empty and semantic present) ? "full"
+   - "none" only when red is clearly non-semantic-dominant (dominant_side="extra" and ratio ? 0.3) or unrelated
 
 Output **only** this JSON (missing fields = error):
 {{
@@ -547,8 +548,9 @@ Open-vocabulary discipline (**mandatory**)
 
 Also choose geometric partition strategy and params:
 - Pick strategy from **open semantic description** and **block_faces**, not always geodesic_fps.
-- graph_cut: parts separated by gaps/folds/grooves (preferred when concavity obvious, lambda_concave?0.8);
-  spectral: distant parts stuck together (default first choice); when spectral, provide geodesic_weight /
+- **graph_cut is DISABLED** (smooths boundaries but does not preserve part shape) ? never choose it; use spectral instead.
+- spectral: **default first choice**; best conforms to convex-hull structure + concavities and preserves part shape,
+  including parts separated by gaps/folds/grooves; provide geodesic_weight /
   curvature_weight / concavity_weight (**default favors concavity concavity_weight=0.70; raise to 0.75~0.85 when grooves obvious**);
   skeleton: tree/limb skeleton, split along axis branches (large meshes auto-pool);
   cvt: equal fragments; sdf: thickness hierarchy in description (large meshes auto-reduce num_rays);
@@ -561,11 +563,9 @@ override only when render/semantics clearly require it, and explain in reason.
 Return **only** this JSON:
 {{
   "seed_count": <int, min 2, max {max_seeds}>,
-  "strategy": "graph_cut" | "spectral" | "cvt" | "sdf" | "skeleton" | "geodesic_fps",
+  "strategy": "spectral" | "cvt" | "sdf" | "skeleton" | "geodesic_fps",
   "reason": "English brief: why this seed_count and strategy; map each matched/covered part to expected child",
   "params": {{
-    "lambda_smooth": <float, graph_cut, 0.1~3.0, default 1.0>,
-    "lambda_concave": <float, graph_cut, 0.0~2.0, obvious concavity ?0.8, default 0.85>,
     "geodesic_weight": <float, spectral, 0.05~0.80, default 0.20>,
     "curvature_weight": <float, spectral, 0.05~0.80, default 0.15>,
     "concavity_weight": <float, spectral, 0.05~0.90, default 0.70, obvious grooves 0.75~0.85>,
@@ -580,7 +580,7 @@ Return **only** this JSON:
 """
 
 # ---------------------------------------------------------------------------
-# Split strategy selection: graph_cut / spectral / CVT / SDF / skeleton / geodesic_fps
+# Split strategy selection: spectral / CVT / SDF / skeleton / geodesic_fps (graph_cut disabled)
 # ---------------------------------------------------------------------------
 
 SPLIT_STRATEGY_SYSTEM_PROMPT = (
@@ -609,21 +609,20 @@ Performance and scale (system auto-optimizes; do not default to geodesic_fps for
 - Geodesic strategies (spectral / skeleton / geodesic_fps / cvt) **pool vertex graphs** on large blocks
   (~8k~12k nodes); Dijkstra cost controlled; with fixed seed_count spectral **skips eigendecomposition**.
 - block_faces < 30_000: prefer **spectral** (good distant-part separation).
-- block_faces 30_000~150_000: pick spectral / skeleton / graph_cut / sdf by semantics; system lowers lloyd_iter / rays.
+- block_faces 30_000~150_000: pick spectral / skeleton / sdf by semantics; system lowers lloyd_iter / rays.
 - block_faces ? 150_000: spectral / skeleton still OK; lloyd_iter 2~3 in params;
   **geodesic_fps only as fallback** when semantics unclear or prior strategies fail.
-- graph_cut / sdf ray cost grows linearly with faces: reduce num_rays or lloyd_iter on huge blocks, not swap to non-semantic strategy.
+- sdf ray cost grows linearly with faces: reduce num_rays or lloyd_iter on huge blocks, not swap to non-semantic strategy.
 
 Available strategies (strategy field must be one of)
 -----------------------------------
-1. **graph_cut**
-   - Good when boundaries should follow grooves/valleys; adjacent semantics separated by gaps/folds
-     (finger gaps, armor seams, skirt folds, armpit, neck base).
-   - **First choice when concavity is obvious** ? boundary follows concave seams.
-   - Params: lambda_smooth (boundary smoothness, 0.3~2.0, default 1.0),
-     lambda_concave (concavity pull, 0.5~2.0, **default 0.85**; obvious concavity **0.9~1.2**).
+1. **graph_cut** ? **DISABLED, DO NOT CHOOSE.**
+   - Reason it is disabled: it optimizes only for smooth boundary lines and **does NOT preserve a part's overall shape** ? with no real groove it cuts a straight line across a semantic part. For groove/seam separation use **spectral** (raise concavity_weight) instead, which follows concavities AND keeps shape.
 
-2. **spectral**
+2. **spectral**  ? **PRIMARY / DEFAULT CHOICE**
+   - Trade-off (PROS): intrinsic/quasi-isometric embedding **best conforms to the shape's convex-hull structure AND its concavities** ? cuts respect the object's actual form (mushroom cap vs body, limb vs torso), so it **preserves part shape**. Robustly separates distant/joined parts and symmetry, and also handles groove/seam boundaries (raise concavity_weight).
+   - Trade-off (CONS): heavier (eigendecomposition, unless seed_count is fixed); on very large blocks it relies on graph pooling / graph_vertex_budget to stay fast.
+   - **This is the preferred default whenever the target is a coherent shaped part rather than a groove-bounded flat region.**
    - Good for large pose/topology change, quasi-isometric splits (limb-torso joints, bent limbs, repeated symmetry).
    - Edge weight = weighted sum (auto-normalized):
      geodesic_weight (geodesic distance, separates distant parts),
@@ -636,22 +635,30 @@ Available strategies (strategy field must be one of)
    - Default: geodesic_weight=0.20, curvature_weight=0.15, concavity_weight=0.70.
 
 3. **cvt** (centroidal Voronoi)
+   - Trade-off (PROS): equal-area compact roundish pieces; predictable, uniform fragment sizes.
+   - Trade-off (CONS): **ignores semantics, concavities and shape** ? cuts by spatial proximity only; never use for head+torso+limb composites.
    - Equal-size compact roundish pieces (even finger splits, comparable fragments).
    - Params: lloyd_iter (2~12, default 4; auto-scaled by face count).
 
 4. **sdf** (shape diameter function)
+   - Trade-off (PROS): separates by **local thickness** ? great for thick-vs-thin hierarchy (torso vs arm, leg vs foot).
+   - Trade-off (CONS): keys only on thickness, so it **cannot guarantee one block per semantic item** and is sensitive to ray params.
    - Organic models by thickness hierarchy (thick torso vs thin arm vs thinner fingers; quadruped leg vs torso).
    - Params: num_rays (4~24, default 8; auto-reduced on large blocks), cone_angle_deg (15~120, default 60).
 
 5. **geodesic_fps** (geodesic FPS + Voronoi)
+   - Trade-off (PROS): fastest; gives **uniform, evenly-sized** patches over the surface.
+   - Trade-off (CONS): uniformity is the goal, so it **ignores semantic and geometric boundaries** ? it will not align cuts to a part's outline. Fallback only.
    - Fallback when semantics mixed or other strategies fail; also fast uniform splits.
    - Params: lloyd_iter (0~12, default 0; 2~4 on large for uniformity), graph_vertex_budget (4000~20000, optional).
 
 6. **skeleton** (Laplacian contraction skeleton + geodesic Voronoi)
+   - Trade-off (PROS): cuts **elongated limbs along their axis** into clean longitudinal segments even when there is no groove; most stable for axis-aligned limb chains.
+   - Trade-off (CONS): needs clearly elongated geometry (major axis >> cross-section); pointless / unstable on compact or round blobs (e.g. a head or a mushroom cap).
    - Tree/limb skeleton semantics (humanoid, quadruped, multi-limb mech) ? separate limbs from torso along axis/branches.
    - **Also splits one long limb along its axis into segments** (thigh/calf/foot, upper arm/forearm/hand, neck/head)
      even when transitions are smooth with no obvious groove ? cuts equidistant along axis, perpendicular to length,
-     more stable than spectral/graph_cut when no concave seam exists.
+     more stable than spectral when no concave seam exists.
    - **Criterion**: block is clearly elongated (major axis >> cross-section) and child semantics are longitudinal segments on same limb ? skeleton.
    - Params: contraction_iters (2~12, default 5), lloyd_iter (0~12, default 0),
      graph_vertex_budget (4000~20000, optional); large meshes auto-pool.
@@ -660,12 +667,12 @@ Open-vocabulary discipline
 -----------------------------------
 - covered_parts / semantic_parts / extra_parts / matched_parts are **open vocabulary** ? not necessarily humanoid;
   choose strategy from described geometry.
-- Multiple matched_parts with very different names ? spectral or graph_cut on small/medium blocks;
-  **obvious grooves/seams in image ? prefer graph_cut (high lambda_concave) or spectral (concavity_weight 0.75~0.85)**.
+- Multiple matched_parts with very different names ? spectral on small/medium blocks;
+  **obvious grooves/seams in image ? spectral with concavity_weight 0.75~0.85** (graph_cut is disabled).
 - Description emphasizes thickness hierarchy ? sdf on smaller blocks.
 - Description emphasizes skeleton/limbs/torso-limb chain ? skeleton (large meshes OK, auto-pool).
 - **Longitudinal limb segments without obvious groove ? must use skeleton**: e.g. separate thigh from leg, calf/foot segments;
-  even if image shows no concave line, do not fall back to spectral/graph_cut random cuts; skeleton cuts equidistant along axis.
+  even if image shows no concave line, do not fall back to spectral random cuts; skeleton cuts equidistant along axis.
 - **Semantics over scale**: pick best semantic strategy on large blocks; system pools/reduces iterations.
 - geodesic_fps is fallback, not default: only when semantics unclear or groove/thickness/skeleton strategies unsuitable.
 
@@ -680,11 +687,9 @@ Parameter discipline
 
 Return **only** this JSON:
 {{
-  "strategy": "graph_cut" | "spectral" | "cvt" | "sdf" | "skeleton" | "geodesic_fps",
+  "strategy": "spectral" | "cvt" | "sdf" | "skeleton" | "geodesic_fps",
   "reason": "English brief: why this strategy; map each matched_parts item to expected child (avoid swallowing small parts); note any param overrides",
   "params": {{
-    "lambda_smooth": <float, graph_cut, 0.1~3.0, default 1.0>,
-    "lambda_concave": <float, graph_cut, 0.0~2.0, default 0.85, obvious concavity 0.9~1.2>,
     "geodesic_weight": <float, spectral, 0.05~0.80, default 0.20>,
     "curvature_weight": <float, spectral, 0.05~0.80, default 0.15>,
     "concavity_weight": <float, spectral, 0.05~0.90, default 0.70, obvious grooves 0.75~0.85>,
@@ -726,18 +731,18 @@ Point-cloud traits and performance (system auto-optimizes; do not default to geo
 - Geodesic strategies auto **downsample/pool point graphs** on large blocks (~8k~12k nodes);
   with fixed seed_count spectral **skips eigendecomposition**.
 - block_points < 30_000: prefer **spectral**.
-- block_points 30_000~150_000: spectral / skeleton / graph_cut / sdf by semantics; system lowers iterations/rays.
+- block_points 30_000~150_000: spectral / skeleton / sdf by semantics; system lowers iterations/rays.
 - block_points ? 150_000: spectral / skeleton OK; small iteration counts (2~3);
   **geodesic_fps fallback only**.
 
 Available point-cloud strategies (strategy field must be one of)
 ------------------------------------
-1. **graph_cut** (kNN graph cut)
-   - Boundaries along grooves/valleys; adjacent semantics separated by gaps (finger gaps, armor seams, armpit, neck base).
-   - **First choice when concavity obvious**.
-   - Params: lambda_smooth (0.1~3.0, default 1.0), lambda_concave (0.0~2.0, **default 0.85**; obvious **0.9~1.2**).
+1. **graph_cut** (kNN graph cut) ? **DISABLED, DO NOT CHOOSE.**
+   - Reason it is disabled: optimizes only for smooth boundaries and **does NOT preserve part shape** ? with no real groove it cuts straight across a semantic part. For groove/seam separation use **spectral** (raise concavity_weight) instead.
 
-2. **spectral** (point-cloud spectral)
+2. **spectral** (point-cloud spectral) ? **PRIMARY / DEFAULT CHOICE**
+   - Trade-off (PROS): intrinsic embedding **best conforms to convex-hull structure AND concavities**, so it **preserves part shape**; robust for distant/joined parts and symmetry, and handles groove/seam boundaries (raise concavity_weight). **Preferred default for a coherent shaped part.**
+   - Trade-off (CONS): heavier (eigendecomposition unless seed_count fixed); large blocks rely on graph pooling.
    - Large pose/topology change, quasi-isometric splits (limb-torso, bent limbs, symmetry).
    - kNN edge weights (auto-normalized):
      curvature_weight (normal angle/curvature, fold lines),
@@ -748,18 +753,22 @@ Available point-cloud strategies (strategy field must be one of)
    - Default: curvature_weight?1.0, concavity_weight=0.0, normal_weight=1.0 (deviate as needed).
 
 3. **cvt** ? equal compact pieces; lloyd_iter (2~12, default 4).
+   - Trade-off: uniform equal-area pieces but **ignores semantics/concavities/shape** ? not for composites.
 
 4. **sdf** (point-cloud SDF) ? thickness hierarchy; num_rays (4~24, default 8), cone_angle_deg (15~120, default 60).
+   - Trade-off: keys on **thickness** only ? cannot guarantee one block per semantic item.
 
 5. **geodesic_fps** ? fallback / fast uniform; lloyd_iter (0~12, default 0).
+   - Trade-off: fastest, **uniform** patches, but uniformity **ignores semantic/geometric boundaries** ? fallback only.
 
 6. **skeleton** ? tree/limb along axis/branches; longitudinal limb segments even without grooves;
    contraction_iters (2~12, default 5), lloyd_iter (0~12, default 0).
+   - Trade-off: excels at **axis-aligned limb segmentation** without grooves, but needs elongated geometry ? useless on compact/round blobs.
 
 Open-vocabulary discipline
 ------------------------------------
 - Inputs are open vocabulary ? choose from geometry described in text.
-- Diverse matched_parts ? spectral or graph_cut; obvious grooves ? graph_cut (high lambda_concave) or spectral (raise concavity_weight).
+- Diverse matched_parts ? spectral; obvious grooves ? spectral (raise concavity_weight). (graph_cut is disabled.)
 - Thickness hierarchy ? sdf; skeleton/limb chain ? skeleton.
 - Longitudinal limb segments without groove ? **must use skeleton**.
 - Semantics over scale; geodesic_fps fallback only.
@@ -773,11 +782,9 @@ Parameter discipline
 
 Return **only** this JSON:
 {{
-  "strategy": "graph_cut" | "spectral" | "cvt" | "sdf" | "skeleton" | "geodesic_fps",
+  "strategy": "spectral" | "cvt" | "sdf" | "skeleton" | "geodesic_fps",
   "reason": "English brief: why this strategy; map matched_parts to expected children; note param overrides",
   "params": {{
-    "lambda_smooth": <float, graph_cut, 0.1~3.0, default 1.0>,
-    "lambda_concave": <float, graph_cut, 0.0~2.0, default 0.85, obvious concavity 0.9~1.2>,
     "curvature_weight": <float, spectral, 0.0~2.0, default 1.0>,
     "concavity_weight": <float, spectral, 0.0~2.0, default 0.0, obvious grooves 0.5~1.0>,
     "normal_weight": <float, spectral, 0.0~2.0, default 1.0>,

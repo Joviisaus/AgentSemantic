@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Iterable, List, Sequence, Tuple
+from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -85,10 +85,14 @@ def _render_views_with_color_table(
     face_colors: np.ndarray,
     *,
     image_size: Tuple[int, int],
+    view_list: Sequence[Tuple[float, float]] = VIEW_GRID,
 ) -> List[np.ndarray]:
     """
-    12 视角渲染。每个 face-adjacency 连通块单独 add_mesh，避免三角汤里
+    多视角渲染。每个 face-adjacency 连通块单独 add_mesh，避免三角汤里
     多个非连通岛被 pyvista 合并后只显示最大岛。
+
+    ``view_list`` 默认全部 12 视角；传入 (elev, azim) 子集时只渲染这些视角
+    ——由 VLM 选最佳视角阶段决定的「分类视角子集」，少而精以降低幻觉。
     """
     try:
         import pyvista as pv
@@ -103,7 +107,7 @@ def _render_views_with_color_table(
     cc = mesh_face_connected_components(vertices, faces)
 
     views: List[np.ndarray] = []
-    for elev, azim in VIEW_GRID:
+    for elev, azim in view_list:
         plotter = pv.Plotter(off_screen=True, window_size=image_size)
         plotter.set_background("white")
         for cc_id in np.unique(cc):
@@ -137,8 +141,9 @@ def _compose_panel(
     output_path: Path,
     title: str,
     cols: int = 4,
+    view_list: Sequence[Tuple[float, float]] = VIEW_GRID,
 ) -> Path:
-    labels = [f"elev={el:.0f} az={az:.0f}" for el, az in VIEW_GRID]
+    labels = [f"elev={el:.0f} az={az:.0f}" for el, az in view_list]
     stitched = stitch_views(list(views), cols=cols, labels=labels)
     grid = Image.fromarray(stitched)
     title_h = 40
@@ -164,10 +169,14 @@ def render_highlighted_component_panel(
     cols: int = 4,
     highlight_rgb: Tuple[int, int, int] = HIGHLIGHT_RGB,
     dim_rgb: Tuple[int, int, int] = DIM_RGB,
+    views: Optional[Sequence[Tuple[float, float]]] = None,
 ) -> Path:
     """
-    渲染 12 视角拼图：highlight_face_ids 用高亮色，其它面用淡色。
+    渲染多视角高亮拼图：highlight_face_ids 用高亮色，其它面用淡色。
     输出 PNG 路径，供 VLM 直接读图。
+
+    ``views`` 不传时用全部 ``VIEW_GRID``（12 视角）；传入 (elev, azim) 子集时只渲染
+    这些视角——由 VLM 在选最佳视角阶段决定的「分类视角子集」，少而精以降低幻觉。
     """
     n_faces = _faces_count(faces)
     face_colors = build_highlight_face_colors(
@@ -176,10 +185,16 @@ def render_highlighted_component_panel(
         highlight_rgb=highlight_rgb,
         dim_rgb=dim_rgb,
     )
-    views = _render_views_with_color_table(
-        vertices, faces, face_colors, image_size=(image_size, image_size)
+    view_list = list(views) if views else list(VIEW_GRID)
+    rendered = _render_views_with_color_table(
+        vertices, faces, face_colors,
+        image_size=(image_size, image_size),
+        view_list=view_list,
     )
-    return _compose_panel(views, output_path=Path(output_path), title=title, cols=cols)
+    return _compose_panel(
+        rendered, output_path=Path(output_path), title=title, cols=cols,
+        view_list=view_list,
+    )
 
 
 def render_semantic_mask_panel(

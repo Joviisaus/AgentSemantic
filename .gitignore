@@ -90,6 +90,38 @@ benchmark/data_shapenetpart/gt/
 benchmark/data_shapenetpart/manifest.json
 
 # ============================================================
+# 本地测试模型：体积大（1.4GB+），不入库
+#   仅保留 Cat.stl / Hazmat 两个小样例用于冒烟测试
+# ============================================================
+testmodels/**
+!testmodels/Cat.stl
+!testmodels/Hazmat_Guys_15mm_02.stl
+
+# ============================================================
+# 一次性 / 调试脚本：不入库
+# ============================================================
+/_compose_flow.py
+/_spectral_remote.py
+/scripts/_*.py
+
+# ============================================================
+# Benchmark：只保留代码与 subset 清单，忽略数据、结果、VLM 中间产物
+# ============================================================
+benchmark/vlm_oracle/
+benchmark/results/
+benchmark/results_shapenetpart/
+benchmark/data_shapenetpart/**/*.npz
+benchmark/data_shapenetpart/**/*.npy
+benchmark/data_shapenetpart/**/*.json
+benchmark/ai_vlm_exp/**/*.png
+benchmark/ai_vlm_exp/**/*.npz
+benchmark/ai_vlm_exp/**/*.npy
+benchmark/ai_vlm_exp/**/*.json
+
+# 第三方 baseline 源码（本地下载，非本仓库主链路）
+third_party/PointCLIP_V2/
+
+# ============================================================
 # Third-party 下载的可执行 / 源码压缩包与解压产物
 #   说明：SEG-MAT 作为 submodule 由 git 跟踪，这里只忽略外部下载件
 # ============================================================

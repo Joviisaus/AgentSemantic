@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -62,13 +63,16 @@ def _run_ours_pointcloud(args, keys, by_key, C) -> int:
     client, provider_cfg = ours_pointcloud.build_client(
         config_path, args.provider, args.model, args.env_file
     )
-    work_dir = C.RESULTS_DIR / "ours_pointcloud" / "_work"
+    # oracle 重跑写入独立子目录，skip 检查也必须看同一个子目录，
+    # 否则会误判 token 版 ours_pointcloud 的 pred 已存在而全部跳过。
+    subdir = os.environ.get("AGENTSEMANTIC_RESULTS_SUBDIR") or "ours_pointcloud"
+    work_dir = C.RESULTS_DIR / subdir / "_work"
     work_dir.mkdir(parents=True, exist_ok=True)
 
     t0 = time.perf_counter()
     for i, key in enumerate(keys):
         meta = by_key[key]
-        pred = C.RESULTS_DIR / "ours_pointcloud" / f"{key}.npy"
+        pred = C.RESULTS_DIR / subdir / f"{key}.npy"
         if pred.is_file() and not args.overwrite:
             print(f"[{i+1}/{len(keys)}] skip {key} (exists)")
             continue
@@ -83,6 +87,13 @@ def _run_ours_pointcloud(args, keys, by_key, C) -> int:
             model=args.model,
             select_best_view=not args.no_view_select,
             parallel_vlm=args.parallel_vlm,
+            use_neo=args.use_neo,
+            neo_ckpt=args.neo_ckpt,
+            neo_python=args.neo_python,
+            neo_k=args.neo_k,
+            neo_device=args.neo_device,
+            neo_no_mass=args.neo_no_mass,
+            neo_densify_target=args.neo_densify_target,
         )
         print(f"    done in {summary['elapsed_seconds']:.1f}s "
               f"(parts: {[m['num_full_points'] for m in summary['per_part']]})")
@@ -95,7 +106,7 @@ def main(argv=None) -> int:
     ap.add_argument("--dataset", default="compat200",
                     help="dataset name: compat200 (default, CoSMo3D comparison) or shapenetpart")
     ap.add_argument("--method", required=True,
-                    choices=("ours", "ours_pointcloud", "cosmo3d", "pointclip", "unim", "pointcept"))
+                    choices=("ours", "ours_pointcloud", "ours_pointcloud_oracle", "ours_pointcloud_fair", "cosmo3d", "pointclip", "unim", "pointcept"))
     ap.add_argument("--subset", default="tiny", help="subset name (tiny|subset|full)")
     ap.add_argument("--limit", type=int, default=0, help="only process first N keys (debug)")
     ap.add_argument("--overwrite", action="store_true", help="recompute existing preds")
@@ -113,6 +124,23 @@ def main(argv=None) -> int:
     ap.add_argument("--min-block-size", type=int, default=20)
     ap.add_argument("--no-view-select", action="store_true")
     ap.add_argument("--parallel-vlm", type=int, default=1)
+
+    # ours_pointcloud：稀疏 benchmark 默认 NEO + mesh 辅助增强 + spectral
+    ap.add_argument(
+        "--no-neo", action="store_false", dest="use_neo",
+        help="关闭 NEO（spectral 回退 scipy 现算；默认启用 NEO + proxy mesh 稀疏增强）",
+    )
+    ap.set_defaults(use_neo=True)
+    ap.add_argument("--neo-ckpt", type=str, default=None, help="NEO 权重 .ckpt")
+    ap.add_argument("--neo-python", type=str, default=None, help="NEO 环境 python")
+    ap.add_argument("--neo-k", type=int, default=0, help="NEO 模式数；0=模型默认")
+    ap.add_argument("--neo-device", type=str, default="cpu", help="NEO 设备 cpu/cuda/mps")
+    ap.add_argument("--neo-no-mass", action="store_true", help="NEO 消融 mass-aware attention")
+    ap.add_argument(
+        "--neo-densify-target", type=int, default=20000,
+        help="稀疏点云 mesh 辅助增强时 NEO 输入目标总点数",
+    )
+
     args = ap.parse_args(argv)
 
     logging.basicConfig(
@@ -128,10 +156,10 @@ def main(argv=None) -> int:
 
     dataset_name = args.dataset.strip().lower().replace("-", "_")
     if dataset_name not in {"compat200", "compat_200", "3dcompat200", "3d_compat200"}:
-        if args.method != "ours_pointcloud":
+        if args.method not in {"ours_pointcloud", "ours_pointcloud_oracle", "ours_pointcloud_fair", "pointclip"}:
             print(
                 f"[error] method={args.method} is only wired for compat200; "
-                "supplementary point-cloud datasets currently support ours_pointcloud only.",
+                "supplementary point-cloud datasets currently support ours_pointcloud and pointclip.",
                 file=sys.stderr,
             )
             return 2
@@ -150,12 +178,23 @@ def main(argv=None) -> int:
         return _run_ours(args, keys, by_key, C)
     if args.method == "ours_pointcloud":
         return _run_ours_pointcloud(args, keys, by_key, C)
+    if args.method == "ours_pointcloud_oracle":
+        # 人工 oracle 重跑：写入独立结果子目录，便于与 token 版 ours_pointcloud 对比
+        os.environ["AGENTSEMANTIC_RESULTS_SUBDIR"] = "ours_pointcloud_oracle"
+        return _run_ours_pointcloud(args, keys, by_key, C)
+    if args.method == "ours_pointcloud_fair":
+        # 公平版：GT 仅提供部件名（语义），分类由助手肉眼看渲染面板判定，绝不读 GT 掩码/高亮图。
+        # 几何分裂由块大小驱动（vlm_oracle 的 FAIR 分支），与 GT 无关。
+        os.environ["AGENTSEMANTIC_VLM_ORACLE"] = "1"
+        os.environ["AGENTSEMANTIC_VLM_FAIR"] = "1"
+        os.environ["AGENTSEMANTIC_RESULTS_SUBDIR"] = "ours_pointcloud_fair"
+        return _run_ours_pointcloud(args, keys, by_key, C)
     if args.method == "cosmo3d":
         from benchmark.methods import cosmo3d
         return cosmo3d.run_subset(keys, by_key, overwrite=args.overwrite)
     if args.method == "pointclip":
         from benchmark.methods import pointclip
-        return pointclip.run_subset(keys, by_key, overwrite=args.overwrite)
+        return pointclip.run_subset(keys, by_key, dataset_module=C, overwrite=args.overwrite)
     if args.method == "unim":
         from benchmark.methods import unim
         return unim.run_subset(keys, by_key, overwrite=args.overwrite)

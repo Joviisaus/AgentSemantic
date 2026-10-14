@@ -456,7 +456,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--split-strategy",
-        choices=("auto", "graph_cut", "spectral", "cvt", "sdf", "skeleton", "geodesic_fps"),
+        choices=("auto", "spectral", "cvt", "sdf", "skeleton", "geodesic_fps"),
         default="spectral",
         help="几何分裂策略（默认 spectral）",
     )

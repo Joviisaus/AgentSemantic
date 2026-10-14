@@ -344,7 +344,7 @@ def infer_split_strategy_retry(
     tried = {str(s).strip().lower() for s in (tried_strategies or [])}
     faces = int(block_faces)
     est_vertices = max(faces // 2, 1)
-    order = ["spectral", "skeleton", "graph_cut", "sdf", "cvt", "geodesic_fps"]
+    order = ["spectral", "skeleton", "sdf", "cvt", "geodesic_fps"]
     for strat in order:
         if strat in tried:
             continue
@@ -398,8 +398,8 @@ def ask_split_strategy_retry(
     if matched_parts:
         ctx_parts.append(
             f"切分后子块并集必须覆盖全部 matched_parts（{ '、'.join(matched_parts) }），"
-            "禁止小部位（如头、手）被吞并；凹陷明显时优先 graph_cut（高 lambda_concave）"
-            "或 spectral（高 concavity_weight）；避免 cvt 与均匀 geodesic_fps"
+            "禁止小部位（如头、手）被吞并；凹陷明显时优先 spectral（高 concavity_weight）"
+            "或 skeleton（沿轴切）；避免 cvt 与均匀 geodesic_fps"
         )
     retry_ctx = "。".join(ctx_parts)
     resp = ask_split_strategy(
@@ -504,6 +504,8 @@ def ask_seed_and_strategy(
         )
 
     seed_count = max(2, min(int(max_seeds), int(raw_count)))
+    if raw_strat == "graph_cut":  # graph_cut 已禁用，改用 spectral
+        raw_strat = "spectral"
     strategy = raw_strat if raw_strat in VALID_STRATEGIES else fallback_strategy
     return SeedAndStrategyResponse(
         seed_count=seed_count,

@@ -182,7 +182,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--split-strategy",
         type=str,
         default="auto",
-        choices=["auto", "graph_cut", "spectral", "cvt", "sdf", "skeleton", "geodesic_fps"],
+        choices=["auto", "spectral", "cvt", "sdf", "skeleton", "geodesic_fps"],
         help=(
             "分块策略：auto=每个 partial 块由 VLM 看高亮图自选策略 + 参数（曲率指标、"
             "凸包/凹凸指标等，默认）；也可强制指定 6 种之一。NEO 仅在所选策略为 spectral 时介入。"

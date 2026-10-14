@@ -33,8 +33,8 @@ from geometry.pointcloud_cluster import (
 
 LOGGER = logging.getLogger("geometry.pointcloud_partition")
 
+# graph_cut 已禁用（边缘平滑但不保持形状）：不再作为可选策略，遇到时统一改用 spectral。
 VALID_POINT_STRATEGIES = (
-    "graph_cut",
     "spectral",
     "cvt",
     "sdf",
@@ -470,18 +470,13 @@ def split_points_by_strategy(
     """按策略名分块（与 mesh ``split_block_by_strategy`` 参数对齐）。"""
     _ = geodesic_weight, graph_vertex_budget
     strat = str(strategy or "geodesic_fps").strip().lower()
+    if strat == "graph_cut":
+        LOGGER.info("graph_cut 已禁用，改用 spectral")
+        strat = "spectral"
     if strat not in VALID_POINT_STRATEGIES:
         LOGGER.warning("未知点云分块策略 %r，回退 geodesic_fps", strategy)
         strat = "geodesic_fps"
 
-    if strat == "graph_cut":
-        return split_points_by_graph_cut(
-            points, point_ids, seed_count,
-            lambda_smooth=lambda_smooth,
-            lambda_concave=lambda_concave,
-            n_neighbors=n_neighbors,
-            random_state=random_state,
-        )
     if strat == "spectral":
         return split_points_by_spectral(
             points, point_ids, seed_count,

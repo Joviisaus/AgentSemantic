@@ -16,8 +16,8 @@ from .spectral import split_block_by_spectral_seeds
 
 LOGGER = logging.getLogger("geometry.partition.strategy")
 
+# graph_cut 已禁用（边缘平滑但不保持形状）：不再作为可选策略，遇到时统一改用 spectral。
 VALID_STRATEGIES = (
-    "graph_cut",
     "spectral",
     "cvt",
     "sdf",
@@ -50,6 +50,9 @@ def split_block_by_strategy(
     vertex_scalars: Optional[Sequence[float]] = None,
 ) -> SubBlockSplit:
     strat = str(strategy or "geodesic_fps").strip().lower()
+    if strat == "graph_cut":
+        LOGGER.info("graph_cut 已禁用，改用 spectral")
+        strat = "spectral"
     if strat not in VALID_STRATEGIES:
         LOGGER.warning("未知分块策略 %r，回退 geodesic_fps", strategy)
         strat = "geodesic_fps"

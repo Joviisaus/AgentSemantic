@@ -286,25 +286,31 @@ def render_pointcloud_status_view(
     background: str = "transparent",
     point_size: Optional[float] = None,
     normals: Optional[np.ndarray] = None,
+    as_spheres: bool = False,
 ) -> Path:
     """单视角渲染逐点状态图（live_report / 迭代时间线用）。
 
     - point_status[i] ∈ {"full","pending","none","abandoned"}
     - background="transparent" 输出 RGBA PNG，背景透明（与 mesh 版一致）。
     - 传入 ``normals`` 时按法向对状态色做明暗（扁平点，不画球体）。
+    - ``as_spheres=True``：每个点渲染成一个带光照的实心球体（3D 明暗，而非扁平纯色），
+      此时忽略 ``normals`` 的法向明暗（由球体自身光照产生立体感），并适当放大点尺寸。
     """
     if pv is None:
         raise ImportError("需要 pyvista: pip install pyvista") from _PV_IMPORT_ERROR
 
     pts = np.asarray(points, dtype=np.float64)[:, :3]
     rgb = point_status_to_rgb(point_status, color_map=color_map)
-    if normals is not None:
+    if normals is not None and not as_spheres:
         rgb = _shade_rgb_by_normal(rgb, normals, _view_direction(elev, azim))
     pdata = pv.PolyData(pts)
     pdata.point_data["RGB"] = rgb
 
     win = (int(image_size), int(image_size))
     ps = point_size if point_size is not None else _auto_point_size(pts, win, elev, azim)
+    if as_spheres:
+        # 球体模式下适当放大，让每个点是一个清晰可辨的小球。
+        ps = ps * 1.6
     transparent = background == "transparent"
     plotter = pv.Plotter(off_screen=True, window_size=win)
     if transparent:
@@ -315,9 +321,10 @@ def render_pointcloud_status_view(
         pdata,
         scalars="RGB",
         rgb=True,
-        render_points_as_spheres=False,
+        render_points_as_spheres=as_spheres,
         point_size=ps,
         show_scalar_bar=False,
+        lighting=True if as_spheres else None,
     )
     _apply_camera(plotter, pts, elev, azim)
     plotter.enable_anti_aliasing("ssaa")

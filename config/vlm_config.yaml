@@ -68,7 +68,8 @@ providers:
     models:
       - glm-4v-plus
       - glm-4v
-    default_model: glm-4v-plus
+      - glm-5v-turbo
+    default_model: glm-5v-turbo
 
   moonshot:
     enabled: false
@@ -108,14 +109,31 @@ providers:
       image_detail: auto
 
   ollama:
-    enabled: false
-    base_url: http://localhost:11434/v1
+    # 本地视觉大模型后端：无 API Key、不出网，用于语义查找与语义分块。
+    # 前置：ollama serve（默认 11434）且已拉取视觉模型，例如
+    #   ollama pull qwen2.5vl:7b
+    # 远程/改端口用环境变量覆盖：OLLAMA_BASE_URL=http://host:11434/v1
+    enabled: true
+    base_url: ${OLLAMA_BASE_URL:-http://localhost:11434/v1}
     api_key: ollama  # 本地无需真实 key
     models:
-      - llava
-      - llama3.2-vision
-      - minicpm-v
-    default_model: llava
+      - qwen2.5vl:7b            # 推荐：中文语义理解与结构输出最稳
+      - qwen2.5vl:32b
+      - llama3.2-vision:11b
+      - minicpm-v:8b
+      - llava:13b
+      - granite3.2-vision:2b    # 轻量，适合大批量预跑
+    default_model: ${OLLAMA_MODEL:-qwen2.5vl:7b}
+    # 本地模型首帧要加载权重，超时/重试放宽；视觉多图输入 token 较多
+    timeout_seconds: 600
+    max_retries: 3
+    temperature: 0.2
+    max_tokens: 4096
+    keep_alive: 10m             # 模型常驻显存，避免逐次冷启动
+    options:
+      num_ctx: 8192             # 多视图 + JSON 输出需要较大上下文
+    vision:
+      image_detail: auto
 
   hy3:
     # 腾讯 MaaS TokenHub，兼容 OpenAI Chat Completions
@@ -135,5 +153,7 @@ providers:
       - custom-vlm
     default_model: custom-vlm
 
-# 当前激活的 provider（可被 CLI / 代码覆盖）
-active_provider: openai
+# 当前激活的 provider（可被 CLI 的 --provider / 环境变量 VLM_ACTIVE_PROVIDER 覆盖）
+# 默认走本地 ollama 视觉模型做语义查找与语义分块；
+# 想切回云端填好对应 API Key 后 export VLM_ACTIVE_PROVIDER=openai 即可。
+active_provider: ${VLM_ACTIVE_PROVIDER:-ollama}

@@ -15,7 +15,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -50,6 +50,7 @@ from pipeline.geometry_postprocess import (
     build_neighbor_index,
     compute_selection_metrics,
 )
+from rendering.heatmap_renderer import VIEW_GRID
 from rendering.render_component import (
     ACCEPTED_RGB,
     DIM_RGB,
@@ -67,9 +68,32 @@ from vlm.classifier import classify_component
 from vlm.client import VLMClient
 from vlm.prompts import LABEL_FULL, LABEL_NONE, LABEL_PARTIAL, ObjectContext
 from vlm.review import ProgressReview, review_progress
-from vlm.view_selector import BestViewSelection, select_best_view
+from vlm.view_selector import (
+    BestViewSelection,
+    select_best_view,
+    select_diverse_view_indices,
+)
 
 LOGGER = logging.getLogger("pipeline.pipeline")
+
+
+def _clean_stale_run_artifacts(out_dir: Path) -> None:
+    """清空上一次运行遗留、会随迭代动态增删的子目录内容。
+
+    这些目录（迭代帧、分块面板、逐块响应、球体帧）每次运行都会重新生成；若不清理，
+    上一次更深的运行残留的文件会与本次混在一起，造成“深度/迭代数看起来超了”的错觉。
+    只删文件、保留目录，避免误删同级的最终产物（block_tree.json 等）。
+    """
+    for sub in ("iterations", "iterations_spheres", "panels", "responses"):
+        d = out_dir / sub
+        if not d.is_dir():
+            continue
+        for f in d.iterdir():
+            if f.is_file():
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
 
 
 @dataclass
@@ -153,6 +177,16 @@ class SemanticRefinementConfig:
     # 失败时退回到 heatmap_renderer.DEFAULT_OVERVIEW_VIEW。
     select_best_view: bool = True
     view_select_model: Optional[str] = None
+    # ---- 分类视角子集（选最佳视角时一并让 VLM 挑一组「最少但足够」的互补视角）----
+    # select_classify_views=True 时由 VLM 决定数量与具体视角（在 select_best_view 那一步一起出）；
+    # classify_view_count>0 时强制固定张数（以 best view 为中心按角度互补挑），不问 VLM；
+    # 关闭 select_best_view 或 VLM 选择失败时，退回 default_classify_view_count 张（角度互补）。
+    # 逐块高亮拼图只渲染这些视角——视角越少越精，能看清语义区域即可，太多会诱发幻觉/虚报部位。
+    select_classify_views: bool = True
+    classify_view_count: int = 0          # >0 强制固定张数；0=自动（VLM 决定 / 兜底默认）
+    default_classify_view_count: int = 4  # 兜底默认张数
+    min_classify_views: int = 2           # VLM 可选的最少张数
+    max_classify_views: int = 6           # VLM 可选的最多张数（上限 = 全部 12 视角）
     # 单视角渲染分辨率（像素）。VLM 不看这张图，只是 HTML 展示用，可以开高一点。
     single_view_image_size: int = 720
     # 物体上下文（通用部件分割用）：物体类别 + 候选部件清单。注入到 classify 的
@@ -184,6 +218,8 @@ class SemanticRefinementPipeline:
         self._counter_per_parent: Dict[str, int] = {}
         # 视角选择 + 迭代时间线（在 run() 里被初始化 / 填充）
         self._best_view: Optional[BestViewSelection] = None
+        # 逐块分类拼图实际使用的视角子集（None=全部 12 视角）
+        self._classify_views: Optional[List[Tuple[float, float]]] = None
         self._iter_progress_pngs: List[Path] = []
         self._object_context = ObjectContext(
             category=config.object_category or "",
@@ -360,6 +396,12 @@ class SemanticRefinementPipeline:
             return {"groups": [], "error": str(exc)}
 
     # ---------- 渲染 ----------
+    def _n_classify_views(self) -> int:
+        """当前逐块分类拼图实际用的视角数（喂给 prompt，让它如实知道有几张图）。"""
+        if self._classify_views:
+            return len(self._classify_views)
+        return len(VIEW_GRID)
+
     def _render_block_panel(
         self,
         vertices: np.ndarray,
@@ -380,6 +422,7 @@ class SemanticRefinementPipeline:
             cols=self.config.panel_cols,
             highlight_rgb=HIGHLIGHT_RGB,
             dim_rgb=DIM_RGB,
+            views=self._classify_views,
         )
 
     # ---------- 实时 HTML 进度报告 ----------
@@ -718,6 +761,7 @@ class SemanticRefinementPipeline:
                 self.config.semantic,
                 model=self.config.classification_model,
                 context=self._object_context,
+                n_views=self._n_classify_views(),
             )
 
         workers = max(1, int(self.config.parallel_vlm_workers))
@@ -799,6 +843,13 @@ class SemanticRefinementPipeline:
                     self.client, thumb_path,
                     self.config.semantic,
                     model=self.config.view_select_model,
+                    min_classify_views=self.config.min_classify_views,
+                    max_classify_views=self.config.max_classify_views,
+                    default_classify_views=(
+                        self.config.classify_view_count
+                        if self.config.classify_view_count > 0
+                        else self.config.default_classify_view_count
+                    ),
                 )
                 bv.thumbnails_panel = thumb_path
 
@@ -839,6 +890,9 @@ class SemanticRefinementPipeline:
                         "overview_png": (
                             str(bv.overview_png) if bv.overview_png else None
                         ),
+                        "classify_view_indices_1based": [
+                            i + 1 for i in (bv.classify_view_indices or [])
+                        ],
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -855,6 +909,46 @@ class SemanticRefinementPipeline:
         )
         return bv
 
+    def _resolve_classify_views(self) -> None:
+        """根据 best_view + 配置，确定逐块分类拼图实际使用的视角子集。
+
+        优先级：
+          1. classify_view_count>0 → 以 best view 为中心按角度互补强制固定张数；
+          2. select_classify_views 且 VLM 给了 classify_view_indices → 用 VLM 的选择；
+          3. 否则（关闭或缺失）→ 用 default_classify_view_count 张角度互补视角。
+        关闭分类视角裁剪（select_classify_views=False 且 classify_view_count<=0）→ None（全 12 视角）。
+        """
+        n_grid = len(VIEW_GRID)
+        bv = self._best_view
+        best_idx = int(bv.index) if bv is not None else 0
+
+        forced = int(self.config.classify_view_count or 0)
+        if forced <= 0 and not self.config.select_classify_views:
+            self._classify_views = None
+            LOGGER.info("分类视角裁剪关闭：逐块仍用全部 %d 视角", n_grid)
+            return
+
+        if forced > 0:
+            idxs = select_diverse_view_indices(best_idx, min(forced, n_grid))
+        elif bv is not None and bv.classify_view_indices:
+            idxs = [i for i in bv.classify_view_indices if 0 <= i < n_grid]
+            if not idxs:
+                idxs = select_diverse_view_indices(
+                    best_idx, self.config.default_classify_view_count
+                )
+        else:
+            idxs = select_diverse_view_indices(
+                best_idx, self.config.default_classify_view_count
+            )
+
+        self._classify_views = [VIEW_GRID[i] for i in idxs]
+        if bv is not None:
+            bv.classify_view_indices = idxs
+        LOGGER.info(
+            "逐块分类视角子集: %s（共 %d 张，全网格 %d；视角越少越降幻觉）",
+            [i + 1 for i in idxs], len(idxs), n_grid,
+        )
+
     # ---------- 主流程 ----------
     def run(
         self,
@@ -869,6 +963,10 @@ class SemanticRefinementPipeline:
         t0 = time.perf_counter()
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
+        # 清理上一次运行遗留的迭代帧 / 分块面板 / 响应，避免旧运行（可能更深）的
+        # 产物与本次混在一起（例如残留的深层 block panel、超出本次 num_iterations 的
+        # iter_NN.png），导致复盘时“深度看起来超了”。
+        _clean_stale_run_artifacts(out_dir)
         panel_dir = out_dir / "panels"
         panel_dir.mkdir(parents=True, exist_ok=True)
         responses_dir = out_dir / "responses"
@@ -880,6 +978,8 @@ class SemanticRefinementPipeline:
         # DEFAULT_OVERVIEW_VIEW，主流程不会被阻断。
         self._iter_progress_pngs = []
         self._best_view = self._select_view_for_display(out_dir, vertices, faces)
+        # 确定逐块分类拼图用的「有效视角子集」（少而精降幻觉）。
+        self._resolve_classify_views()
 
         n_faces = int(faces.shape[0])
         if len(initial_face_labels) != n_faces:
@@ -1058,6 +1158,7 @@ class SemanticRefinementPipeline:
                         self.config.semantic,
                         model=self.config.classification_model,
                         context=self._object_context,
+                        n_views=self._n_classify_views(),
                     )
                 block.classification = {
                     "label": cls.label,
@@ -1107,22 +1208,19 @@ class SemanticRefinementPipeline:
                     committed = cls.committed_if_forced or ""
                     dom = cls.dominant_side or ""
                     sar = cls.semantic_area_ratio
-                    # 新版接受规则（更保守，要求 VLM 自己「强制承诺 full」）：
-                    # 必要条件：
+                    # 到达 max_depth 的 partial 是「最后一次分块」——已无法再细分，
+                    # 语义上应**算法直接强制 full**，不再依赖 VLM 的 committed_if_forced
+                    # / dominant_side（它们常保守返回 none/partial，反而把该保留的区域丢掉）。
+                    # 仅保留最基本的反噪声护栏：
                     #   ① accept_partial_at_max_depth 开启；
-                    #   ② 含有语义部位（n_sem ≥ 1）；
-                    #   ③ block 面数 ≥ 阈值（小块多半是 VLM 幻觉边角）；
-                    #   ④ VLM committed_if_forced == "full"（表示语义占主导值得保留）；
-                    #   ⑤ dominant_side ∈ {"semantic", ""}（balanced/extra 一律不接受）。
-                    # 这样 (头发+整张脸) 这种主导边是 "extra" 的块会被收为 abandoned，
-                    # 不会污染最终掩码。
+                    #   ② 含有语义部位（n_sem ≥ 1，partial 本就应成立）；
+                    #   ③ 与语义区确有交叠（missing_overlap 不为 True）；
+                    #   ④ block 面数 ≥ 阈值（挡掉极小的幻觉边角）。
                     accept = (
                         self.config.accept_partial_at_max_depth
                         and n_sem >= 1
                         and cls.missing_overlap is not True
                         and block_faces >= self.config.accept_partial_min_faces
-                        and committed == LABEL_FULL
-                        and dom in ("semantic", "")
                     )
                     if accept:
                         block.status = BlockStatus.FULL
@@ -2069,6 +2167,11 @@ def run_semantic_refinement(
     live_report_refresh_seconds: int = 10,
     select_best_view: bool = True,
     view_select_model: Optional[str] = None,
+    select_classify_views: bool = True,
+    classify_view_count: int = 0,
+    default_classify_view_count: int = 4,
+    min_classify_views: int = 2,
+    max_classify_views: int = 6,
     single_view_image_size: int = 720,
     object_category: str = "",
     candidate_parts: Optional[List[str]] = None,
@@ -2102,6 +2205,11 @@ def run_semantic_refinement(
         live_report_refresh_seconds=live_report_refresh_seconds,
         select_best_view=select_best_view,
         view_select_model=view_select_model,
+        select_classify_views=select_classify_views,
+        classify_view_count=max(0, int(classify_view_count)),
+        default_classify_view_count=max(1, int(default_classify_view_count)),
+        min_classify_views=max(1, int(min_classify_views)),
+        max_classify_views=max(1, int(max_classify_views)),
         single_view_image_size=single_view_image_size,
         object_category=object_category,
         candidate_parts=candidate_parts,

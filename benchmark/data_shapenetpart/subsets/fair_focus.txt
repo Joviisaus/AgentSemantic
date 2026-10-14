@@ -1,0 +1,4 @@
+bag__test0_00142
+mug__test0_00033
+knife__test0_00013
+cap__test0_00186

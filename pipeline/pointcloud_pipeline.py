@@ -33,6 +33,7 @@ from __future__ import annotations
 import html as _html
 import json
 import logging
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -122,6 +123,11 @@ class PointCloudRefinementConfig:
     neo_k: int = 0                           # 取多少个模式；0=模型默认 targ_dim_model
     neo_device: str = "cpu"                  # cpu/cuda/mps
     neo_no_mass: bool = False                # 消融 mass-aware attention
+    # 稀疏点云 mesh 辅助增强（benchmark GT ~5k 点）：NEO 在「GT + mesh 采样」合并点云上
+    # 前馈，只保留 GT 行特征向量。需 proxy mesh 与 GT 坐标对齐。
+    neo_proxy_mesh: Optional[str] = None
+    neo_densify_target: int = 20000          # NEO 输入目标总点数（含 GT）
+    neo_densify_min_points: int = 8000       # 点数低于此阈值且 proxy 可用时触发增强
     image_size: int = 512
     panel_cols: int = 4
     point_size: Optional[float] = None
@@ -271,7 +277,24 @@ class PointCloudRefinementPipeline:
         # 标题不写 semantic，避免给 VLM 暗示（确认偏差）。
         title = f"[block {block.block_id}] depth={block.depth} pts={block.size}"
         panel_path = panel_dir / f"block_{block.block_id}.png"
-        return render_pointcloud_highlight_panel(
+        oracle = bool(os.environ.get("AGENTSEMANTIC_VLM_ORACLE"))
+        fast = bool(os.environ.get("AGENTSEMANTIC_ORACLE_FAST"))
+        if oracle and fast:
+            # Fast oracle (geometric-subdivision test): the oracle classifier reads only
+            # the point-index sidecar, never the rendered panel. Skip matplotlib entirely
+            # and just dump the sidecar so the full-dataset run stays cheap.
+            try:
+                (panel_dir / f"block_{block.block_id}.pts.json").write_text(
+                    json.dumps(
+                        {"block_id": block.block_id, "face_ids": list(block.face_ids)},
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+            except OSError as exc:  # pragma: no cover
+                LOGGER.warning("oracle sidecar dump failed %s: %s", block.block_id, exc)
+            return panel_path
+        out = render_pointcloud_highlight_panel(
             self.points,
             block.face_ids,
             panel_path,
@@ -282,6 +305,20 @@ class PointCloudRefinementPipeline:
             views=self._classify_views,
             normals=self._point_normals,
         )
+        # oracle 模式：把每块的点索引落盘，供 AssistantVLMClient 的 GT 重叠规则使用
+        # （仅在该环境变量开启时写入，正常 VLM 运行不受影响）。
+        if oracle:
+            try:
+                (panel_dir / f"block_{block.block_id}.pts.json").write_text(
+                    json.dumps(
+                        {"block_id": block.block_id, "face_ids": list(block.face_ids)},
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+            except OSError as exc:  # pragma: no cover
+                LOGGER.warning("oracle sidecar dump failed %s: %s", block.block_id, exc)
+        return out
 
     def _dump_response(self, responses_dir: Path, block_id: str, payload: Dict[str, Any]) -> None:
         if not self.config.save_responses:
@@ -294,22 +331,55 @@ class PointCloudRefinementPipeline:
             LOGGER.warning("写 response 失败 %s: %s", block_id, exc)
 
     # ---------- NEO 全局特征空间 ----------
+    def _neo_input_points(self) -> Tuple[np.ndarray, int]:
+        """返回 (NEO 推理用点云, 保留特征行数 n_gt)。稀疏 benchmark 可从 proxy mesh 增强。"""
+        n_gt = len(self.points)
+        proxy = (self.config.neo_proxy_mesh or "").strip()
+        if (
+            proxy
+            and n_gt < int(self.config.neo_densify_min_points)
+            and Path(proxy).is_file()
+        ):
+            try:
+                from geometry.sparse_point_enhance import densify_for_neo, is_sparse_point_cloud
+
+                if is_sparse_point_cloud(self.points, n_points_threshold=n_gt + 1):
+                    combined, n_keep = densify_for_neo(
+                        self.points,
+                        proxy,
+                        n_target=int(self.config.neo_densify_target),
+                    )
+                    return combined, n_keep
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("稀疏点云 mesh 增强失败，NEO 直接用原始点云: %s", exc)
+        return self.points, n_gt
+
     def _compute_neo_eigenspace(self) -> None:
         """对整朵点云调用一次 NEO，前馈预测全局低频 LBO 特征向量，存入
         self._neo_eigvecs (N, k)，供后续所有子块 lbo_spectral 切片复用。"""
         from geometry.neo_backend import neo_eigenspace
 
-        LOGGER.info("调用 NEO 前馈全局特征空间（整朵点云 %d 点，一次性）...", len(self.points))
+        neo_pts, n_gt = self._neo_input_points()
+        LOGGER.info(
+            "调用 NEO 前馈全局特征空间（%d 点%s，一次性）...",
+            len(neo_pts),
+            f"，稀疏增强保留 GT {n_gt} 行" if len(neo_pts) > n_gt else "",
+        )
         t = time.perf_counter()
         eigvecs, _eigvals = neo_eigenspace(
-            self.points,
+            neo_pts,
             ckpt=self.config.neo_ckpt,
             neo_python=self.config.neo_python,
             k=self.config.neo_k,
             device=self.config.neo_device,
             no_mass=self.config.neo_no_mass,
         )
-        self._neo_eigvecs = np.asarray(eigvecs, dtype=np.float64)
+        eigvecs = np.asarray(eigvecs, dtype=np.float64)
+        if eigvecs.shape[0] < n_gt:
+            raise ValueError(
+                f"NEO 返回行数 {eigvecs.shape[0]} 少于 GT 点数 {n_gt}"
+            )
+        self._neo_eigvecs = eigvecs[:n_gt]
         LOGGER.info(
             "NEO 全局特征空间就绪: eigvecs=%s，耗时 %.1fs；后续分裂走 lbo_spectral 切片复用",
             self._neo_eigvecs.shape, time.perf_counter() - t,
@@ -415,6 +485,26 @@ class PointCloudRefinementPipeline:
             LOGGER.warning("iter %d 进度图渲染失败: %s", iteration, exc)
             return None
         self._iter_progress_pngs.append(png)
+        # 附加：球体渲染模式的同一帧（每个点一个带光照的实心球），存到 iterations_spheres/。
+        sp_dir = out_dir / "iterations_spheres"
+        sp_dir.mkdir(parents=True, exist_ok=True)
+        sp_png = sp_dir / f"iter_{iteration:02d}.png"
+        try:
+            render_pointcloud_status_view(
+                self.points,
+                status,
+                sp_png,
+                elev=elev,
+                azim=azim,
+                image_size=self.config.single_view_image_size,
+                color_map=self._LIVE_COLOR_MAP,
+                background="transparent",
+                point_size=self.config.point_size,
+                normals=self._point_normals,
+                as_spheres=True,
+            )
+        except (OSError, ValueError, ImportError) as exc:
+            LOGGER.warning("iter %d 球体渲染帧失败: %s", iteration, exc)
         return png
 
     def _update_live_report(
@@ -1180,6 +1270,10 @@ class PointCloudRefinementPipeline:
 
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
+        # 清理上一次运行遗留的动态产物（迭代帧 / 球体帧 / 面板 / 响应），避免更深的旧
+        # 运行残留物与本次混在一起，造成“深度/迭代数看起来超了”。
+        from pipeline.pipeline import _clean_stale_run_artifacts
+        _clean_stale_run_artifacts(out_dir)
         panel_dir = out_dir / "panels"
         panel_dir.mkdir(parents=True, exist_ok=True)
         responses_dir = out_dir / "responses"
@@ -1366,13 +1460,20 @@ class PointCloudRefinementPipeline:
                     continue
 
                 if at_max_depth:
+                    # 最后一次分块（已到 max_depth，无法再细分）：语义上算法直接强制 full，
+                    # 不再依赖 VLM 的 committed_if_forced（它常保守返回 none 而丢掉该区域）。
+                    # 仅保留反噪声护栏：含语义部位 + 与语义区有交叠 + 点数达下限。
+                    n_sem = len(cls.get("semantic_parts") or [])
                     if (
                         self.config.accept_partial_at_max_depth
-                        and (cls.get("committed_if_forced") or "none") == LABEL_FULL
+                        and n_sem >= 1
+                        and cls.get("missing_overlap") is not True
                         and block.size >= self.config.accept_partial_min_points
                     ):
                         block.status = BlockStatus.FULL
-                        block.notes = (block.notes + " | accepted_partial_at_max_depth").strip(" |")
+                        block.notes = (
+                            block.notes + " | accepted_partial_at_max_depth(forced)"
+                        ).strip(" |")
                     else:
                         self._apply_force_terminate(
                             block, cls, responses_dir, responses_log,

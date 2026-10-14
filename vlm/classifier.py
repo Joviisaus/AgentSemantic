@@ -8,6 +8,7 @@ Block three-way classification: call VLM to label a single block as
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -191,9 +192,12 @@ def classify_component(
         memory_block=memory,
     )
     try:
+        # oracle 模式：把面板图也传给 reason 阶段，供 AssistantVLMClient 依块点索引+
+        # GT 重叠判定 full/partial/none（正常 VLM 运行仍不传图，避免二次幻觉）。
+        _rsn_images = [image_path] if os.environ.get("AGENTSEMANTIC_VLM_ORACLE") else []
         rsn_response: VLMResponse = client.chat(
             user_prompt=rsn_prompt.user,
-            image_paths=[],  # no image — avoid re-hallucination
+            image_paths=_rsn_images,
             system=rsn_prompt.system,
             temperature=0.0,
             json_mode=True,

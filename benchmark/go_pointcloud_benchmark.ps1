@@ -40,6 +40,13 @@ param(
     [int]$MinBlockSize = 20,
     [int]$ParallelVlm = 1,
 
+    [switch]$NoNeo,
+    [string]$NeoCkpt = "",
+    [string]$NeoPython = "",
+    [int]$NeoK = 0,
+    [string]$NeoDevice = "cpu",
+    [int]$NeoDensifyTarget = 20000,
+
     [string[]]$EvalMethods = @(),
     [string]$AgentEnv = "agentsematic",
     [string]$ExportEnv = "cosmo3d",
@@ -169,9 +176,21 @@ if ($SkipRun) {
     }
     if ($Overwrite) { [void]$runArgs.Add("--overwrite") }
     if ($NoViewSelect) { [void]$runArgs.Add("--no-view-select") }
+    if ($NoNeo) { [void]$runArgs.Add("--no-neo") }
     Add-IfValue $runArgs "--model" $Model
     Add-IfValue $runArgs "--config" $Config
     Add-IfValue $runArgs "--env-file" $EnvFile
+    Add-IfValue $runArgs "--neo-ckpt" $NeoCkpt
+    Add-IfValue $runArgs "--neo-python" $NeoPython
+    if ($NeoK -gt 0) {
+        [void]$runArgs.Add("--neo-k")
+        [void]$runArgs.Add("$NeoK")
+    }
+    Add-IfValue $runArgs "--neo-device" $NeoDevice
+    if ($NeoDensifyTarget -gt 0) {
+        [void]$runArgs.Add("--neo-densify-target")
+        [void]$runArgs.Add("$NeoDensifyTarget")
+    }
     RunCmd "STAGE 2  run ours_pointcloud" ([string[]]$runArgs)
 }
 

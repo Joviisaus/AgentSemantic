@@ -217,7 +217,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--split-strategy",
-        choices=("auto", "graph_cut", "spectral", "cvt", "sdf", "skeleton", "geodesic_fps"),
+        choices=("auto", "spectral", "cvt", "sdf", "skeleton", "geodesic_fps"),
         default="auto",
         help=(
             "分裂策略提示：auto（默认，完全由 VLM 根据语义与 block_faces 决定）；"
@@ -339,6 +339,49 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="视角选择步骤单独指定模型；不传则沿用 --model / provider 默认模型。",
     )
+    # ---- 分类视角子集：VLM 选完最佳视角后，决定逐块三分类用几张视角（少而精降幻觉）----
+    p.add_argument(
+        "--no-select-classify-views",
+        action="store_false",
+        dest="select_classify_views",
+        help=(
+            "关闭「让 VLM 决定逐块分类用几张视角」。默认开启：选最佳视角时一并让 VLM 挑一组"
+            "最少但足够的互补视角，逐块高亮拼图只渲染这些（视角太多会让 VLM 幻觉/虚报部位）。"
+            "关闭后逐块仍用全部 12 视角（除非用 --classify-view-count 固定）。"
+        ),
+    )
+    p.set_defaults(select_classify_views=True)
+    p.add_argument(
+        "--classify-view-count",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "强制逐块分类固定用 N 张视角（以最佳视角为中心按角度互补挑），不询问 VLM。"
+            "0=自动（由 VLM 决定，或兜底默认值）。"
+        ),
+    )
+    p.add_argument(
+        "--default-classify-views",
+        type=int,
+        default=4,
+        metavar="N",
+        help="VLM 未给/选择失败时，逐块分类兜底用的视角张数（默认 4）。",
+    )
+    p.add_argument(
+        "--min-classify-views",
+        type=int,
+        default=2,
+        metavar="N",
+        help="VLM 可挑的最少分类视角张数（默认 2）。",
+    )
+    p.add_argument(
+        "--max-classify-views",
+        type=int,
+        default=6,
+        metavar="N",
+        help="VLM 可挑的最多分类视角张数（默认 6，上限 12）。",
+    )
     p.add_argument(
         "--single-view-size",
         type=int,
@@ -398,6 +441,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     out_dir = _resolve_output_dir(mesh_path, args.semantic, args.output_dir, args.output_base)
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"[output] {out_dir.resolve()}")
+    if args.no_view_select:
+        print("[views] 逐块分类用全部 12 视角（已关闭视角选择）")
+    elif args.classify_view_count > 0:
+        print(f"[views] 逐块分类固定 {args.classify_view_count} 张视角（角度互补，降幻觉）")
+    elif args.select_classify_views:
+        print(
+            f"[views] 逐块分类视角由 VLM 决定（{args.min_classify_views}~{args.max_classify_views} 张；"
+            f"兜底 {args.default_classify_views} 张）"
+        )
+    else:
+        print("[views] 逐块分类用全部 12 视角（未启用视角裁剪）")
     if not args.no_live_report and not args.dry_run:
         print(
             f"[live]   {(out_dir / 'live_report.html').resolve()}"
@@ -489,6 +543,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         live_report_refresh_seconds=args.live_report_refresh,
         select_best_view=not args.no_view_select,
         view_select_model=args.view_select_model or args.model,
+        select_classify_views=args.select_classify_views,
+        classify_view_count=max(0, int(args.classify_view_count)),
+        default_classify_view_count=max(1, int(args.default_classify_views)),
+        min_classify_views=max(1, int(args.min_classify_views)),
+        max_classify_views=max(1, int(args.max_classify_views)),
         single_view_image_size=args.single_view_size,
         postprocess=args.postprocess,
         postprocess_max_rounds=max(1, int(args.postprocess_rounds)),
@@ -517,6 +576,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"  best view ({tag:>8}) : #{bv.index + 1}  "
             f"elev={bv.elev:.1f}° azim={bv.azim:.1f}°"
         )
+        if bv.classify_view_indices:
+            nums = ", ".join(f"#{i + 1}" for i in bv.classify_view_indices)
+            print(f"  classify views     : {nums}  ({len(bv.classify_view_indices)} 张)")
         if bv.reason:
             print(f"                       reason: {bv.reason[:140]}")
     if result.best_view_overview:

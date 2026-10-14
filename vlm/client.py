@@ -173,6 +173,16 @@ class OpenAICompatibleClient(VLMClient):
         if json_mode:
             body["response_format"] = {"type": "json_object"}
 
+        # Ollama 等本地后端：透传 options(num_ctx 等) / keep_alive，
+        # 否则默认 2k~4k 上下文会截断多视图 JSON 输出。
+        extra = self.config.extra or {}
+        options = extra.get("options")
+        if isinstance(options, dict) and options:
+            body["options"] = options
+        keep_alive = extra.get("keep_alive")
+        if keep_alive:
+            body["keep_alive"] = keep_alive
+
         headers = {"Content-Type": "application/json"}
         if self.config.api_key and self.config.api_key != "ollama":
             headers["Authorization"] = f"Bearer {self.config.api_key}"
